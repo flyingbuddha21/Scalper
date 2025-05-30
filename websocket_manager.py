@@ -24,6 +24,7 @@ from config_manager import ConfigManager
 from data_manager import DataManager
 from database_setup import TradingDatabase
 from security_manager import SecurityManager
+from goodwill_api_handler import GoodwillAPIHandler, get_goodwill_handler
 from utils import Logger, ErrorHandler, DataValidator
 from bot_core import TradingBot
 
@@ -392,7 +393,7 @@ class WebSocketConnection:
         return datetime.now() - self.last_message_time > timeout_threshold
 
 class WebSocketManager:
-    """Main WebSocket manager for handling multiple connections"""
+    """Main WebSocket manager for handling multiple connections including Goodwill feeds"""
     
     def __init__(self, config_manager: ConfigManager, data_manager: DataManager,
                  trading_db: TradingDatabase, security_manager: SecurityManager):
@@ -401,6 +402,9 @@ class WebSocketManager:
         self.trading_db = trading_db
         self.security_manager = security_manager
         
+        # Get Goodwill API handler instance
+        self.goodwill_handler = get_goodwill_handler()
+        
         # Initialize logger and error handler
         self.logger = Logger(__name__)
         self.error_handler = ErrorHandler()
@@ -408,6 +412,7 @@ class WebSocketManager:
         
         # WebSocket connections
         self.connections: Dict[str, WebSocketConnection] = {}
+        self.goodwill_websocket = None
         self.is_running = False
         
         # Data handlers
@@ -423,17 +428,25 @@ class WebSocketManager:
         self.stats = {
             'messages_received': defaultdict(int),
             'last_message_time': defaultdict(lambda: None),
-            'connection_uptime': defaultdict(lambda: None)
+            'connection_uptime': defaultdict(lambda: None),
+            'goodwill_connection_status': 'DISCONNECTED'
         }
     
     async def initialize(self):
-        """Initialize WebSocket manager"""
+        """Initialize WebSocket manager with Goodwill integration"""
         try:
             config = self.config_manager.get_config()
             websocket_config = config.get('websockets', {})
             
-            # Create WebSocket connections from config
+            # Setup Goodwill WebSocket connection if authenticated
+            if self.goodwill_handler.is_authenticated:
+                await self._setup_goodwill_websocket()
+            
+            # Create other WebSocket connections from config
             for conn_name, conn_config in websocket_config.items():
+                if conn_name == 'goodwill':  # Skip, handled separately
+                    continue
+                    
                 ws_config = WebSocketConfig(
                     url=conn_config['url'],
                     name=conn_name,
@@ -454,12 +467,46 @@ class WebSocketManager:
                 
                 self.connections[conn_name] = connection
             
-            self.logger.info(f"WebSocket manager initialized with {len(self.connections)} connections")
+            self.logger.info(f"WebSocket manager initialized with {len(self.connections)} connections + Goodwill feed")
             
         except Exception as e:
             self.logger.error(f"WebSocket manager initialization failed: {e}")
             self.error_handler.handle_error(e, "websocket_manager_init")
             raise
+    
+    async def _setup_goodwill_websocket(self):
+        """Setup Goodwill WebSocket connection"""
+        try:
+            # Use the correct Goodwill WebSocket URL from documentation
+            goodwill_ws_url = "wss://giga.gwcindia.in/NorenWSTP/"
+            
+            # Create Goodwill-specific WebSocket config
+            goodwill_config = WebSocketConfig(
+                url=goodwill_ws_url,
+                name="goodwill_feeds",
+                feed_type=DataFeedType.LIVE_QUOTES,
+                symbols=[],  # Will be populated based on subscriptions
+                auth_required=True,
+                reconnect_interval=5,
+                max_reconnect_attempts=10,
+                heartbeat_interval=30
+            )
+            
+            # Create Goodwill WebSocket connection
+            self.goodwill_websocket = WebSocketConnection(
+                goodwill_config,
+                self._goodwill_message_callback,
+                self.security_manager
+            )
+            
+            self.connections['goodwill'] = self.goodwill_websocket
+            self.stats['goodwill_connection_status'] = 'INITIALIZED'
+            
+            self.logger.info("Goodwill WebSocket connection setup completed with URL: wss://giga.gwcindia.in/NorenWSTP/")
+            
+        except Exception as e:
+            self.logger.error(f"Goodwill WebSocket setup failed: {e}")
+            self.stats['goodwill_connection_status'] = 'ERROR'
     
     async def start_all_connections(self):
         """Start all WebSocket connections"""
@@ -600,6 +647,148 @@ class WebSocketManager:
             
         except Exception as e:
             self.logger.error(f"Trade updates handling error: {e}")
+    
+    async def _goodwill_message_callback(self, feed_type: DataFeedType, data: Any):
+        """Handle Goodwill-specific WebSocket messages"""
+        try:
+            # Update statistics
+            self.stats['messages_received'][feed_type] += 1
+            self.stats['last_message_time'][feed_type] = datetime.now()
+            self.stats['goodwill_connection_status'] = 'CONNECTED'
+            
+            # Parse Goodwill message format
+            if isinstance(data, dict):
+                message_type = data.get('t', '')
+                
+                if message_type == 'tf':  # Trade feed
+                    await self._handle_goodwill_quote(data)
+                elif message_type == 'df':  # Depth feed
+                    await self._handle_goodwill_depth(data)
+                elif message_type == 'om':  # Order update
+                    await self._handle_goodwill_order_update(data)
+                else:
+                    self.logger.debug(f"Unknown Goodwill message type: {message_type}")
+            
+        except Exception as e:
+            self.logger.error(f"Goodwill message callback error: {e}")
+            self.error_handler.handle_error(e, "goodwill_websocket_callback")
+    
+    async def _handle_goodwill_quote(self, data: Dict):
+        """Handle Goodwill quote/trade feed"""
+        try:
+            # Parse Goodwill quote format
+            symbol = data.get('tk', '')  # Token
+            ltp = float(data.get('lp', 0))  # Last traded price
+            volume = int(data.get('v', 0))  # Volume
+            
+            # Create MarketTick object
+            tick = MarketTick(
+                symbol=symbol,
+                ltp=ltp,
+                volume=volume,
+                bid=float(data.get('bp1', 0)),
+                ask=float(data.get('sp1', 0)),
+                bid_qty=int(data.get('bq1', 0)),
+                ask_qty=int(data.get('sq1', 0)),
+                timestamp=datetime.now(),
+                change=float(data.get('c', 0)),
+                change_percent=float(data.get('pc', 0))
+            )
+            
+            # Process through main handler
+            await self._handle_live_quotes(tick)
+            
+        except Exception as e:
+            self.logger.error(f"Goodwill quote handling error: {e}")
+    
+    async def _handle_goodwill_depth(self, data: Dict):
+        """Handle Goodwill market depth feed"""
+        try:
+            symbol = data.get('tk', '')
+            
+            # Parse bid/ask arrays
+            bids = []
+            asks = []
+            
+            for i in range(1, 6):  # Top 5 levels
+                bid_price = data.get(f'bp{i}')
+                bid_qty = data.get(f'bq{i}')
+                ask_price = data.get(f'sp{i}')
+                ask_qty = data.get(f'sq{i}')
+                
+                if bid_price and bid_qty:
+                    bids.append([float(bid_price), int(bid_qty)])
+                if ask_price and ask_qty:
+                    asks.append([float(ask_price), int(ask_qty)])
+            
+            depth_data = {
+                'symbol': symbol,
+                'bids': bids,
+                'asks': asks,
+                'timestamp': datetime.now()
+            }
+            
+            await self._handle_market_depth(depth_data)
+            
+        except Exception as e:
+            self.logger.error(f"Goodwill depth handling error: {e}")
+    
+    async def _handle_goodwill_order_update(self, data: Dict):
+        """Handle Goodwill order update messages"""
+        try:
+            order_update = OrderUpdate(
+                order_id=data.get('nstordno', ''),
+                symbol=data.get('tsym', ''),
+                status=data.get('st', ''),
+                executed_qty=int(data.get('fillqty', 0)),
+                executed_price=float(data.get('flprc', 0)),
+                timestamp=datetime.now(),
+                message=data.get('emsg', '')
+            )
+            
+            await self._handle_order_updates(order_update)
+            
+        except Exception as e:
+            self.logger.error(f"Goodwill order update handling error: {e}")
+    
+    async def subscribe_to_goodwill_symbols(self, symbols: List[str]):
+        """Subscribe to Goodwill symbols for live data"""
+        try:
+            if not self.goodwill_handler.is_authenticated:
+                self.logger.error("Goodwill not authenticated, cannot subscribe to symbols")
+                return False
+            
+            # Get symbol tokens from Goodwill API
+            symbol_tokens = []
+            for symbol in symbols:
+                search_results = await self.goodwill_handler.search_symbols(symbol)
+                if search_results:
+                    # Get the first matching result and format as per Goodwill docs
+                    result = search_results[0]
+                    exchange = result.get('exchange', 'NSE')
+                    token = result.get('token', '')
+                    if token:
+                        # Format: "EXCHANGE|TOKEN" as per documentation
+                        symbol_tokens.append(f"{exchange}|{token}")
+            
+            # Send subscription message to Goodwill WebSocket
+            if self.goodwill_websocket and symbol_tokens:
+                # Subscribe to touchline data as per documentation
+                subscription_message = {
+                    "t": "t",  # Touchline subscription
+                    "k": "#".join(symbol_tokens)  # Join tokens with #
+                }
+                
+                if self.goodwill_websocket.websocket:
+                    await self.goodwill_websocket.websocket.send(json.dumps(subscription_message))
+                    self.logger.info(f"Subscribed to Goodwill symbols: {symbols} -> {symbol_tokens}")
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Goodwill symbol subscription error: {e}")
+            return False
     
     async def _handle_news_feed(self, news_data: Dict):
         """Handle news feed data"""
