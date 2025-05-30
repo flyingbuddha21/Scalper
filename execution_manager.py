@@ -1,1523 +1,1204 @@
-#!/usr/bin/env python3
 """
-Execution Manager for Top 10 Active Stocks
-Manages real-time execution of scalping strategies on selected stocks
+Advanced Execution Manager for Indian Market Trading Bot
+Handles order execution, position management, and risk controls
+100% Market Ready - Routes to live Goodwill API or paper trading based on config
 """
 
-import asyncio
 import logging
+import asyncio
 import time
-import threading
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
-import pandas as pd
-import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict
 from enum import Enum
-import sqlite3
-import json
-from collections import deque
-import queue
+import threading
+from collections import defaultdict
 
-logger = logging.getLogger(__name__)
+from config_manager import get_config
+from utils import (
+    calculate_position_size, calculate_dynamic_stop_loss, calculate_portfolio_risk,
+    format_currency, format_percentage
+)
+from strategy_manager import ScalpingSignal, SignalType, get_strategy_manager
+from data_manager import get_data_manager
+from goodwill_api_handler import get_goodwill_handler
 
-class ExecutionStatus(Enum):
-    IDLE = "idle"
-    MONITORING = "monitoring"
-    SIGNAL_DETECTED = "signal_detected"
-    ORDER_PLACED = "order_placed"
-    POSITION_OPEN = "position_open"
-    EXITING = "exiting"
-    COMPLETED = "completed"
-    ERROR = "error"
+class OrderType(Enum):
+    """Order types supported"""
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP_LOSS = "STOP_LOSS"
+    STOP_LIMIT = "STOP_LIMIT"
+    BRACKET = "BRACKET"
 
-class SignalType(Enum):
-    BUY = "buy"
-    SELL = "sell"
-    EXIT_LONG = "exit_long"
-    EXIT_SHORT = "exit_short"
-    STOP_LOSS = "stop_loss"
-    TAKE_PROFIT = "take_profit"
+class OrderStatus(Enum):
+    """Order status types"""
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    PARTIAL_FILLED = "PARTIAL_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
 
-@dataclass
-class ExecutionStock:
-    symbol: str
-    asset_type: str
-    scalping_score: float
-    volatility_score: float
-    liquidity_score: float
-    
-    # Real-time data
-    current_price: float = 0.0
-    bid_price: float = 0.0
-    ask_price: float = 0.0
-    volume: int = 0
-    last_update: datetime = field(default_factory=datetime.now)
-    
-    # Trading state
-    status: ExecutionStatus = ExecutionStatus.IDLE
-    position_size: int = 0
-    entry_price: float = 0.0
-    current_pnl: float = 0.0
-    unrealized_pnl: float = 0.0
-    
-    # Strategy parameters
-    stop_loss_pct: float = 0.5
-    take_profit_pct: float = 1.0
-    max_position_size: int = 100
-    min_tick_size: float = 0.05
-    
-    # Performance tracking
-    trades_today: int = 0
-    profit_trades: int = 0
-    loss_trades: int = 0
-    total_pnl: float = 0.0
-    
-    def to_dict(self) -> Dict:
-        return {
-            'symbol': self.symbol,
-            'asset_type': self.asset_type,
-            'scalping_score': round(self.scalping_score, 2),
-            'volatility_score': round(self.volatility_score, 2),
-            'liquidity_score': round(self.liquidity_score, 2),
-            'current_price': round(self.current_price, 2),
-            'bid_price': round(self.bid_price, 2),
-            'ask_price': round(self.ask_price, 2),
-            'volume': self.volume,
-            'last_update': self.last_update.isoformat(),
-            'status': self.status.value,
-            'position_size': self.position_size,
-            'entry_price': round(self.entry_price, 2),
-            'current_pnl': round(self.current_pnl, 2),
-            'unrealized_pnl': round(self.unrealized_pnl, 2),
-            'trades_today': self.trades_today,
-            'profit_trades': self.profit_trades,
-            'loss_trades': self.loss_trades,
-            'total_pnl': round(self.total_pnl, 2)
-        }
+class PositionSide(Enum):
+    """Position sides"""
+    LONG = "LONG"
+    SHORT = "SHORT"
+    FLAT = "FLAT"
 
 @dataclass
-class TradingSignal:
+class Order:
+    """Order data structure"""
+    order_id: str
     symbol: str
-    signal_type: SignalType
+    side: str  # BUY/SELL
+    order_type: OrderType
+    quantity: int
     price: float
-    confidence: float
+    stop_price: float
+    trigger_price: float
+    time_in_force: str  # DAY, IOC, FOK
+    status: OrderStatus
+    filled_qty: int
+    remaining_qty: int
+    avg_price: float
+    commission: float
     timestamp: datetime
-    indicators: Dict[str, Any]
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    
-    def to_dict(self) -> Dict:
-        return {
-            'symbol': self.symbol,
-            'signal_type': self.signal_type.value,
-            'price': round(self.price, 2),
-            'confidence': round(self.confidence, 2),
-            'timestamp': self.timestamp.isoformat(),
-            'indicators': self.indicators,
-            'stop_loss': round(self.stop_loss, 2) if self.stop_loss else None,
-            'take_profit': round(self.take_profit, 2) if self.take_profit else None
-        }
+    parent_signal_id: Optional[str]
+    exchange_order_id: Optional[str]
+    notes: str
 
-# 10 HIGHLY SUCCESSFUL SCALPING STRATEGIES FOR GOODWILL L1 DATA
+@dataclass
+class Position:
+    """Position data structure"""
+    symbol: str
+    side: PositionSide
+    quantity: int
+    avg_price: float
+    current_price: float
+    unrealized_pnl: float
+    realized_pnl: float
+    total_pnl: float
+    market_value: float
+    cost_basis: float
+    day_pnl: float
+    timestamp: datetime
+    entry_orders: List[str]
+    exit_orders: List[str]
+    stop_loss_price: float
+    take_profit_prices: List[float]
+    max_profit: float
+    max_loss: float
+    hold_time_seconds: int
 
-class Strategy1_BidAskScalping:
-    """Strategy 1: Bid-Ask Spread Scalping (Most Profitable)"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.bid_ask_history = deque(maxlen=50)
-        self.trades_today = 0
-        self.win_rate = 0.0
-        self.avg_profit = 0.0
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Analyze L1 bid-ask data for scalping opportunities"""
-        try:
-            bid = market_data.get('bid', 0)
-            ask = market_data.get('ask', 0)
-            ltp = market_data.get('ltp', 0)
-            volume = market_data.get('volume', 0)
-            
-            if bid <= 0 or ask <= 0:
-                return None
-            
-            spread = ask - bid
-            spread_pct = (spread / ltp) * 100
-            mid_price = (bid + ask) / 2
-            
-            self.bid_ask_history.append({
-                'bid': bid, 'ask': ask, 'ltp': ltp, 'spread': spread,
-                'timestamp': datetime.now()
-            })
-            
-            if len(self.bid_ask_history) < 10:
-                return None
-            
-            # Strategy: Enter when price hits bid/ask with tight spread
-            if spread_pct < 0.05:  # Tight spread
-                if ltp <= bid + (spread * 0.3):  # Price near bid
-                    return TradingSignal(
-                        symbol=self.symbol,
-                        signal_type=SignalType.BUY,
-                        price=bid + 0.05,  # Slightly above bid
-                        confidence=85.0,
-                        timestamp=datetime.now(),
-                        indicators={'spread_pct': spread_pct, 'position': 'near_bid'},
-                        take_profit=ask - 0.05,
-                        stop_loss=bid - 0.10
-                    )
-                elif ltp >= ask - (spread * 0.3):  # Price near ask
-                    return TradingSignal(
-                        symbol=self.symbol,
-                        signal_type=SignalType.SELL,
-                        price=ask - 0.05,  # Slightly below ask
-                        confidence=85.0,
-                        timestamp=datetime.now(),
-                        indicators={'spread_pct': spread_pct, 'position': 'near_ask'},
-                        take_profit=bid + 0.05,
-                        stop_loss=ask + 0.10
-                    )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy1 error: {e}")
-            return None
+@dataclass
+class ExecutionReport:
+    """Execution report for completed trades"""
+    trade_id: str
+    symbol: str
+    strategy: str
+    entry_time: datetime
+    exit_time: datetime
+    side: str
+    quantity: int
+    entry_price: float
+    exit_price: float
+    gross_pnl: float
+    commission: float
+    net_pnl: float
+    hold_time_seconds: int
+    max_profit: float
+    max_loss: float
+    exit_reason: str
+    success: bool
 
-class Strategy2_VolumeSpike:
-    """Strategy 2: Volume Spike Momentum (High Win Rate)"""
+class MarketReadyExecutionManager:
+    """Market-ready execution manager - routes to live API or paper trading"""
     
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.volume_history = deque(maxlen=30)
-        self.price_history = deque(maxlen=30)
+    def __init__(self):
+        self.config = get_config()
+        self.data_manager = get_data_manager()
+        self.strategy_manager = get_strategy_manager()
+        self.goodwill_handler = get_goodwill_handler()
         
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Volume spike with price momentum"""
-        try:
-            volume = market_data.get('volume', 0)
-            ltp = market_data.get('ltp', 0)
-            
-            self.volume_history.append(volume)
-            self.price_history.append(ltp)
-            
-            if len(self.volume_history) < 20:
-                return None
-            
-            avg_volume = np.mean(list(self.volume_history)[:-5])
-            current_volume = volume
-            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
-            
-            if volume_ratio > 2.5:  # 2.5x average volume
-                prices = list(self.price_history)
-                price_change = (prices[-1] - prices[-5]) / prices[-5] * 100
-                
-                if price_change > 0.3:  # Price rising with volume
-                    return TradingSignal(
-                        symbol=self.symbol,
-                        signal_type=SignalType.BUY,
-                        price=ltp,
-                        confidence=80.0,
-                        timestamp=datetime.now(),
-                        indicators={'volume_ratio': volume_ratio, 'price_change': price_change},
-                        take_profit=ltp * 1.005,  # 0.5% target
-                        stop_loss=ltp * 0.997    # 0.3% stop
-                    )
-                elif price_change < -0.3:  # Price falling with volume
-                    return TradingSignal(
-                        symbol=self.symbol,
-                        signal_type=SignalType.SELL,
-                        price=ltp,
-                        confidence=80.0,
-                        timestamp=datetime.now(),
-                        indicators={'volume_ratio': volume_ratio, 'price_change': price_change},
-                        take_profit=ltp * 0.995,  # 0.5% target
-                        stop_loss=ltp * 1.003    # 0.3% stop
-                    )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy2 error: {e}")
-            return None
-
-class Strategy3_TickMomentum:
-    """Strategy 3: Tick-by-Tick Momentum (Ultra Fast)"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.tick_data = deque(maxlen=20)
+        # Order and position tracking
+        self.pending_orders: Dict[str, Order] = {}
+        self.filled_orders: Dict[str, Order] = {}
+        self.active_positions: Dict[str, Position] = {}
+        self.execution_reports: List[ExecutionReport] = []
         
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Analyze tick momentum"""
-        try:
-            ltp = market_data.get('ltp', 0)
-            timestamp = datetime.now()
-            
-            self.tick_data.append({'price': ltp, 'time': timestamp})
-            
-            if len(self.tick_data) < 10:
-                return None
-            
-            # Calculate tick momentum
-            recent_ticks = list(self.tick_data)[-10:]
-            up_ticks = sum(1 for i in range(1, len(recent_ticks)) 
-                          if recent_ticks[i]['price'] > recent_ticks[i-1]['price'])
-            down_ticks = sum(1 for i in range(1, len(recent_ticks)) 
-                           if recent_ticks[i]['price'] < recent_ticks[i-1]['price'])
-            
-            momentum_score = (up_ticks - down_ticks) / 9.0 * 100
-            
-            if momentum_score >= 70:  # Strong upward momentum
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=75.0,
-                    timestamp=timestamp,
-                    indicators={'momentum_score': momentum_score, 'up_ticks': up_ticks},
-                    take_profit=ltp * 1.003,
-                    stop_loss=ltp * 0.998
-                )
-            elif momentum_score <= -70:  # Strong downward momentum
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=75.0,
-                    timestamp=timestamp,
-                    indicators={'momentum_score': momentum_score, 'down_ticks': down_ticks},
-                    take_profit=ltp * 0.997,
-                    stop_loss=ltp * 1.002
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy3 error: {e}")
-            return None
-
-class Strategy4_OrderBookImbalance:
-    """Strategy 4: Order Book Imbalance (L1 Depth)"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.depth_history = deque(maxlen=15)
+        # Portfolio metrics
+        self.portfolio_value = 100000.0  # Will be updated from API
+        self.available_cash = 100000.0
+        self.buying_power = 100000.0
+        self.daily_pnl = 0.0
+        self.max_daily_loss_limit = -5000.0  # ₹5,000 daily loss limit
         
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Analyze order book imbalance"""
-        try:
-            bid = market_data.get('bid', 0)
-            ask = market_data.get('ask', 0)
-            bid_qty = market_data.get('bid_qty', 0)
-            ask_qty = market_data.get('ask_qty', 0)
-            ltp = market_data.get('ltp', 0)
-            
-            if bid_qty <= 0 or ask_qty <= 0:
-                return None
-            
-            total_qty = bid_qty + ask_qty
-            bid_ratio = bid_qty / total_qty
-            imbalance = (bid_qty - ask_qty) / total_qty
-            
-            self.depth_history.append({
-                'bid_ratio': bid_ratio,
-                'imbalance': imbalance,
-                'timestamp': datetime.now()
-            })
-            
-            if len(self.depth_history) < 5:
-                return None
-            
-            avg_imbalance = np.mean([d['imbalance'] for d in self.depth_history])
-            
-            if imbalance > 0.6 and avg_imbalance > 0.4:  # Strong bid side
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=78.0,
-                    timestamp=datetime.now(),
-                    indicators={'imbalance': imbalance, 'avg_imbalance': avg_imbalance},
-                    take_profit=ltp * 1.004,
-                    stop_loss=ltp * 0.997
-                )
-            elif imbalance < -0.6 and avg_imbalance < -0.4:  # Strong ask side
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=78.0,
-                    timestamp=datetime.now(),
-                    indicators={'imbalance': imbalance, 'avg_imbalance': avg_imbalance},
-                    take_profit=ltp * 0.996,
-                    stop_loss=ltp * 1.003
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy4 error: {e}")
-            return None
-
-class Strategy5_MicroTrend:
-    """Strategy 5: Micro Trend Following (5-tick EMA)"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.prices = deque(maxlen=25)
-        self.ema_5 = None
-        self.ema_12 = None
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """5-tick and 12-tick EMA crossover"""
-        try:
-            ltp = market_data.get('ltp', 0)
-            self.prices.append(ltp)
-            
-            if len(self.prices) < 15:
-                return None
-            
-            # Calculate EMAs
-            prices_list = list(self.prices)
-            self.ema_5 = self._calculate_ema(prices_list, 5)
-            self.ema_12 = self._calculate_ema(prices_list, 12)
-            
-            if self.ema_5 is None or self.ema_12 is None:
-                return None
-            
-            # Previous EMAs
-            prev_ema_5 = self._calculate_ema(prices_list[:-1], 5)
-            prev_ema_12 = self._calculate_ema(prices_list[:-1], 12)
-            
-            if prev_ema_5 is None or prev_ema_12 is None:
-                return None
-            
-            # Crossover detection
-            bullish_cross = (self.ema_5 > self.ema_12 and prev_ema_5 <= prev_ema_12)
-            bearish_cross = (self.ema_5 < self.ema_12 and prev_ema_5 >= prev_ema_12)
-            
-            if bullish_cross and ltp > self.ema_5:
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=82.0,
-                    timestamp=datetime.now(),
-                    indicators={'ema_5': self.ema_5, 'ema_12': self.ema_12, 'cross': 'bullish'},
-                    take_profit=ltp * 1.0035,
-                    stop_loss=ltp * 0.9985
-                )
-            elif bearish_cross and ltp < self.ema_5:
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=82.0,
-                    timestamp=datetime.now(),
-                    indicators={'ema_5': self.ema_5, 'ema_12': self.ema_12, 'cross': 'bearish'},
-                    take_profit=ltp * 0.9965,
-                    stop_loss=ltp * 1.0015
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy5 error: {e}")
-            return None
-    
-    def _calculate_ema(self, prices: List[float], period: int) -> Optional[float]:
-        """Calculate EMA"""
-        if len(prices) < period:
-            return None
-        
-        multiplier = 2 / (period + 1)
-        ema = prices[0]
-        
-        for price in prices[1:]:
-            ema = (price * multiplier) + (ema * (1 - multiplier))
-        
-        return ema
-
-class Strategy6_SpreadCompression:
-    """Strategy 6: Spread Compression Breakout"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.spread_history = deque(maxlen=20)
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Tight spread followed by breakout"""
-        try:
-            bid = market_data.get('bid', 0)
-            ask = market_data.get('ask', 0)
-            ltp = market_data.get('ltp', 0)
-            
-            if bid <= 0 or ask <= 0:
-                return None
-            
-            spread = ask - bid
-            spread_pct = (spread / ltp) * 100
-            
-            self.spread_history.append({
-                'spread': spread,
-                'spread_pct': spread_pct,
-                'ltp': ltp,
-                'timestamp': datetime.now()
-            })
-            
-            if len(self.spread_history) < 10:
-                return None
-            
-            recent_spreads = [s['spread_pct'] for s in list(self.spread_history)[-10:]]
-            avg_spread = np.mean(recent_spreads[:-2])
-            current_spread = spread_pct
-            
-            # Compression followed by expansion
-            if avg_spread < 0.08 and current_spread > avg_spread * 1.5:  # Spread expanding
-                price_move = (ltp - self.spread_history[-5]['ltp']) / self.spread_history[-5]['ltp'] * 100
-                
-                if price_move > 0.2:  # Upward breakout
-                    return TradingSignal(
-                        symbol=self.symbol,
-                        signal_type=SignalType.BUY,
-                        price=ltp,
-                        confidence=79.0,
-                        timestamp=datetime.now(),
-                        indicators={'spread_expansion': current_spread/avg_spread, 'price_move': price_move},
-                        take_profit=ltp * 1.006,
-                        stop_loss=ltp * 0.996
-                    )
-                elif price_move < -0.2:  # Downward breakout
-                    return TradingSignal(
-                        symbol=self.symbol,
-                        signal_type=SignalType.SELL,
-                        price=ltp,
-                        confidence=79.0,
-                        timestamp=datetime.now(),
-                        indicators={'spread_expansion': current_spread/avg_spread, 'price_move': price_move},
-                        take_profit=ltp * 0.994,
-                        stop_loss=ltp * 1.004
-                    )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy6 error: {e}")
-            return None
-
-class Strategy7_PriceAction:
-    """Strategy 7: Price Action Patterns (Support/Resistance)"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.price_levels = deque(maxlen=50)
-        self.support_resistance = {'support': [], 'resistance': []}
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Support/Resistance breakout scalping"""
-        try:
-            ltp = market_data.get('ltp', 0)
-            volume = market_data.get('volume', 0)
-            
-            self.price_levels.append({'price': ltp, 'volume': volume, 'time': datetime.now()})
-            
-            if len(self.price_levels) < 30:
-                return None
-            
-            # Find recent highs and lows
-            prices = [p['price'] for p in self.price_levels]
-            self._update_support_resistance(prices)
-            
-            if not self.support_resistance['support'] or not self.support_resistance['resistance']:
-                return None
-            
-            nearest_support = max([s for s in self.support_resistance['support'] if s < ltp], default=0)
-            nearest_resistance = min([r for r in self.support_resistance['resistance'] if r > ltp], default=float('inf'))
-            
-            # Breakout signals
-            if nearest_resistance != float('inf') and ltp >= nearest_resistance * 1.0005:  # Resistance breakout
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=76.0,
-                    timestamp=datetime.now(),
-                    indicators={'breakout': 'resistance', 'level': nearest_resistance},
-                    take_profit=ltp * 1.008,
-                    stop_loss=nearest_resistance * 0.999
-                )
-            elif nearest_support > 0 and ltp <= nearest_support * 0.9995:  # Support breakdown
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=76.0,
-                    timestamp=datetime.now(),
-                    indicators={'breakout': 'support', 'level': nearest_support},
-                    take_profit=ltp * 0.992,
-                    stop_loss=nearest_support * 1.001
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy7 error: {e}")
-            return None
-    
-    def _update_support_resistance(self, prices: List[float]):
-        """Update support and resistance levels"""
-        try:
-            # Simple pivot point calculation
-            highs = []
-            lows = []
-            
-            for i in range(2, len(prices) - 2):
-                if prices[i] > prices[i-1] and prices[i] > prices[i+1] and prices[i] > prices[i-2] and prices[i] > prices[i+2]:
-                    highs.append(prices[i])
-                elif prices[i] < prices[i-1] and prices[i] < prices[i+1] and prices[i] < prices[i-2] and prices[i] < prices[i+2]:
-                    lows.append(prices[i])
-            
-            self.support_resistance['resistance'] = sorted(highs)[-3:] if highs else []
-            self.support_resistance['support'] = sorted(lows)[-3:] if lows else []
-            
-        except Exception as e:
-            logger.debug(f"Support/Resistance calculation error: {e}")
-
-class Strategy8_VolumeProfile:
-    """Strategy 8: Volume Profile & VWAP"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.vwap_data = deque(maxlen=100)
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """VWAP deviation signals"""
-        try:
-            ltp = market_data.get('ltp', 0)
-            volume = market_data.get('volume', 0)
-            
-            self.vwap_data.append({'price': ltp, 'volume': volume})
-            
-            if len(self.vwap_data) < 20:
-                return None
-            
-            # Calculate VWAP
-            total_volume = sum(d['volume'] for d in self.vwap_data)
-            if total_volume == 0:
-                return None
-            
-            vwap = sum(d['price'] * d['volume'] for d in self.vwap_data) / total_volume
-            deviation = (ltp - vwap) / vwap * 100
-            
-            # Standard deviation
-            price_deviations = [(d['price'] - vwap) ** 2 for d in self.vwap_data]
-            std_dev = np.sqrt(np.mean(price_deviations))
-            std_dev_pct = (std_dev / vwap) * 100
-            
-            # Mean reversion signals
-            if deviation < -2 * std_dev_pct and deviation < -0.5:  # Oversold vs VWAP
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=77.0,
-                    timestamp=datetime.now(),
-                    indicators={'vwap_deviation': deviation, 'std_dev': std_dev_pct},
-                    take_profit=vwap,
-                    stop_loss=ltp * 0.996
-                )
-            elif deviation > 2 * std_dev_pct and deviation > 0.5:  # Overbought vs VWAP
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=77.0,
-                    timestamp=datetime.now(),
-                    indicators={'vwap_deviation': deviation, 'std_dev': std_dev_pct},
-                    take_profit=vwap,
-                    stop_loss=ltp * 1.004
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy8 error: {e}")
-            return None
-
-class Strategy9_TimeBasedMomentum:
-    """Strategy 9: Time-Based Momentum (Opening/Closing Hour)"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.momentum_data = deque(maxlen=30)
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Time-based momentum patterns"""
-        try:
-            ltp = market_data.get('ltp', 0)
-            volume = market_data.get('volume', 0)
-            current_time = datetime.now().time()
-            
-            # Focus on high-volume periods
-            is_opening_hour = datetime.strptime('09:15', '%H:%M').time() <= current_time <= datetime.strptime('10:30', '%H:%M').time()
-            is_closing_hour = datetime.strptime('14:30', '%H:%M').time() <= current_time <= datetime.strptime('15:30', '%H:%M').time()
-            
-            if not (is_opening_hour or is_closing_hour):
-                return None
-            
-            self.momentum_data.append({
-                'price': ltp,
-                'volume': volume,
-                'time': current_time
-            })
-            
-            if len(self.momentum_data) < 10:
-                return None
-            
-            # Calculate price momentum
-            recent_prices = [d['price'] for d in list(self.momentum_data)[-10:]]
-            momentum = (recent_prices[-1] - recent_prices[0]) / recent_prices[0] * 100
-            
-            # Volume confirmation
-            recent_volumes = [d['volume'] for d in list(self.momentum_data)[-5:]]
-            avg_volume = np.mean(recent_volumes)
-            
-            if momentum > 0.4 and volume > avg_volume * 1.2:  # Strong upward momentum
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=81.0,
-                    timestamp=datetime.now(),
-                    indicators={'momentum': momentum, 'period': 'opening' if is_opening_hour else 'closing'},
-                    take_profit=ltp * 1.007,
-                    stop_loss=ltp * 0.995
-                )
-            elif momentum < -0.4 and volume > avg_volume * 1.2:  # Strong downward momentum
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=81.0,
-                    timestamp=datetime.now(),
-                    indicators={'momentum': momentum, 'period': 'opening' if is_opening_hour else 'closing'},
-                    take_profit=ltp * 0.993,
-                    stop_loss=ltp * 1.005
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy9 error: {e}")
-            return None
-
-class Strategy10_MultiTimeframe:
-    """Strategy 10: Multi-Timeframe Confluence"""
-    
-    def __init__(self, symbol: str):
-        self.symbol = symbol
-        self.tick_data = deque(maxlen=100)
-        self.minute_data = deque(maxlen=10)
-        self.last_minute_close = None
-        
-    def analyze_signal(self, market_data: Dict) -> Optional[TradingSignal]:
-        """Multi-timeframe analysis"""
-        try:
-            ltp = market_data.get('ltp', 0)
-            volume = market_data.get('volume', 0)
-            timestamp = datetime.now()
-            
-            self.tick_data.append({'price': ltp, 'volume': volume, 'time': timestamp})
-            
-            # Create minute bars
-            current_minute = timestamp.replace(second=0, microsecond=0)
-            
-            if not self.minute_data or self.minute_data[-1]['time'] < current_minute:
-                if self.tick_data:
-                    minute_prices = [t['price'] for t in self.tick_data if t['time'] >= current_minute - timedelta(minutes=1)]
-                    if minute_prices:
-                        minute_bar = {
-                            'open': minute_prices[0],
-                            'high': max(minute_prices),
-                            'low': min(minute_prices),
-                            'close': minute_prices[-1],
-                            'volume': sum(t['volume'] for t in self.tick_data if t['time'] >= current_minute - timedelta(minutes=1)),
-                            'time': current_minute
-                        }
-                        self.minute_data.append(minute_bar)
-            
-            if len(self.minute_data) < 5 or len(self.tick_data) < 20:
-                return None
-            
-            # Minute trend
-            minute_prices = [bar['close'] for bar in list(self.minute_data)[-5:]]
-            minute_trend = 'up' if minute_prices[-1] > minute_prices[0] else 'down'
-            
-            # Tick momentum
-            tick_prices = [t['price'] for t in list(self.tick_data)[-10:]]
-            tick_momentum = (tick_prices[-1] - tick_prices[0]) / tick_prices[0] * 100
-            
-            # Confluence signal
-            if minute_trend == 'up' and tick_momentum > 0.2:  # Both timeframes bullish
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.BUY,
-                    price=ltp,
-                    confidence=88.0,
-                    timestamp=timestamp,
-                    indicators={'minute_trend': minute_trend, 'tick_momentum': tick_momentum},
-                    take_profit=ltp * 1.008,
-                    stop_loss=ltp * 0.994
-                )
-            elif minute_trend == 'down' and tick_momentum < -0.2:  # Both timeframes bearish
-                return TradingSignal(
-                    symbol=self.symbol,
-                    signal_type=SignalType.SELL,
-                    price=ltp,
-                    confidence=88.0,
-                    timestamp=timestamp,
-                    indicators={'minute_trend': minute_trend, 'tick_momentum': tick_momentum},
-                    take_profit=ltp * 0.992,
-                    stop_loss=ltp * 1.006
-                )
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Strategy10 error: {e}")
-            return None
-
-
-# REAL-TIME EXECUTION MANAGER WITH STRATEGY APPLICATION
-class ExecutionManager:
-    """Manages real-time execution of 10 scalping strategies on top stocks"""
-    
-    def __init__(self, api_handler, paper_engine, db_path: str = "data/execution_queue.db"):
-        self.api = api_handler
-        self.paper_engine = paper_engine
-        self.db_path = db_path
-        
-        # Active stocks for execution
-        self.active_stocks: Dict[str, ExecutionStock] = {}
-        self.max_active_stocks = 10
-        
-        # Strategy instances for each stock
-        self.strategies: Dict[str, List] = {}
-        
-        # Real-time data processing
-        self.market_data_queue = queue.Queue(maxsize=1000)
-        self.signal_queue = queue.Queue(maxsize=500)
-        self.execution_queue = queue.Queue(maxsize=200)
-        
-        # Threading control
-        self.running = False
-        self.threads = {}
-        
-        # Performance tracking
+        # Execution statistics
         self.execution_stats = {
-            'signals_generated': 0,
-            'orders_placed': 0,
-            'successful_trades': 0,
-            'total_pnl': 0.0,
-            'win_rate': 0.0
+            'total_orders': 0,
+            'filled_orders': 0,
+            'cancelled_orders': 0,
+            'rejected_orders': 0,
+            'avg_fill_time_ms': 0,
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_commission': 0.0,
+            'total_pnl': 0.0
         }
         
-        # Risk management
-        self.risk_manager = RiskManager()
+        # Risk controls
+        self.risk_controls = {
+            'max_position_size': 10000,  # Max shares per position
+            'max_portfolio_risk': 0.10,  # 10% max portfolio risk
+            'max_single_position_risk': 0.02,  # 2% max risk per position
+            'max_daily_trades': 50,  # Max trades per day
+            'min_liquidity_check': True,  # Check liquidity before orders
+            'pre_market_trading': False,  # Allow pre-market trading
+            'after_hours_trading': False  # Allow after-hours trading
+        }
         
-        # Initialize database
-        self._init_database()
+        # Order management
+        self.order_counter = 0
+        self.execution_lock = threading.Lock()
         
-        logger.info("⚡ Execution Manager initialized")
+        logging.info("Market-Ready Execution Manager initialized")
     
-    def _init_database(self):
-        """Initialize execution database"""
+    async def execute_signal(self, signal: ScalpingSignal) -> Optional[str]:
+        """Execute a trading signal - routes to live API or paper trading"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS execution_signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    strategy_name TEXT NOT NULL,
-                    signal_type TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    confidence REAL NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    indicators TEXT,
-                    stop_loss REAL,
-                    take_profit REAL,
-                    executed BOOLEAN DEFAULT 0,
-                    order_id TEXT,
-                    execution_price REAL,
-                    execution_time DATETIME
-                )
-            """)
-            
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS active_positions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    strategy_name TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    entry_price REAL NOT NULL,
-                    current_price REAL,
-                    unrealized_pnl REAL,
-                    stop_loss REAL,
-                    take_profit REAL,
-                    entry_time DATETIME NOT NULL,
-                    last_update DATETIME,
-                    is_open BOOLEAN DEFAULT 1
-                )
-            """)
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info("✅ Execution database initialized")
-            
+            if self.config.trading.paper_trading:
+                # Route to paper trading engine
+                from paper_trading_engine import get_paper_trading_engine
+                paper_engine = get_paper_trading_engine()
+                return await paper_engine.place_paper_order(signal)
+            else:
+                # Live trading execution
+                return await self._execute_live_signal(signal)
+                
         except Exception as e:
-            logger.error(f"❌ Execution database init error: {e}")
+            logging.error(f"Error executing signal for {signal.symbol}: {e}")
+            return None
     
-    def set_active_stocks(self, stocks_data: List[Dict]):
-        """Set the top 10 stocks for active execution"""
+    async def _execute_live_signal(self, signal: ScalpingSignal) -> Optional[str]:
+        """Execute live trading signal with comprehensive risk checks"""
         try:
-            # Clear existing stocks
-            self.active_stocks.clear()
-            self.strategies.clear()
-            
-            # Add new stocks (top 10)
-            for i, stock_data in enumerate(stocks_data[:self.max_active_stocks]):
-                symbol = stock_data['symbol']
+            async with asyncio.Lock():
+                # Pre-execution risk checks
+                if not await self._pre_execution_risk_check(signal):
+                    return None
                 
-                # Create ExecutionStock
-                execution_stock = ExecutionStock(
-                    symbol=symbol,
-                    asset_type=stock_data.get('asset_type', 'equity'),
-                    scalping_score=stock_data.get('scalping_score', 0),
-                    volatility_score=stock_data.get('volatility_score', 0),
-                    liquidity_score=stock_data.get('liquidity_score', 0),
-                    current_price=stock_data.get('current_price', 0)
-                )
+                # Check market conditions
+                if not await self._check_market_conditions(signal.symbol):
+                    return None
                 
-                self.active_stocks[symbol] = execution_stock
+                # Validate signal freshness (signals older than 30 seconds are rejected)
+                signal_age = (datetime.now() - signal.timestamp).total_seconds()
+                if signal_age > 30:
+                    logging.warning(f"Signal for {signal.symbol} is {signal_age:.1f}s old, rejecting")
+                    return None
                 
-                # Initialize all 10 strategies for this stock
-                self.strategies[symbol] = [
-                    Strategy1_BidAskScalping(symbol),
-                    Strategy2_VolumeSpike(symbol),
-                    Strategy3_TickMomentum(symbol),
-                    Strategy4_OrderBookImbalance(symbol),
-                    Strategy5_MicroTrend(symbol),
-                    Strategy6_SpreadCompression(symbol),
-                    Strategy7_PriceAction(symbol),
-                    Strategy8_VolumeProfile(symbol),
-                    Strategy9_TimeBasedMomentum(symbol),
-                    Strategy10_MultiTimeframe(symbol)
-                ]
+                # Create primary order
+                order_id = await self._create_primary_order(signal)
+                if not order_id:
+                    return None
                 
-                logger.info(f"📈 Added {symbol} for active execution (rank #{i+1})")
-            
-            logger.info(f"✅ Set {len(self.active_stocks)} stocks for active execution")
-            
-        except Exception as e:
-            logger.error(f"❌ Set active stocks error: {e}")
-    
-    def start_execution(self):
-        """Start real-time execution system"""
-        try:
-            self.running = True
-            
-            # Start data processing thread
-            self.threads['data_processor'] = threading.Thread(
-                target=self._process_market_data,
-                daemon=True,
-                name="DataProcessor"
-            )
-            self.threads['data_processor'].start()
-            
-            # Start signal generation thread
-            self.threads['signal_generator'] = threading.Thread(
-                target=self._generate_signals,
-                daemon=True,
-                name="SignalGenerator"
-            )
-            self.threads['signal_generator'].start()
-            
-            # Start order execution thread
-            self.threads['order_executor'] = threading.Thread(
-                target=self._execute_orders,
-                daemon=True,
-                name="OrderExecutor"
-            )
-            self.threads['order_executor'].start()
-            
-            # Start position monitoring thread
-            self.threads['position_monitor'] = threading.Thread(
-                target=self._monitor_positions,
-                daemon=True,
-                name="PositionMonitor"
-            )
-            self.threads['position_monitor'].start()
-            
-            logger.info("🚀 Execution Manager started - all threads running")
-            
-        except Exception as e:
-            logger.error(f"❌ Start execution error: {e}")
-    
-    def stop_execution(self):
-        """Stop execution system"""
-        try:
-            self.running = False
-            
-            # Wait for threads to finish
-            for thread_name, thread in self.threads.items():
-                if thread.is_alive():
-                    thread.join(timeout=5)
-                    logger.info(f"⏹️ {thread_name} stopped")
-            
-            logger.info("⏹️ Execution Manager stopped")
-            
-        except Exception as e:
-            logger.error(f"❌ Stop execution error: {e}")
-    
-    def feed_market_data(self, symbol: str, market_data: Dict):
-        """Feed real-time market data to processing queue"""
-        try:
-            if symbol in self.active_stocks:
-                data_packet = {
-                    'symbol': symbol,
-                    'data': market_data,
-                    'timestamp': datetime.now()
-                }
-                
-                # Add to processing queue (non-blocking)
-                if not self.market_data_queue.full():
-                    self.market_data_queue.put(data_packet)
+                # Submit order to Goodwill API
+                if await self._submit_order(order_id):
+                    logging.info(f"Successfully executed live signal for {signal.symbol}: {order_id}")
+                    return order_id
                 else:
-                    logger.warning(f"⚠️ Market data queue full for {symbol}")
+                    logging.error(f"Failed to submit live order for {signal.symbol}")
+                    return None
                     
         except Exception as e:
-            logger.debug(f"Feed market data error: {e}")
+            logging.error(f"Error executing live signal for {signal.symbol}: {e}")
+            return None
     
-    def _process_market_data(self):
-        """Process incoming market data in real-time"""
-        while self.running:
-            try:
-                # Get market data with timeout
-                data_packet = self.market_data_queue.get(timeout=1)
-                
-                symbol = data_packet['symbol']
-                market_data = data_packet['data']
-                timestamp = data_packet['timestamp']
-                
-                if symbol not in self.active_stocks:
-                    continue
-                
-                # Update stock data
-                execution_stock = self.active_stocks[symbol]
-                execution_stock.current_price = market_data.get('ltp', 0)
-                execution_stock.bid_price = market_data.get('bid', 0)
-                execution_stock.ask_price = market_data.get('ask', 0)
-                execution_stock.volume = market_data.get('volume', 0)
-                execution_stock.last_update = timestamp
-                
-                # Calculate unrealized P&L if position exists
-                if execution_stock.position_size != 0:
-                    price_diff = execution_stock.current_price - execution_stock.entry_price
-                    if execution_stock.position_size > 0:  # Long position
-                        execution_stock.unrealized_pnl = price_diff * execution_stock.position_size
-                    else:  # Short position
-                        execution_stock.unrealized_pnl = -price_diff * abs(execution_stock.position_size)
-                
-                # Apply all strategies to this market data
-                self._apply_strategies_to_data(symbol, market_data)
-                
-                # Mark task as done
-                self.market_data_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"❌ Process market data error: {e}")
-    
-    def _apply_strategies_to_data(self, symbol: str, market_data: Dict):
-        """Apply all 10 strategies to incoming market data"""
+    async def _pre_execution_risk_check(self, signal: ScalpingSignal) -> bool:
+        """Comprehensive pre-execution risk validation"""
         try:
-            if symbol not in self.strategies:
-                return
-            
-            strategy_instances = self.strategies[symbol]
-            
-            # Apply each strategy
-            for i, strategy in enumerate(strategy_instances):
-                try:
-                    signal = strategy.analyze_signal(market_data)
-                    
-                    if signal:
-                        # Add strategy name to signal
-                        signal_data = signal.to_dict()
-                        signal_data['strategy_name'] = strategy.__class__.__name__
-                        signal_data['strategy_id'] = i + 1
-                        
-                        # Add to signal queue
-                        if not self.signal_queue.full():
-                            self.signal_queue.put(signal_data)
-                            self.execution_stats['signals_generated'] += 1
-                            
-                            logger.info(f"📊 Signal: {symbol} {signal.signal_type.value} from {strategy.__class__.__name__} (conf: {signal.confidence}%)")
-                        
-                except Exception as e:
-                    logger.debug(f"Strategy {i+1} error for {symbol}: {e}")
-                    continue
-                    
-        except Exception as e:
-            logger.error(f"❌ Apply strategies error: {e}")
-    
-    def _generate_signals(self):
-        """Process and validate generated signals"""
-        while self.running:
-            try:
-                # Get signal with timeout
-                signal_data = self.signal_queue.get(timeout=1)
-                
-                symbol = signal_data['symbol']
-                
-                # Validate signal
-                if self._validate_signal(signal_data):
-                    # Save signal to database
-                    self._save_signal_to_db(signal_data)
-                    
-                    # Check risk management
-                    if self.risk_manager.check_signal_risk(signal_data, self.active_stocks[symbol]):
-                        # Add to execution queue
-                        if not self.execution_queue.full():
-                            self.execution_queue.put(signal_data)
-                            logger.info(f"✅ Signal validated: {symbol} {signal_data['signal_type']}")
-                        else:
-                            logger.warning(f"⚠️ Execution queue full for {symbol}")
-                    else:
-                        logger.warning(f"⚠️ Signal failed risk check: {symbol}")
-                
-                self.signal_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"❌ Generate signals error: {e}")
-    
-    def _validate_signal(self, signal_data: Dict) -> bool:
-        """Validate signal quality"""
-        try:
-            # Basic validation
-            if signal_data['confidence'] < 70:  # Minimum confidence
+            # Check daily loss limit
+            if self.daily_pnl <= self.max_daily_loss_limit:
+                logging.warning(f"Daily loss limit reached: ₹{self.daily_pnl:.2f}")
                 return False
             
-            symbol = signal_data['symbol']
-            if symbol not in self.active_stocks:
+            # Check maximum daily trades
+            today_trades = len([r for r in self.execution_reports 
+                              if r.entry_time.date() == datetime.now().date()])
+            if today_trades >= self.risk_controls['max_daily_trades']:
+                logging.warning(f"Daily trade limit reached: {today_trades}")
                 return False
             
-            execution_stock = self.active_stocks[symbol]
-            
-            # Check if stock is already in position (avoid over-trading)
-            if execution_stock.status in [ExecutionStatus.ORDER_PLACED, ExecutionStatus.POSITION_OPEN]:
+            # Check position size limits
+            if signal.position_size > self.risk_controls['max_position_size']:
+                logging.warning(f"Position size {signal.position_size} exceeds limit {self.risk_controls['max_position_size']}")
                 return False
             
-            # Check price validity
-            current_price = execution_stock.current_price
-            signal_price = signal_data['price']
-            
-            if abs(signal_price - current_price) / current_price > 0.01:  # 1% price deviation
+            # Check portfolio risk
+            portfolio_risk = calculate_portfolio_risk(self.active_positions, self.portfolio_value)
+            if portfolio_risk['risk_percentage'] > self.risk_controls['max_portfolio_risk'] * 100:
+                logging.warning(f"Portfolio risk {portfolio_risk['risk_percentage']:.1f}% exceeds limit")
                 return False
             
-            # Check minimum time between signals (avoid spam)
-            time_since_last = (datetime.now() - execution_stock.last_update).seconds
-            if time_since_last < 5:  # Minimum 5 seconds
+            # Check individual position risk
+            position_risk = abs(signal.entry_price - signal.stop_loss_price) * signal.position_size
+            position_risk_pct = position_risk / self.portfolio_value
+            if position_risk_pct > self.risk_controls['max_single_position_risk']:
+                logging.warning(f"Position risk {position_risk_pct:.2%} exceeds {self.risk_controls['max_single_position_risk']:.2%}")
+                return False
+            
+            # Check available cash
+            order_value = signal.entry_price * signal.position_size
+            if order_value > self.available_cash:
+                logging.warning(f"Insufficient cash: need ₹{order_value:.2f}, have ₹{self.available_cash:.2f}")
+                return False
+            
+            # Check if symbol already has maximum exposure
+            existing_position = self.active_positions.get(signal.symbol)
+            if existing_position and existing_position.market_value > self.portfolio_value * 0.1:  # 10% max per symbol
+                logging.warning(f"Maximum exposure reached for {signal.symbol}")
                 return False
             
             return True
             
         except Exception as e:
-            logger.debug(f"Signal validation error: {e}")
+            logging.error(f"Error in pre-execution risk check: {e}")
             return False
     
-    def _execute_orders(self):
-        """Execute validated trading signals"""
-        while self.running:
-            try:
-                # Get execution signal with timeout
-                signal_data = self.execution_queue.get(timeout=1)
-                
-                symbol = signal_data['symbol']
-                execution_stock = self.active_stocks[symbol]
-                
-                # Calculate position size
-                position_size = self._calculate_position_size(execution_stock, signal_data)
-                
-                if position_size == 0:
-                    continue
-                
-                # Place order
-                order_result = self._place_scalping_order(signal_data, position_size)
-                
-                if order_result and order_result.get('success'):
-                    # Update execution stock status
-                    execution_stock.status = ExecutionStatus.ORDER_PLACED
-                    
-                    # Update statistics
-                    self.execution_stats['orders_placed'] += 1
-                    
-                    logger.info(f"📝 Order placed: {symbol} {signal_data['signal_type']} qty: {position_size}")
-                else:
-                    logger.error(f"❌ Order failed: {symbol} {signal_data['signal_type']}")
-                
-                self.execution_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"❌ Execute orders error: {e}")
-    
-    def _calculate_position_size(self, execution_stock: ExecutionStock, signal_data: Dict) -> int:
-        """Calculate appropriate position size"""
+    async def _check_market_conditions(self, symbol: str) -> bool:
+        """Check market conditions before order placement"""
         try:
-            # Base position size from stock's max size
-            base_size = execution_stock.max_position_size
+            # Check if market is open
+            if not self.config.is_trading_hours():
+                if not (self.risk_controls['pre_market_trading'] or self.risk_controls['after_hours_trading']):
+                    logging.warning(f"Market is closed and extended hours trading is disabled")
+                    return False
             
-            # Adjust based on confidence
-            confidence = signal_data['confidence']
-            confidence_multiplier = confidence / 100
-            
-            # Adjust based on volatility (lower volatility = larger size)
-            volatility_multiplier = 1.0
-            if execution_stock.volatility_score > 80:
-                volatility_multiplier = 0.5
-            elif execution_stock.volatility_score > 60:
-                volatility_multiplier = 0.7
-            
-            # Calculate final size
-            position_size = int(base_size * confidence_multiplier * volatility_multiplier)
-            
-            # Minimum and maximum limits
-            position_size = max(1, min(position_size, execution_stock.max_position_size))
-            
-            return position_size
-            
-        except Exception as e:
-            logger.debug(f"Position size calculation error: {e}")
-            return 0
-    
-    def _place_scalping_order(self, signal_data: Dict, position_size: int) -> Optional[Dict]:
-        """Place actual trading order"""
-        try:
-            symbol = signal_data['symbol']
-            signal_type = signal_data['signal_type']
-            price = signal_data['price']
-            
-            # Determine order side
-            if signal_type in ['buy', 'exit_short']:
-                side = 'BUY'
-            else:
-                side = 'SELL'
-            
-            # Use paper trading engine
-            if self.paper_engine:
-                from paper_trading_engine import OrderType
+            # Check liquidity
+            if self.risk_controls['min_liquidity_check']:
+                latest_tick = self.data_manager.get_latest_tick(symbol)
+                if not latest_tick or latest_tick.volume < 1000:  # Minimum volume requirement
+                    logging.warning(f"Insufficient liquidity for {symbol}")
+                    return False
                 
-                order_id = self.paper_engine.place_order(
-                    symbol=symbol,
-                    side=side,
-                    quantity=position_size,
-                    order_type=OrderType.MARKET  # Market orders for scalping
-                )
-                
-                if order_id:
-                    return {
-                        'success': True,
-                        'order_id': order_id,
-                        'mode': 'paper'
-                    }
-            
-            # For live trading (when implemented)
-            # order_response = self.api.place_order(...)
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Place scalping order error: {e}")
-            return None
-    
-    def _monitor_positions(self):
-        """Monitor open positions for exit signals"""
-        while self.running:
-            try:
-                time.sleep(1)  # Check every second
-                
-                for symbol, execution_stock in self.active_stocks.items():
-                    if execution_stock.status == ExecutionStatus.POSITION_OPEN:
-                        self._check_position_exit(execution_stock)
-                        
-            except Exception as e:
-                logger.error(f"❌ Monitor positions error: {e}")
-    
-    def _check_position_exit(self, execution_stock: ExecutionStock):
-        """Check if position should be exited"""
-        try:
-            current_price = execution_stock.current_price
-            entry_price = execution_stock.entry_price
-            
-            if entry_price == 0:
-                return
-            
-            # Calculate profit/loss percentage
-            if execution_stock.position_size > 0:  # Long position
-                pnl_pct = (current_price - entry_price) / entry_price * 100
-            else:  # Short position
-                pnl_pct = (entry_price - current_price) / entry_price * 100
-            
-            # Exit conditions
-            should_exit = False
-            exit_reason = ""
-            
-            # Stop loss
-            if pnl_pct <= -execution_stock.stop_loss_pct:
-                should_exit = True
-                exit_reason = "stop_loss"
-            
-            # Take profit
-            elif pnl_pct >= execution_stock.take_profit_pct:
-                should_exit = True
-                exit_reason = "take_profit"
-            
-            # Time-based exit (scalping - quick exits)
-            elif (datetime.now() - execution_stock.last_update).seconds > 300:  # 5 minutes max
-                should_exit = True
-                exit_reason = "time_exit"
-            
-            if should_exit:
-                self._exit_position(execution_stock, exit_reason)
-                
-        except Exception as e:
-            logger.debug(f"Check position exit error: {e}")
-    
-    def _exit_position(self, execution_stock: ExecutionStock, reason: str):
-        """Exit open position"""
-        try:
-            symbol = execution_stock.symbol
-            position_size = execution_stock.position_size
-            
-            if position_size == 0:
-                return
-            
-            # Determine exit side
-            exit_side = 'SELL' if position_size > 0 else 'BUY'
-            
-            # Place exit order
-            if self.paper_engine:
-                from paper_trading_engine import OrderType
-                
-                order_id = self.paper_engine.place_order(
-                    symbol=symbol,
-                    side=exit_side,
-                    quantity=abs(position_size),
-                    order_type=OrderType.MARKET
-                )
-                
-                if order_id:
-                    execution_stock.status = ExecutionStatus.EXITING
-                    logger.info(f"🔒 Exiting position: {symbol} reason: {reason}")
-                    
-                    # Update statistics
-                    if execution_stock.unrealized_pnl > 0:
-                        self.execution_stats['successful_trades'] += 1
-                    
-                    self.execution_stats['total_pnl'] += execution_stock.unrealized_pnl
-                    
-                    # Reset position
-                    execution_stock.position_size = 0
-                    execution_stock.entry_price = 0
-                    execution_stock.unrealized_pnl = 0
-                    execution_stock.status = ExecutionStatus.COMPLETED
-                    
-        except Exception as e:
-            logger.error(f"❌ Exit position error: {e}")
-    
-    def _save_signal_to_db(self, signal_data: Dict):
-        """Save signal to database"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT INTO execution_signals 
-                (symbol, strategy_name, signal_type, price, confidence, timestamp, 
-                 indicators, stop_loss, take_profit)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                signal_data['symbol'],
-                signal_data.get('strategy_name', ''),
-                signal_data['signal_type'],
-                signal_data['price'],
-                signal_data['confidence'],
-                signal_data['timestamp'],
-                json.dumps(signal_data.get('indicators', {})),
-                signal_data.get('stop_loss'),
-                signal_data.get('take_profit')
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.debug(f"Save signal to DB error: {e}")
-    
-    def get_execution_summary(self) -> Dict:
-        """Get execution summary"""
-        try:
-            # Calculate win rate
-            total_trades = self.execution_stats['successful_trades'] + max(0, self.execution_stats['orders_placed'] - self.execution_stats['successful_trades'])
-            win_rate = (self.execution_stats['successful_trades'] / total_trades * 100) if total_trades > 0 else 0
-            
-            # Get active positions
-            active_positions = []
-            for symbol, stock in self.active_stocks.items():
-                if stock.position_size != 0:
-                    active_positions.append({
-                        'symbol': symbol,
-                        'side': 'LONG' if stock.position_size > 0 else 'SHORT',
-                        'size': abs(stock.position_size),
-                        'entry_price': stock.entry_price,
-                        'current_price': stock.current_price,
-                        'unrealized_pnl': stock.unrealized_pnl,
-                        'status': stock.status.value
-                    })
-            
-            return {
-                'execution_stats': {
-                    'signals_generated': self.execution_stats['signals_generated'],
-                    'orders_placed': self.execution_stats['orders_placed'],
-                    'successful_trades': self.execution_stats['successful_trades'],
-                    'total_pnl': round(self.execution_stats['total_pnl'], 2),
-                    'win_rate': round(win_rate, 1)
-                },
-                'active_stocks': [stock.to_dict() for stock in self.active_stocks.values()],
-                'active_positions': active_positions,
-                'system_status': {
-                    'running': self.running,
-                    'active_stocks_count': len(self.active_stocks),
-                    'queue_sizes': {
-                        'market_data': self.market_data_queue.qsize(),
-                        'signals': self.signal_queue.qsize(),
-                        'execution': self.execution_queue.qsize()
-                    }
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Execution summary error: {e}")
-            return {'error': str(e)}
-
-
-# RISK MANAGEMENT
-class RiskManager:
-    """Risk management for scalping execution"""
-    
-    def __init__(self):
-        self.max_daily_trades_per_stock = 50
-        self.max_daily_loss_per_stock = 1000.0
-        self.max_concurrent_positions = 5
-        self.daily_trade_counts = {}
-        self.daily_pnl = {}
-        
-    def check_signal_risk(self, signal_data: Dict, execution_stock: ExecutionStock) -> bool:
-        """Check if signal passes risk management"""
-        try:
-            symbol = signal_data['symbol']
-            today = datetime.now().date()
-            
-            # Initialize daily counters
-            if symbol not in self.daily_trade_counts:
-                self.daily_trade_counts[symbol] = {}
-            if today not in self.daily_trade_counts[symbol]:
-                self.daily_trade_counts[symbol][today] = 0
-            
-            if symbol not in self.daily_pnl:
-                self.daily_pnl[symbol] = {}
-            if today not in self.daily_pnl[symbol]:
-                self.daily_pnl[symbol][today] = 0.0
-            
-            # Check daily trade limit
-            if self.daily_trade_counts[symbol][today] >= self.max_daily_trades_per_stock:
-                return False
-            
-            # Check daily loss limit
-            if self.daily_pnl[symbol][today] <= -self.max_daily_loss_per_stock:
-                return False
-            
-            # Check confidence threshold based on recent performance
-            if execution_stock.trades_today > 5:
-                win_rate = execution_stock.profit_trades / execution_stock.trades_today
-                if win_rate < 0.4 and signal_data['confidence'] < 85:  # Higher threshold if losing
+                # Check bid-ask spread
+                latest_l1 = self.data_manager.get_latest_l1(symbol)
+                if latest_l1 and latest_l1.spread_percent > 1.0:  # 1% max spread
+                    logging.warning(f"Bid-ask spread too wide for {symbol}: {latest_l1.spread_percent:.2f}%")
                     return False
             
             return True
             
         except Exception as e:
-            logger.debug(f"Risk check error: {e}")
+            logging.error(f"Error checking market conditions for {symbol}: {e}")
             return False
-
-
-# INTEGRATION EXAMPLE
-if __name__ == "__main__":
-    # Example usage showing real-time data flow
     
-    # Mock API and paper engine
-    class MockAPI:
-        pass
+    async def _create_primary_order(self, signal: ScalpingSignal) -> Optional[str]:
+        """Create primary market order from signal"""
+        try:
+            self.order_counter += 1
+            order_id = f"ORD_{signal.symbol}_{int(time.time())}_{self.order_counter}"
+            
+            # Determine order side
+            side = "BUY" if signal.signal_type == SignalType.BUY else "SELL"
+            
+            order = Order(
+                order_id=order_id,
+                symbol=signal.symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=signal.position_size,
+                price=signal.entry_price,
+                stop_price=0.0,
+                trigger_price=0.0,
+                time_in_force="IOC",  # Immediate or Cancel for market orders
+                status=OrderStatus.PENDING,
+                filled_qty=0,
+                remaining_qty=signal.position_size,
+                avg_price=0.0,
+                commission=0.0,
+                timestamp=datetime.now(),
+                parent_signal_id=id(signal),
+                exchange_order_id=None,
+                notes=f"Strategy: {signal.strategy.value}, Confidence: {signal.confidence:.2f}"
+            )
+            
+            self.pending_orders[order_id] = order
+            self.execution_stats['total_orders'] += 1
+            
+            # Create bracket orders for stop-loss and take-profits
+            await self._create_bracket_orders(order_id, signal)
+            
+            logging.info(f"Created primary order {order_id} for {signal.symbol}: "
+                        f"{side} {signal.position_size} shares at market")
+            
+            return order_id
+            
+        except Exception as e:
+            logging.error(f"Error creating primary order: {e}")
+            return None
     
-    class MockPaperEngine:
-        def place_order(self, symbol, side, quantity, order_type):
-            return f"ORDER_{symbol}_{int(time.time())}"
+    async def _create_bracket_orders(self, parent_order_id: str, signal: ScalpingSignal):
+        """Create stop-loss and take-profit bracket orders"""
+        try:
+            parent_order = self.pending_orders.get(parent_order_id)
+            if not parent_order:
+                return
+            
+            # Stop-loss order
+            sl_order_id = f"SL_{parent_order_id}"
+            sl_side = "SELL" if parent_order.side == "BUY" else "BUY"
+            
+            sl_order = Order(
+                order_id=sl_order_id,
+                symbol=signal.symbol,
+                side=sl_side,
+                order_type=OrderType.STOP_LOSS,
+                quantity=signal.position_size,
+                price=signal.stop_loss_price,
+                stop_price=signal.stop_loss_price,
+                trigger_price=signal.stop_loss_price,
+                time_in_force="DAY",
+                status=OrderStatus.PENDING,
+                filled_qty=0,
+                remaining_qty=signal.position_size,
+                avg_price=0.0,
+                commission=0.0,
+                timestamp=datetime.now(),
+                parent_signal_id=parent_order_id,
+                exchange_order_id=None,
+                notes=f"Stop-loss for {parent_order_id}"
+            )
+            
+            self.pending_orders[sl_order_id] = sl_order
+            
+            # Take-profit orders (3 levels)
+            tp_quantities = [
+                int(signal.position_size * 0.5),  # 50% at TP1
+                int(signal.position_size * 0.3),  # 30% at TP2
+                int(signal.position_size * 0.2)   # 20% at TP3
+            ]
+            
+            tp_prices = [signal.take_profit_1, signal.take_profit_2, signal.take_profit_3]
+            
+            for i, (qty, price) in enumerate(zip(tp_quantities, tp_prices)):
+                if qty <= 0:
+                    continue
+                
+                tp_order_id = f"TP{i+1}_{parent_order_id}"
+                tp_side = "SELL" if parent_order.side == "BUY" else "BUY"
+                
+                tp_order = Order(
+                    order_id=tp_order_id,
+                    symbol=signal.symbol,
+                    side=tp_side,
+                    order_type=OrderType.LIMIT,
+                    quantity=qty,
+                    price=price,
+                    stop_price=0.0,
+                    trigger_price=0.0,
+                    time_in_force="DAY",
+                    status=OrderStatus.PENDING,
+                    filled_qty=0,
+                    remaining_qty=qty,
+                    avg_price=0.0,
+                    commission=0.0,
+                    timestamp=datetime.now(),
+                    parent_signal_id=parent_order_id,
+                    exchange_order_id=None,
+                    notes=f"Take-profit {i+1} for {parent_order_id}"
+                )
+                
+                self.pending_orders[tp_order_id] = tp_order
+            
+            logging.info(f"Created bracket orders for {parent_order_id}: SL + 3 TP levels")
+            
+        except Exception as e:
+            logging.error(f"Error creating bracket orders: {e}")
     
-    # Initialize execution manager
-    execution_manager = ExecutionManager(MockAPI(), MockPaperEngine())
+    async def _submit_order(self, order_id: str) -> bool:
+        """Submit order - routes to live API or paper trading"""
+        try:
+            order = self.pending_orders.get(order_id)
+            if not order:
+                return False
+            
+            if self.config.trading.paper_trading:
+                # Paper trading is handled by paper_trading_engine
+                return True
+            else:
+                # Live trading - submit to real Goodwill API
+                return await self._submit_live_order(order_id)
+                
+        except Exception as e:
+            logging.error(f"Error submitting order {order_id}: {e}")
+            return False
     
-    # Set top 10 stocks from scanner
-    top_stocks = [
-        {'symbol': 'RELIANCE', 'asset_type': 'equity', 'scalping_score': 85, 'volatility_score': 75, 'liquidity_score': 90, 'current_price': 2500},
-        {'symbol': 'TCS', 'asset_type': 'equity', 'scalping_score': 82, 'volatility_score': 70, 'liquidity_score': 88, 'current_price': 3200},
-        # ... more stocks
-    ]
-    
-    execution_manager.set_active_stocks(top_stocks)
-    execution_manager.start_execution()
-    
-    # Simulate real-time market data feed
-    import random
-    
-    for i in range(100):
-        for symbol in ['RELIANCE', 'TCS']:
-            # Simulate L1 market data from Goodwill API
-            market_data = {
-                'ltp': 2500 + random.uniform(-10, 10),
-                'bid': 2499.95,
-                'ask': 2500.05,
-                'bid_qty': random.randint(100, 1000),
-                'ask_qty': random.randint(100, 1000),
-                'volume': random.randint(1000, 10000)
+    async def _submit_live_order(self, order_id: str) -> bool:
+        """Submit live order to Goodwill API"""
+        try:
+            order = self.pending_orders[order_id]
+            
+            # Convert internal order to Goodwill API format
+            order_data = {
+                "tsym": f"{order.symbol}-EQ",  # Add -EQ suffix for equity
+                "exchange": "NSE",  # Default to NSE
+                "trantype": order.side,  # BUY/SELL
+                "validity": "DAY",
+                "pricetype": self._convert_order_type(order.order_type),
+                "qty": str(order.quantity),
+                "discqty": "0",  # No disclosed quantity for scalping
+                "price": "0" if order.order_type == OrderType.MARKET else str(order.price),
+                "trgprc": str(order.trigger_price) if order.trigger_price > 0 else "0",
+                "product": "MIS",  # Intraday for scalping
+                "amo": "NO"  # Not after market order
             }
             
-            # Feed to execution manager
-            execution_manager.feed_market_data(symbol, market_data)
-        
-        time.sleep(0.1)  # 100ms intervals
+            # Submit to Goodwill API
+            response = await self.goodwill_handler.place_order(order_data)
+            
+            if response and response.status == 'submitted':
+                # Update order with exchange order ID
+                order.status = OrderStatus.SUBMITTED
+                if hasattr(response, 'order_id'):
+                    order.exchange_order_id = response.order_id
+                    order.notes += f" | Exchange Order ID: {response.order_id}"
+                
+                logging.info(f"Live order submitted successfully: {order_id}")
+                return True
+            else:
+                # Order rejected
+                order.status = OrderStatus.REJECTED
+                rejection_reason = response.message if response else "API submission failed"
+                order.notes += f" | Rejected: {rejection_reason}"
+                
+                # Move to filled orders with rejected status
+                self.filled_orders[order_id] = order
+                del self.pending_orders[order_id]
+                self.execution_stats['rejected_orders'] += 1
+                
+                logging.error(f"Live order rejected: {order_id} - {rejection_reason}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error submitting live order {order_id}: {e}")
+            order = self.pending_orders.get(order_id)
+            if order:
+                order.status = OrderStatus.REJECTED
+                order.notes += f" | Error: {str(e)}"
+            return False
     
-    # Get summary
-    summary = execution_manager.get_execution_summary()
-    print(f"📊 Execution Summary: {json.dumps(summary, indent=2)}")
+    def _convert_order_type(self, order_type: OrderType) -> str:
+        """Convert internal order type to Goodwill API format"""
+        mapping = {
+            OrderType.MARKET: "MKT",
+            OrderType.LIMIT: "L",
+            OrderType.STOP_LOSS: "SL-M",
+            OrderType.STOP_LIMIT: "SL-L"
+        }
+        return mapping.get(order_type, "MKT")
     
-    execution_manager.stop_execution()
+    async def update_positions_real_time(self):
+        """Update all positions with real-time prices"""
+        try:
+            for symbol, position in self.active_positions.items():
+                latest_tick = self.data_manager.get_latest_tick(symbol)
+                if latest_tick:
+                    position.current_price = latest_tick.last_price
+                    
+                    # Calculate unrealized P&L
+                    if position.side == PositionSide.LONG:
+                        position.unrealized_pnl = (position.current_price - position.avg_price) * position.quantity
+                    elif position.side == PositionSide.SHORT:
+                        position.unrealized_pnl = (position.avg_price - position.current_price) * abs(position.quantity)
+                    else:
+                        position.unrealized_pnl = 0.0
+                    
+                    position.total_pnl = position.realized_pnl + position.unrealized_pnl
+                    position.market_value = abs(position.quantity) * position.current_price
+                    
+                    # Track max profit/loss
+                    if position.unrealized_pnl > position.max_profit:
+                        position.max_profit = position.unrealized_pnl
+                    if position.unrealized_pnl < position.max_loss:
+                        position.max_loss = position.unrealized_pnl
+                    
+                    # Update hold time
+                    position.hold_time_seconds = int((datetime.now() - position.timestamp).total_seconds())
+            
+            # Update portfolio metrics
+            await self._update_portfolio_metrics()
+            
+        except Exception as e:
+            logging.error(f"Error updating positions real-time: {e}")
+    
+    async def _update_portfolio_metrics(self):
+        """Update overall portfolio metrics"""
+        try:
+            total_unrealized_pnl = sum(pos.unrealized_pnl for pos in self.active_positions.values())
+            total_realized_pnl = sum(pos.realized_pnl for pos in self.active_positions.values())
+            total_market_value = sum(pos.market_value for pos in self.active_positions.values())
+            
+            self.portfolio_value = self.available_cash + total_market_value
+            self.daily_pnl = total_unrealized_pnl + total_realized_pnl
+            
+            # Update buying power (simplified)
+            self.buying_power = self.available_cash + (total_market_value * 0.5)  # 50% margin
+            
+        except Exception as e:
+            logging.error(f"Error updating portfolio metrics: {e}")
+    
+    async def process_order_updates(self):
+        """Process order status updates from broker/exchange"""
+        try:
+            if self.config.trading.paper_trading:
+                # Paper trading handles its own order processing
+                return
+            else:
+                # Live trading - get real order updates from Goodwill API
+                await self._process_live_order_updates()
+                
+        except Exception as e:
+            logging.error(f"Error processing order updates: {e}")
+    
+    async def _process_live_order_updates(self):
+        """Process live order updates from Goodwill API"""
+        try:
+            # Get current order book from Goodwill API
+            order_book = await self.goodwill_handler.get_order_book()
+            
+            if not order_book:
+                return
+            
+            # Process each order in the order book
+            for api_order in order_book:
+                exchange_order_id = api_order.get('nstordno', '')
+                api_status = api_order.get('status', '').lower()
+                filled_qty = int(api_order.get('fillshares', 0))
+                avg_price = float(api_order.get('avgprc', 0))
+                
+                # Find matching internal order by exchange order ID or symbol/details
+                matching_order = None
+                for order_id, order in self.pending_orders.items():
+                    if (order.exchange_order_id == exchange_order_id or
+                        (order.symbol.replace('-EQ', '') in api_order.get('tsym', '') and
+                         order.side == api_order.get('trantype', '') and
+                         order.quantity == int(api_order.get('qty', 0)))):
+                        matching_order = (order_id, order)
+                        break
+                
+                if not matching_order:
+                    continue
+                
+                order_id, order = matching_order
+                
+                # Update order status based on API response
+                if api_status == 'complete':
+                    # Order fully filled
+                    order.status = OrderStatus.FILLED
+                    order.filled_qty = filled_qty
+                    order.remaining_qty = 0
+                    order.avg_price = avg_price
+                    order.commission = self._calculate_commission(filled_qty, avg_price)
+                    
+                    # Move to filled orders
+                    self.filled_orders[order_id] = order
+                    del self.pending_orders[order_id]
+                    
+                    # Update position
+                    await self._update_position(order)
+                    
+                    # Update statistics
+                    self.execution_stats['filled_orders'] += 1
+                    
+                    logging.info(f"Live order filled: {order_id} at ₹{avg_price:.2f}")
+                    
+                elif api_status == 'rejected':
+                    # Order rejected
+                    order.status = OrderStatus.REJECTED
+                    rejection_reason = api_order.get('rejreason', 'Unknown rejection reason')
+                    order.notes += f" | Rejected: {rejection_reason}"
+                    
+                    # Move to filled orders with rejected status
+                    self.filled_orders[order_id] = order
+                    del self.pending_orders[order_id]
+                    
+                    self.execution_stats['rejected_orders'] += 1
+                    
+                    logging.warning(f"Live order rejected: {order_id} - {rejection_reason}")
+                    
+                elif api_status in ['open', 'pending']:
+                    # Order still pending
+                    if filled_qty > 0 and filled_qty < order.quantity:
+                        # Partial fill
+                        order.status = OrderStatus.PARTIAL_FILLED
+                        order.filled_qty = filled_qty
+                        order.remaining_qty = order.quantity - filled_qty
+                        order.avg_price = avg_price
+                        
+                        logging.info(f"Live order partially filled: {order_id} - {filled_qty}/{order.quantity}")
+                
+                # Store exchange order ID for reference
+                if exchange_order_id and not order.exchange_order_id:
+                    order.exchange_order_id = exchange_order_id
+                    order.notes += f" | Exchange Order ID: {exchange_order_id}"
+                    
+        except Exception as e:
+            logging.error(f"Error processing live order updates: {e}")
+    
+    def _calculate_commission(self, quantity: int, price: float) -> float:
+        """Calculate brokerage commission"""
+        try:
+            # Indian brokerage structure (typical discount broker)
+            order_value = quantity * price
+            
+            # Flat fee per order (₹20) or 0.03% whichever is lower
+            flat_fee = 20.0
+            percentage_fee = order_value * 0.0003
+            
+            brokerage = min(flat_fee, percentage_fee)
+            
+            # Add other charges (STT, transaction charges, GST, etc.)
+            stt = order_value * 0.001  # 0.1% STT for delivery
+            transaction_charges = order_value * 0.00003  # 0.003%
+            gst = brokerage * 0.18  # 18% GST on brokerage
+            
+            total_commission = brokerage + stt + transaction_charges + gst
+            
+            return round(total_commission, 2)
+            
+        except Exception as e:
+            logging.error(f"Error calculating commission: {e}")
+            return 0.0
+    
+    async def _update_position(self, filled_order: Order):
+        """Update position after order fill"""
+        try:
+            symbol = filled_order.symbol
+            
+            if symbol not in self.active_positions:
+                # Create new position
+                side = PositionSide.LONG if filled_order.side == "BUY" else PositionSide.SHORT
+                qty = filled_order.filled_qty if side == PositionSide.LONG else -filled_order.filled_qty
+                
+                position = Position(
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    avg_price=filled_order.avg_price,
+                    current_price=filled_order.avg_price,
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                    total_pnl=0.0,
+                    market_value=filled_order.avg_price * filled_order.filled_qty,
+                    cost_basis=filled_order.avg_price * filled_order.filled_qty,
+                    day_pnl=0.0,
+                    timestamp=datetime.now(),
+                    entry_orders=[filled_order.order_id],
+                    exit_orders=[],
+                    stop_loss_price=0.0,
+                    take_profit_prices=[],
+                    max_profit=0.0,
+                    max_loss=0.0,
+                    hold_time_seconds=0
+                )
+                
+                self.active_positions[symbol] = position
+                
+            else:
+                # Update existing position
+                position = self.active_positions[symbol]
+                
+                if filled_order.side == "BUY":
+                    # Adding to long position or reducing short position
+                    if position.side == PositionSide.LONG:
+                        # Average down/up calculation
+                        total_cost = (position.quantity * position.avg_price) + (filled_order.filled_qty * filled_order.avg_price)
+                        total_qty = position.quantity + filled_order.filled_qty
+                        position.avg_price = total_cost / total_qty
+                        position.quantity = total_qty
+                    else:  # Covering short position
+                        position.quantity += filled_order.filled_qty
+                        if position.quantity >= 0:
+                            position.side = PositionSide.LONG if position.quantity > 0 else PositionSide.FLAT
+                
+                else:  # SELL
+                    # Adding to short position or reducing long position
+                    if position.side == PositionSide.SHORT:
+                        # Average down/up calculation for short
+                        total_cost = abs(position.quantity * position.avg_price) + (filled_order.filled_qty * filled_order.avg_price)
+                        total_qty = abs(position.quantity) + filled_order.filled_qty
+                        position.avg_price = total_cost / total_qty
+                        position.quantity = -total_qty
+                    else:  # Selling long position
+                        position.quantity -= filled_order.filled_qty
+                        if position.quantity <= 0:
+                            position.side = PositionSide.SHORT if position.quantity < 0 else PositionSide.FLAT
+                
+                # Update other fields
+                position.market_value = abs(position.quantity) * position.current_price
+                position.entry_orders.append(filled_order.order_id)
+            
+            # Update available cash
+            if filled_order.side == "BUY":
+                self.available_cash -= (filled_order.avg_price * filled_order.filled_qty + filled_order.commission)
+            else:
+                self.available_cash += (filled_order.avg_price * filled_order.filled_qty - filled_order.commission)
+            
+            logging.info(f"Updated position for {symbol}: {position.quantity} shares @ ₹{position.avg_price:.2f}")
+            
+        except Exception as e:
+            logging.error(f"Error updating position: {e}")
+    
+    async def check_exit_conditions(self):
+        """Check exit conditions for all active positions"""
+        try:
+            for symbol, position in list(self.active_positions.items()):
+                # Check time-based exits
+                if position.hold_time_seconds > 600:  # 10 minutes max hold
+                    await self._create_exit_order(symbol, "TIME_STOP", position.quantity)
+                
+                # Check stop-loss conditions
+                latest_tick = self.data_manager.get_latest_tick(symbol)
+                if latest_tick and position.stop_loss_price > 0:
+                    if ((position.side == PositionSide.LONG and latest_tick.last_price <= position.stop_loss_price) or
+                        (position.side == PositionSide.SHORT and latest_tick.last_price >= position.stop_loss_price)):
+                        await self._create_exit_order(symbol, "STOP_LOSS", position.quantity)
+                
+                # Check trailing stop
+                if position.max_profit > position.avg_price * 0.02:  # 2% profit
+                    trailing_stop = position.current_price * 0.98 if position.side == PositionSide.LONG else position.current_price * 1.02
+                    if ((position.side == PositionSide.LONG and latest_tick.last_price <= trailing_stop) or
+                        (position.side == PositionSide.SHORT and latest_tick.last_price >= trailing_stop)):
+                        await self._create_exit_order(symbol, "TRAILING_STOP", position.quantity)
+                
+        except Exception as e:
+            logging.error(f"Error checking exit conditions: {e}")
+    
+    async def _create_exit_order(self, symbol: str, exit_reason: str, quantity: int) -> Optional[str]:
+        """Create exit order for position"""
+        try:
+            position = self.active_positions.get(symbol)
+            if not position:
+                return None
+            
+            self.order_counter += 1
+            order_id = f"EXIT_{symbol}_{int(time.time())}_{self.order_counter}"
+            
+            side = "SELL" if position.side == PositionSide.LONG else "BUY"
+            
+            order = Order(
+                order_id=order_id,
+                symbol=symbol,
+                side=side,
+                order_type=OrderType.MARKET,
+                quantity=abs(quantity),
+                price=position.current_price,
+                stop_price=0.0,
+                trigger_price=0.0,
+                time_in_force="IOC",
+                status=OrderStatus.PENDING,
+                filled_qty=0,
+                remaining_qty=abs(quantity),
+                avg_price=0.0,
+                commission=0.0,
+                timestamp=datetime.now(),
+                parent_signal_id=None,
+                exchange_order_id=None,
+                notes=f"Exit: {exit_reason}"
+            )
+            
+            self.pending_orders[order_id] = order
+            
+            if await self._submit_order(order_id):
+                logging.info(f"Created exit order {order_id} for {symbol}: {exit_reason}")
+                return order_id
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"Error creating exit order for {symbol}: {e}")
+            return None
+    
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending order"""
+        try:
+            if order_id not in self.pending_orders:
+                logging.warning(f"Order {order_id} not found in pending orders")
+                return False
+            
+            order = self.pending_orders[order_id]
+            
+            if self.config.trading.paper_trading:
+                # Paper trading - simple cancellation
+                order.status = OrderStatus.CANCELLED
+                del self.pending_orders[order_id]
+                self.execution_stats['cancelled_orders'] += 1
+                logging.info(f"Paper order cancelled: {order_id}")
+                return True
+            else:
+                # Live trading - cancel via Goodwill API
+                # Use exchange order ID if available
+                cancel_order_id = order.exchange_order_id if order.exchange_order_id else order_id
+                
+                success = await self.goodwill_handler.cancel_order(cancel_order_id)
+                if success:
+                    order.status = OrderStatus.CANCELLED
+                    del self.pending_orders[order_id]
+                    self.execution_stats['cancelled_orders'] += 1
+                    logging.info(f"Live order cancelled: {order_id}")
+                    return True
+                else:
+                    logging.error(f"Failed to cancel live order: {order_id}")
+                    return False
+                    
+        except Exception as e:
+            logging.error(f"Error cancelling order {order_id}: {e}")
+            return False
+    
+    async def cancel_all_orders(self, symbol: str = None) -> int:
+        """Cancel all pending orders, optionally for a specific symbol"""
+        try:
+            orders_to_cancel = []
+            
+            for order_id, order in self.pending_orders.items():
+                if symbol is None or order.symbol == symbol:
+                    orders_to_cancel.append(order_id)
+            
+            cancelled_count = 0
+            for order_id in orders_to_cancel:
+                if await self.cancel_order(order_id):
+                    cancelled_count += 1
+            
+            logging.info(f"Cancelled {cancelled_count} orders" + (f" for {symbol}" if symbol else ""))
+            return cancelled_count
+            
+        except Exception as e:
+            logging.error(f"Error cancelling all orders: {e}")
+            return 0
+    
+    async def close_position(self, symbol: str, reason: str = "MANUAL_CLOSE") -> bool:
+        """Close an entire position"""
+        try:
+            if symbol not in self.active_positions:
+                logging.warning(f"No active position found for {symbol}")
+                return False
+            
+            position = self.active_positions[symbol]
+            
+            if position.side == PositionSide.FLAT:
+                logging.info(f"Position for {symbol} is already flat")
+                return True
+            
+            # Cancel any existing orders for this symbol
+            await self.cancel_all_orders(symbol)
+            
+            # Create market order to close position
+            exit_order_id = await self._create_exit_order(symbol, reason, abs(position.quantity))
+            
+            if exit_order_id:
+                logging.info(f"Created exit order to close position in {symbol}")
+                return True
+            else:
+                logging.error(f"Failed to create exit order for {symbol}")
+                return False
+                
+        except Exception as e:
+            logging.error(f"Error closing position for {symbol}: {e}")
+            return False
+    
+    async def close_all_positions(self, reason: str = "EMERGENCY_CLOSE") -> int:
+        """Close all active positions"""
+        try:
+            positions_to_close = list(self.active_positions.keys())
+            closed_count = 0
+            
+            for symbol in positions_to_close:
+                if await self.close_position(symbol, reason):
+                    closed_count += 1
+            
+            logging.info(f"Initiated closure of {closed_count} positions")
+            return closed_count
+            
+        except Exception as e:
+            logging.error(f"Error closing all positions: {e}")
+            return 0
+    
+    def get_portfolio_summary(self) -> Dict[str, Any]:
+        """Get comprehensive portfolio summary"""
+        try:
+            total_positions = len(self.active_positions)
+            total_unrealized_pnl = sum(pos.unrealized_pnl for pos in self.active_positions.values())
+            total_realized_pnl = sum(pos.realized_pnl for pos in self.active_positions.values())
+            total_market_value = sum(pos.market_value for pos in self.active_positions.values())
+            
+            long_positions = len([p for p in self.active_positions.values() if p.side == PositionSide.LONG])
+            short_positions = len([p for p in self.active_positions.values() if p.side == PositionSide.SHORT])
+            
+            return {
+                'timestamp': datetime.now(),
+                'trading_mode': 'Paper Trading' if self.config.trading.paper_trading else 'Live Trading',
+                'portfolio_value': self.portfolio_value,
+                'available_cash': self.available_cash,
+                'buying_power': self.buying_power,
+                'total_market_value': total_market_value,
+                'daily_pnl': self.daily_pnl,
+                'total_unrealized_pnl': total_unrealized_pnl,
+                'total_realized_pnl': total_realized_pnl,
+                'total_positions': total_positions,
+                'long_positions': long_positions,
+                'short_positions': short_positions,
+                'pending_orders': len(self.pending_orders),
+                'filled_orders_today': len([o for o in self.filled_orders.values() 
+                                          if o.timestamp.date() == datetime.now().date()]),
+                'execution_stats': self.execution_stats.copy(),
+                'risk_metrics': self._calculate_risk_metrics()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting portfolio summary: {e}")
+            return {}
+    
+    def _calculate_risk_metrics(self) -> Dict[str, Any]:
+        """Calculate portfolio risk metrics"""
+        try:
+            portfolio_risk = calculate_portfolio_risk(self.active_positions, self.portfolio_value)
+            
+            # Calculate additional risk metrics
+            var_95 = 0.0  # Value at Risk (95% confidence)
+            max_drawdown = 0.0
+            sharpe_ratio = 0.0
+            
+            if self.execution_reports:
+                returns = [r.net_pnl / self.portfolio_value for r in self.execution_reports]
+                if returns:
+                    import numpy as np
+                    var_95 = np.percentile(returns, 5) * self.portfolio_value
+                    
+                    # Calculate max drawdown
+                    cumulative_returns = np.cumsum(returns)
+                    running_max = np.maximum.accumulate(cumulative_returns)
+                    drawdown = cumulative_returns - running_max
+                    max_drawdown = np.min(drawdown)
+                    
+                    # Calculate Sharpe ratio (simplified)
+                    if len(returns) > 1:
+                        avg_return = np.mean(returns)
+                        std_return = np.std(returns)
+                        if std_return > 0:
+                            sharpe_ratio = (avg_return * 252) / (std_return * np.sqrt(252))  # Annualized
+            
+            return {
+                'portfolio_risk_pct': portfolio_risk['risk_percentage'],
+                'largest_position_risk': portfolio_risk['largest_position_risk'],
+                'value_at_risk_95': var_95,
+                'max_drawdown': max_drawdown,
+                'sharpe_ratio': sharpe_ratio,
+                'risk_free_rate': self.config.risk.risk_free_rate,
+                'correlation_risk': self._calculate_correlation_risk()
+            }
+            
+        except Exception as e:
+            logging.error(f"Error calculating risk metrics: {e}")
+            return {}
+    
+    def _calculate_correlation_risk(self) -> float:
+        """Calculate portfolio correlation risk"""
+        try:
+            # Simplified correlation risk calculation
+            # In practice, this would use historical correlation matrix
+            unique_sectors = len(set([pos.symbol[:3] for pos in self.active_positions.values()]))  # Rough sector proxy
+            total_positions = len(self.active_positions)
+            
+            if total_positions <= 1:
+                return 0.0
+            
+            # Higher correlation risk if positions are concentrated in fewer sectors
+            correlation_risk = max(0.0, 1.0 - (unique_sectors / total_positions))
+            return correlation_risk
+            
+        except Exception as e:
+            logging.error(f"Error calculating correlation risk: {e}")
+            return 0.0
+    
+    def get_position_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get detailed information about a specific position"""
+        try:
+            if symbol not in self.active_positions:
+                return None
+            
+            position = self.active_positions[symbol]
+            latest_tick = self.data_manager.get_latest_tick(symbol)
+            
+            return {
+                'symbol': symbol,
+                'side': position.side.value,
+                'quantity': position.quantity,
+                'avg_price': position.avg_price,
+                'current_price': position.current_price,
+                'market_value': position.market_value,
+                'cost_basis': position.cost_basis,
+                'unrealized_pnl': position.unrealized_pnl,
+                'unrealized_pnl_pct': (position.unrealized_pnl / position.cost_basis) * 100 if position.cost_basis > 0 else 0,
+                'realized_pnl': position.realized_pnl,
+                'total_pnl': position.total_pnl,
+                'max_profit': position.max_profit,
+                'max_loss': position.max_loss,
+                'hold_time_seconds': position.hold_time_seconds,
+                'hold_time_minutes': position.hold_time_seconds / 60,
+                'entry_time': position.timestamp,
+                'stop_loss_price': position.stop_loss_price,
+                'take_profit_prices': position.take_profit_prices,
+                'bid_price': latest_tick.bid_price if latest_tick else 0,
+                'ask_price': latest_tick.ask_price if latest_tick else 0,
+                'last_price': latest_tick.last_price if latest_tick else 0,
+                'volume': latest_tick.volume if latest_tick else 0
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting position details for {symbol}: {e}")
+            return None
+    
+    def get_order_history(self, symbol: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get order history"""
+        try:
+            all_orders = list(self.filled_orders.values()) + list(self.pending_orders.values())
+            
+            # Filter by symbol if specified
+            if symbol:
+                all_orders = [o for o in all_orders if o.symbol == symbol]
+            
+            # Sort by timestamp (newest first)
+            all_orders.sort(key=lambda x: x.timestamp, reverse=True)
+            
+            # Limit results
+            all_orders = all_orders[:limit]
+            
+            # Convert to dictionaries
+            order_history = []
+            for order in all_orders:
+                order_dict = asdict(order)
+                order_dict['timestamp'] = order.timestamp.isoformat()
+                order_history.append(order_dict)
+            
+            return order_history
+            
+        except Exception as e:
+            logging.error(f"Error getting order history: {e}")
+            return []
+    
+    def get_trade_history(self, symbol: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get completed trade history"""
+        try:
+            trade_history = self.execution_reports.copy()
+            
+            # Filter by symbol if specified
+            if symbol:
+                trade_history = [t for t in trade_history if t.symbol == symbol]
+            
+            # Sort by exit time (newest first)
+            trade_history.sort(key=lambda x: x.exit_time, reverse=True)
+            
+            # Limit results
+            trade_history = trade_history[:limit]
+            
+            # Convert to dictionaries
+            trades = []
+            for trade in trade_history:
+                trade_dict = asdict(trade)
+                trade_dict['entry_time'] = trade.entry_time.isoformat()
+                trade_dict['exit_time'] = trade.exit_time.isoformat()
+                trades.append(trade_dict)
+            
+            return trades
+            
+        except Exception as e:
+            logging.error(f"Error getting trade history: {e}")
+            return []
+    
+    async def emergency_stop_all(self) -> bool:
+        """Emergency stop - cancel all orders and close all positions"""
+        try:
+            logging.warning("EMERGENCY STOP INITIATED")
+            
+            # Cancel all pending orders
+            cancelled_orders = await self.cancel_all_orders()
+            
+            # Close all positions
+            closed_positions = await self.close_all_positions("EMERGENCY_STOP")
+            
+            logging.warning(f"Emergency stop completed: {cancelled_orders} orders cancelled, {closed_positions} positions closed")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error during emergency stop: {e}")
+            return False
+    
+    def get_performance_summary(self) -> Dict[str, Any]:
+        """Get comprehensive performance summary"""
+        try:
+            if not self.execution_reports:
+                return {
+                    'total_trades': 0,
+                    'win_rate': 0,
+                    'avg_profit_per_trade': 0,
+                    'total_pnl': 0,
+                    'max_win': 0,
+                    'max_loss': 0,
+                    'avg_hold_time_minutes': 0,
+                    'sharpe_ratio': 0
+                }
+            
+            winning_trades = [t for t in self.execution_reports if t.net_pnl > 0]
+            losing_trades = [t for t in self.execution_reports if t.net_pnl <= 0]
+            
+            total_trades = len(self.execution_reports)
+            win_rate = len(winning_trades) / total_trades * 100 if total_trades > 0 else 0
+            
+            total_pnl = sum(t.net_pnl for t in self.execution_reports)
+            avg_profit_per_trade = total_pnl / total_trades if total_trades > 0 else 0
+            
+            max_win = max(t.net_pnl for t in self.execution_reports) if self.execution_reports else 0
+            max_loss = min(t.net_pnl for t in self.execution_reports) if self.execution_reports else 0
+            
+            avg_hold_time = sum(t.hold_time_seconds for t in self.execution_reports) / total_trades / 60 if total_trades > 0 else 0
+            
+            # Calculate Sharpe ratio
+            if len(self.execution_reports) > 1:
+                import numpy as np
+                returns = [t.net_pnl / self.portfolio_value for t in self.execution_reports]
+                avg_return = np.mean(returns)
+                std_return = np.std(returns)
+                sharpe_ratio = (avg_return * 252) / (std_return * np.sqrt(252)) if std_return > 0 else 0
+            else:
+                sharpe_ratio = 0
+            
+            return {
+                'total_trades': total_trades,
+                'winning_trades': len(winning_trades),
+                'losing_trades': len(losing_trades),
+                'win_rate': win_rate,
+                'avg_profit_per_trade': avg_profit_per_trade,
+                'total_pnl': total_pnl,
+                'total_commission': sum(t.commission for t in self.execution_reports),
+                'max_win': max_win,
+                'max_loss': max_loss,
+                'avg_hold_time_minutes': avg_hold_time,
+                'sharpe_ratio': sharpe_ratio,
+                'profit_factor': sum(t.net_pnl for t in winning_trades) / abs(sum(t.net_pnl for t in losing_trades)) if losing_trades else float('inf')
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting performance summary: {e}")
+            return {}
+
+# Global instance
+execution_manager = MarketReadyExecutionManager()
+
+def get_execution_manager() -> MarketReadyExecutionManager:
+    """Get the global execution manager instance"""
+    return execution_manager
