@@ -1,487 +1,727 @@
 #!/usr/bin/env python3
 """
-WebSocket Manager for Real-time Communication
-Handles WebSocket connections and real-time data streaming
+WebSocket Manager for Real-time Market Data
+Handles multiple WebSocket connections for live data feeds
 """
 
 import asyncio
 import websockets
 import json
 import logging
-import threading
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Callable, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import ssl
+import aiohttp
+from urllib.parse import urlencode
 import time
-from datetime import datetime
-from typing import Dict, List, Set, Any
-import queue
+import threading
+from collections import defaultdict
 
-logger = logging.getLogger(__name__)
+# Import system components
+from config_manager import ConfigManager
+from data_manager import DataManager
+from database_setup import TradingDatabase
+from security_manager import SecurityManager
+from utils import Logger, ErrorHandler, DataValidator
+from bot_core import TradingBot
 
-class WebSocketManager:
-    """Manages WebSocket connections for real-time updates"""
+class ConnectionStatus(Enum):
+    """WebSocket connection status"""
+    DISCONNECTED = "DISCONNECTED"
+    CONNECTING = "CONNECTING"
+    CONNECTED = "CONNECTED"
+    RECONNECTING = "RECONNECTING"
+    ERROR = "ERROR"
+
+class DataFeedType(Enum):
+    """Types of data feeds"""
+    LIVE_QUOTES = "LIVE_QUOTES"
+    ORDER_UPDATES = "ORDER_UPDATES"
+    MARKET_DEPTH = "MARKET_DEPTH"
+    TRADE_UPDATES = "TRADE_UPDATES"
+    NEWS_FEED = "NEWS_FEED"
+    TECHNICAL_INDICATORS = "TECHNICAL_INDICATORS"
+
+@dataclass
+class WebSocketConfig:
+    """WebSocket connection configuration"""
+    url: str
+    name: str
+    feed_type: DataFeedType
+    symbols: List[str] = field(default_factory=list)
+    headers: Dict[str, str] = field(default_factory=dict)
+    auth_required: bool = False
+    reconnect_interval: int = 5
+    max_reconnect_attempts: int = 10
+    heartbeat_interval: int = 30
+    message_timeout: int = 10
+
+@dataclass
+class MarketTick:
+    """Real-time market tick data"""
+    symbol: str
+    ltp: float
+    volume: int
+    bid: float
+    ask: float
+    bid_qty: int
+    ask_qty: int
+    timestamp: datetime
+    change: float = 0.0
+    change_percent: float = 0.0
+
+@dataclass
+class OrderUpdate:
+    """Order status update"""
+    order_id: str
+    symbol: str
+    status: str
+    executed_qty: int
+    executed_price: float
+    timestamp: datetime
+    message: str = ""
+
+class WebSocketConnection:
+    """Individual WebSocket connection handler"""
     
-    def __init__(self, host='localhost', port=9001):
-        self.host = host
-        self.port = port
-        self.running = False
+    def __init__(self, config: WebSocketConfig, callback: Callable, 
+                 security_manager: SecurityManager = None):
+        self.config = config
+        self.callback = callback
+        self.security_manager = security_manager
         
-        # Connected clients
-        self.clients: Set[websockets.WebSocketServerProtocol] = set()
+        # Connection state
+        self.websocket = None
+        self.status = ConnectionStatus.DISCONNECTED
+        self.reconnect_attempts = 0
+        self.last_message_time = None
+        self.is_running = False
         
-        # Data queues for different types of updates
-        self.market_data_queue = queue.Queue(maxsize=1000)
-        self.signal_queue = queue.Queue(maxsize=500)
-        self.portfolio_queue = queue.Queue(maxsize=100)
-        self.alert_queue = queue.Queue(maxsize=200)
+        # Initialize logger
+        self.logger = Logger(f"WebSocket-{config.name}")
+        self.error_handler = ErrorHandler()
         
-        # External components
-        self.bot_core = None
-        self.scanner = None
-        self.execution_manager = None
-        self.volatility_analyzer = None
-        
-        # Background threads
-        self.server_thread = None
-        self.broadcast_thread = None
-        
-        logger.info(f"🔌 WebSocket Manager initialized on {host}:{port}")
+        # Message handlers
+        self.message_handlers = {
+            DataFeedType.LIVE_QUOTES: self._handle_quote_message,
+            DataFeedType.ORDER_UPDATES: self._handle_order_message,
+            DataFeedType.MARKET_DEPTH: self._handle_depth_message,
+            DataFeedType.TRADE_UPDATES: self._handle_trade_message,
+            DataFeedType.NEWS_FEED: self._handle_news_message
+        }
     
-    def set_components(self, bot_core=None, scanner=None, execution_manager=None, volatility_analyzer=None):
-        """Set external components for data access"""
-        self.bot_core = bot_core
-        self.scanner = scanner
-        self.execution_manager = execution_manager
-        self.volatility_analyzer = volatility_analyzer
-    
-    async def register_client(self, websocket):
-        """Register new WebSocket client"""
+    async def connect(self):
+        """Connect to WebSocket"""
         try:
-            self.clients.add(websocket)
-            logger.info(f"🔌 Client connected: {websocket.remote_address}")
+            self.status = ConnectionStatus.CONNECTING
+            self.logger.info(f"Connecting to {self.config.url}")
             
-            # Send welcome message
-            welcome_msg = {
-                'type': 'welcome',
-                'message': 'Connected to Trading Bot WebSocket',
-                'timestamp': datetime.now().isoformat(),
-                'client_count': len(self.clients)
-            }
-            await websocket.send(json.dumps(welcome_msg))
+            # Setup SSL context if needed
+            ssl_context = None
+            if self.config.url.startswith('wss://'):
+                ssl_context = ssl.create_default_context()
+            
+            # Add authentication headers if required
+            headers = self.config.headers.copy()
+            if self.config.auth_required and self.security_manager:
+                auth_token = await self._get_auth_token()
+                if auth_token:
+                    headers['Authorization'] = f'Bearer {auth_token}'
+            
+            # Connect to WebSocket
+            self.websocket = await websockets.connect(
+                self.config.url,
+                extra_headers=headers,
+                ssl=ssl_context,
+                ping_interval=self.config.heartbeat_interval,
+                ping_timeout=self.config.message_timeout,
+                close_timeout=10
+            )
+            
+            self.status = ConnectionStatus.CONNECTED
+            self.reconnect_attempts = 0
+            self.last_message_time = datetime.now()
+            
+            self.logger.info(f"Connected to {self.config.name}")
+            
+            # Send subscription message
+            await self._subscribe_to_feeds()
+            
+            return True
             
         except Exception as e:
-            logger.error(f"❌ Client registration error: {e}")
+            self.status = ConnectionStatus.ERROR
+            self.logger.error(f"Connection failed: {e}")
+            self.error_handler.handle_error(e, f"websocket_connect_{self.config.name}")
+            return False
     
-    async def unregister_client(self, websocket):
-        """Unregister WebSocket client"""
+    async def disconnect(self):
+        """Disconnect from WebSocket"""
         try:
-            self.clients.discard(websocket)
-            logger.info(f"🔌 Client disconnected: {websocket.remote_address}")
+            self.is_running = False
+            
+            if self.websocket and not self.websocket.closed:
+                await self.websocket.close()
+            
+            self.status = ConnectionStatus.DISCONNECTED
+            self.websocket = None
+            
+            self.logger.info(f"Disconnected from {self.config.name}")
             
         except Exception as e:
-            logger.error(f"❌ Client unregistration error: {e}")
+            self.logger.error(f"Disconnect error: {e}")
     
-    async def handle_client_message(self, websocket, message):
-        """Handle incoming client messages"""
+    async def start_listening(self):
+        """Start listening for messages"""
+        self.is_running = True
+        
+        while self.is_running:
+            try:
+                if self.status != ConnectionStatus.CONNECTED:
+                    if not await self._reconnect():
+                        await asyncio.sleep(self.config.reconnect_interval)
+                        continue
+                
+                # Listen for messages
+                try:
+                    message = await asyncio.wait_for(
+                        self.websocket.recv(),
+                        timeout=self.config.message_timeout
+                    )
+                    
+                    await self._process_message(message)
+                    self.last_message_time = datetime.now()
+                    
+                except asyncio.TimeoutError:
+                    # Check for heartbeat timeout
+                    if self._is_heartbeat_timeout():
+                        self.logger.warning("Heartbeat timeout detected")
+                        await self._reconnect()
+                    continue
+                    
+                except websockets.exceptions.ConnectionClosed:
+                    self.logger.warning("Connection closed by server")
+                    self.status = ConnectionStatus.DISCONNECTED
+                    await self._reconnect()
+                    continue
+                
+            except Exception as e:
+                self.logger.error(f"Listening error: {e}")
+                self.error_handler.handle_error(e, f"websocket_listen_{self.config.name}")
+                await asyncio.sleep(1)
+    
+    async def _reconnect(self):
+        """Attempt to reconnect"""
+        if self.reconnect_attempts >= self.config.max_reconnect_attempts:
+            self.logger.error("Max reconnection attempts reached")
+            self.status = ConnectionStatus.ERROR
+            return False
+        
+        self.status = ConnectionStatus.RECONNECTING
+        self.reconnect_attempts += 1
+        
+        self.logger.info(f"Reconnecting... (attempt {self.reconnect_attempts})")
+        
+        # Close existing connection
+        if self.websocket:
+            try:
+                await self.websocket.close()
+            except:
+                pass
+        
+        await asyncio.sleep(self.config.reconnect_interval)
+        return await self.connect()
+    
+    async def _get_auth_token(self) -> Optional[str]:
+        """Get authentication token from security manager"""
+        try:
+            if self.security_manager:
+                # This would typically be implemented based on the specific API
+                # For now, return a placeholder
+                return "auth_token_placeholder"
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get auth token: {e}")
+            return None
+    
+    async def _subscribe_to_feeds(self):
+        """Subscribe to data feeds"""
+        try:
+            if self.config.feed_type == DataFeedType.LIVE_QUOTES:
+                subscription = {
+                    "action": "subscribe",
+                    "feeds": ["live_quotes"],
+                    "symbols": self.config.symbols
+                }
+            elif self.config.feed_type == DataFeedType.ORDER_UPDATES:
+                subscription = {
+                    "action": "subscribe",
+                    "feeds": ["order_updates"]
+                }
+            elif self.config.feed_type == DataFeedType.MARKET_DEPTH:
+                subscription = {
+                    "action": "subscribe",
+                    "feeds": ["market_depth"],
+                    "symbols": self.config.symbols,
+                    "depth": 5
+                }
+            else:
+                subscription = {
+                    "action": "subscribe",
+                    "feeds": [self.config.feed_type.value.lower()]
+                }
+            
+            await self.websocket.send(json.dumps(subscription))
+            self.logger.info(f"Subscribed to {self.config.feed_type.value}")
+            
+        except Exception as e:
+            self.logger.error(f"Subscription failed: {e}")
+    
+    async def _process_message(self, message: str):
+        """Process incoming WebSocket message"""
         try:
             data = json.loads(message)
-            msg_type = data.get('type', '')
             
-            if msg_type == 'ping':
-                # Respond to ping
-                pong_msg = {
-                    'type': 'pong',
-                    'timestamp': datetime.now().isoformat()
-                }
-                await websocket.send(json.dumps(pong_msg))
-                
-            elif msg_type == 'request_status':
-                # Send current status
-                status_data = await self._get_current_status()
-                await websocket.send(json.dumps(status_data))
-                
-            elif msg_type == 'request_portfolio':
-                # Send portfolio data
-                portfolio_data = await self._get_portfolio_data()
-                await websocket.send(json.dumps(portfolio_data))
-                
-            elif msg_type == 'request_top_stocks':
-                # Send top stocks
-                stocks_data = await self._get_top_stocks_data()
-                await websocket.send(json.dumps(stocks_data))
-                
-            elif msg_type == 'force_scan':
-                # Force scanner update
-                result = await self._force_scanner_update()
-                await websocket.send(json.dumps(result))
-                
+            # Handle different message types
+            handler = self.message_handlers.get(self.config.feed_type)
+            if handler:
+                processed_data = await handler(data)
+                if processed_data:
+                    await self.callback(self.config.feed_type, processed_data)
             else:
-                error_msg = {
-                    'type': 'error',
-                    'message': f'Unknown message type: {msg_type}',
-                    'timestamp': datetime.now().isoformat()
-                }
-                await websocket.send(json.dumps(error_msg))
+                # Generic message handling
+                await self.callback(self.config.feed_type, data)
                 
         except json.JSONDecodeError:
-            error_msg = {
-                'type': 'error',
-                'message': 'Invalid JSON format',
-                'timestamp': datetime.now().isoformat()
+            self.logger.error(f"Invalid JSON message: {message[:100]}")
+        except Exception as e:
+            self.logger.error(f"Message processing error: {e}")
+            self.error_handler.handle_error(e, f"websocket_message_{self.config.name}")
+    
+    async def _handle_quote_message(self, data: Dict) -> Optional[MarketTick]:
+        """Handle live quote message"""
+        try:
+            if 'symbol' in data and 'ltp' in data:
+                return MarketTick(
+                    symbol=data['symbol'],
+                    ltp=float(data['ltp']),
+                    volume=int(data.get('volume', 0)),
+                    bid=float(data.get('bid', 0)),
+                    ask=float(data.get('ask', 0)),
+                    bid_qty=int(data.get('bid_qty', 0)),
+                    ask_qty=int(data.get('ask_qty', 0)),
+                    timestamp=datetime.now(),
+                    change=float(data.get('change', 0)),
+                    change_percent=float(data.get('change_percent', 0))
+                )
+            return None
+        except Exception as e:
+            self.logger.error(f"Quote message parsing error: {e}")
+            return None
+    
+    async def _handle_order_message(self, data: Dict) -> Optional[OrderUpdate]:
+        """Handle order update message"""
+        try:
+            if 'order_id' in data and 'status' in data:
+                return OrderUpdate(
+                    order_id=data['order_id'],
+                    symbol=data.get('symbol', ''),
+                    status=data['status'],
+                    executed_qty=int(data.get('executed_qty', 0)),
+                    executed_price=float(data.get('executed_price', 0)),
+                    timestamp=datetime.now(),
+                    message=data.get('message', '')
+                )
+            return None
+        except Exception as e:
+            self.logger.error(f"Order message parsing error: {e}")
+            return None
+    
+    async def _handle_depth_message(self, data: Dict) -> Optional[Dict]:
+        """Handle market depth message"""
+        try:
+            if 'symbol' in data and 'bids' in data and 'asks' in data:
+                return {
+                    'symbol': data['symbol'],
+                    'bids': data['bids'],
+                    'asks': data['asks'],
+                    'timestamp': datetime.now()
+                }
+            return None
+        except Exception as e:
+            self.logger.error(f"Depth message parsing error: {e}")
+            return None
+    
+    async def _handle_trade_message(self, data: Dict) -> Optional[Dict]:
+        """Handle trade update message"""
+        try:
+            return {
+                'trade_id': data.get('trade_id'),
+                'symbol': data.get('symbol'),
+                'price': float(data.get('price', 0)),
+                'quantity': int(data.get('quantity', 0)),
+                'timestamp': datetime.now(),
+                'raw_data': data
             }
-            await websocket.send(json.dumps(error_msg))
+        except Exception as e:
+            self.logger.error(f"Trade message parsing error: {e}")
+            return None
+    
+    async def _handle_news_message(self, data: Dict) -> Optional[Dict]:
+        """Handle news feed message"""
+        try:
+            return {
+                'headline': data.get('headline'),
+                'content': data.get('content'),
+                'symbols': data.get('symbols', []),
+                'timestamp': datetime.now(),
+                'source': data.get('source')
+            }
+        except Exception as e:
+            self.logger.error(f"News message parsing error: {e}")
+            return None
+    
+    def _is_heartbeat_timeout(self) -> bool:
+        """Check if heartbeat timeout occurred"""
+        if not self.last_message_time:
+            return False
+        
+        timeout_threshold = timedelta(seconds=self.config.heartbeat_interval * 2)
+        return datetime.now() - self.last_message_time > timeout_threshold
+
+class WebSocketManager:
+    """Main WebSocket manager for handling multiple connections"""
+    
+    def __init__(self, config_manager: ConfigManager, data_manager: DataManager,
+                 trading_db: TradingDatabase, security_manager: SecurityManager):
+        self.config_manager = config_manager
+        self.data_manager = data_manager
+        self.trading_db = trading_db
+        self.security_manager = security_manager
+        
+        # Initialize logger and error handler
+        self.logger = Logger(__name__)
+        self.error_handler = ErrorHandler()
+        self.data_validator = DataValidator()
+        
+        # WebSocket connections
+        self.connections: Dict[str, WebSocketConnection] = {}
+        self.is_running = False
+        
+        # Data handlers
+        self.data_handlers = {
+            DataFeedType.LIVE_QUOTES: self._handle_live_quotes,
+            DataFeedType.ORDER_UPDATES: self._handle_order_updates,
+            DataFeedType.MARKET_DEPTH: self._handle_market_depth,
+            DataFeedType.TRADE_UPDATES: self._handle_trade_updates,
+            DataFeedType.NEWS_FEED: self._handle_news_feed
+        }
+        
+        # Statistics
+        self.stats = {
+            'messages_received': defaultdict(int),
+            'last_message_time': defaultdict(lambda: None),
+            'connection_uptime': defaultdict(lambda: None)
+        }
+    
+    async def initialize(self):
+        """Initialize WebSocket manager"""
+        try:
+            config = self.config_manager.get_config()
+            websocket_config = config.get('websockets', {})
             
-        except Exception as e:
-            logger.error(f"❌ Handle client message error: {e}")
-            error_msg = {
-                'type': 'error',
-                'message': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-            await websocket.send(json.dumps(error_msg))
-    
-    async def _get_current_status(self) -> Dict:
-        """Get current system status"""
-        try:
-            status = {
-                'type': 'status_update',
-                'timestamp': datetime.now().isoformat(),
-                'bot_status': self.bot_core.get_bot_status() if self.bot_core else {'running': False},
-                'scanner_status': self.scanner.get_scanner_status() if self.scanner else {'running': False},
-                'execution_status': self.execution_manager.get_execution_summary() if self.execution_manager else {'running': False},
-                'client_count': len(self.clients)
-            }
-            return status
-            
-        except Exception as e:
-            logger.error(f"❌ Get current status error: {e}")
-            return {
-                'type': 'error',
-                'message': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-    
-    async def _get_portfolio_data(self) -> Dict:
-        """Get portfolio data"""
-        try:
-            if self.bot_core and self.bot_core.paper_engine:
-                portfolio = self.bot_core.paper_engine.get_portfolio_summary()
-                return {
-                    'type': 'portfolio_update',
-                    'timestamp': datetime.now().isoformat(),
-                    'data': portfolio
-                }
-            else:
-                return {
-                    'type': 'error',
-                    'message': 'Portfolio data not available',
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-        except Exception as e:
-            logger.error(f"❌ Get portfolio data error: {e}")
-            return {
-                'type': 'error',
-                'message': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-    
-    async def _get_top_stocks_data(self) -> Dict:
-        """Get top stocks data"""
-        try:
-            if self.scanner:
-                top_stocks = self.scanner.get_top_stocks(10)
-                return {
-                    'type': 'top_stocks_update',
-                    'timestamp': datetime.now().isoformat(),
-                    'data': top_stocks
-                }
-            else:
-                return {
-                    'type': 'error',
-                    'message': 'Scanner data not available',
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-        except Exception as e:
-            logger.error(f"❌ Get top stocks data error: {e}")
-            return {
-                'type': 'error',
-                'message': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-    
-    async def _force_scanner_update(self) -> Dict:
-        """Force scanner update"""
-        try:
-            if self.scanner:
-                result = self.scanner.force_scan()
-                return {
-                    'type': 'scan_result',
-                    'timestamp': datetime.now().isoformat(),
-                    'data': result
-                }
-            else:
-                return {
-                    'type': 'error',
-                    'message': 'Scanner not available',
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-        except Exception as e:
-            logger.error(f"❌ Force scanner update error: {e}")
-            return {
-                'type': 'error',
-                'message': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-    
-    async def broadcast_message(self, message: Dict):
-        """Broadcast message to all connected clients"""
-        if not self.clients:
-            return
-        
-        message_str = json.dumps(message)
-        disconnected_clients = set()
-        
-        for client in self.clients.copy():
-            try:
-                await client.send(message_str)
-            except websockets.exceptions.ConnectionClosed:
-                disconnected_clients.add(client)
-            except Exception as e:
-                logger.debug(f"Broadcast error to {client.remote_address}: {e}")
-                disconnected_clients.add(client)
-        
-        # Remove disconnected clients
-        for client in disconnected_clients:
-            self.clients.discard(client)
-    
-    async def client_handler(self, websocket, path):
-        """Handle individual client connection"""
-        await self.register_client(websocket)
-        
-        try:
-            async for message in websocket:
-                await self.handle_client_message(websocket, message)
-                
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"🔌 Client {websocket.remote_address} connection closed")
-        except Exception as e:
-            logger.error(f"❌ Client handler error: {e}")
-        finally:
-            await self.unregister_client(websocket)
-    
-    def start_server(self):
-        """Start WebSocket server"""
-        try:
-            self.running = True
-            
-            # Start asyncio event loop in separate thread
-            def run_server():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                start_server = websockets.serve(
-                    self.client_handler,
-                    self.host,
-                    self.port,
-                    ping_interval=20,
-                    ping_timeout=10
+            # Create WebSocket connections from config
+            for conn_name, conn_config in websocket_config.items():
+                ws_config = WebSocketConfig(
+                    url=conn_config['url'],
+                    name=conn_name,
+                    feed_type=DataFeedType(conn_config['feed_type']),
+                    symbols=conn_config.get('symbols', []),
+                    headers=conn_config.get('headers', {}),
+                    auth_required=conn_config.get('auth_required', False),
+                    reconnect_interval=conn_config.get('reconnect_interval', 5),
+                    max_reconnect_attempts=conn_config.get('max_reconnect_attempts', 10),
+                    heartbeat_interval=conn_config.get('heartbeat_interval', 30)
                 )
                 
-                loop.run_until_complete(start_server)
-                loop.run_forever()
+                connection = WebSocketConnection(
+                    ws_config, 
+                    self._message_callback,
+                    self.security_manager if ws_config.auth_required else None
+                )
+                
+                self.connections[conn_name] = connection
             
-            self.server_thread = threading.Thread(target=run_server, daemon=True)
-            self.server_thread.start()
-            
-            # Start broadcast thread
-            self.broadcast_thread = threading.Thread(target=self._broadcast_loop, daemon=True)
-            self.broadcast_thread.start()
-            
-            logger.info(f"🚀 WebSocket server started on ws://{self.host}:{self.port}")
+            self.logger.info(f"WebSocket manager initialized with {len(self.connections)} connections")
             
         except Exception as e:
-            logger.error(f"❌ Start server error: {e}")
-            self.running = False
+            self.logger.error(f"WebSocket manager initialization failed: {e}")
+            self.error_handler.handle_error(e, "websocket_manager_init")
+            raise
     
-    def stop_server(self):
-        """Stop WebSocket server"""
+    async def start_all_connections(self):
+        """Start all WebSocket connections"""
         try:
-            self.running = False
-            logger.info("⏹️ WebSocket server stopped")
+            self.is_running = True
+            
+            # Start all connections concurrently
+            tasks = []
+            for name, connection in self.connections.items():
+                task = asyncio.create_task(self._start_connection(name, connection))
+                tasks.append(task)
+            
+            await asyncio.gather(*tasks, return_exceptions=True)
             
         except Exception as e:
-            logger.error(f"❌ Stop server error: {e}")
+            self.logger.error(f"Failed to start WebSocket connections: {e}")
+            raise
     
-    def _broadcast_loop(self):
-        """Background loop for broadcasting updates"""
-        while self.running:
-            try:
-                # Broadcast status updates every 5 seconds
-                if self.clients:
-                    status_update = asyncio.run(self._get_current_status())
-                    asyncio.run(self.broadcast_message(status_update))
-                
-                time.sleep(5)  # Update every 5 seconds
-                
-            except Exception as e:
-                logger.debug(f"Broadcast loop error: {e}")
-                time.sleep(5)
-    
-    def send_market_data_update(self, symbol: str, data: Dict):
-        """Send market data update"""
+    async def _start_connection(self, name: str, connection: WebSocketConnection):
+        """Start individual WebSocket connection"""
         try:
-            message = {
-                'type': 'market_data',
-                'symbol': symbol,
-                'data': data,
-                'timestamp': datetime.now().isoformat()
-            }
+            self.stats['connection_uptime'][name] = datetime.now()
             
-            if not self.market_data_queue.full():
-                self.market_data_queue.put(message)
-            
-            # Immediate broadcast for critical updates
-            if self.clients:
-                asyncio.run(self.broadcast_message(message))
+            if await connection.connect():
+                await connection.start_listening()
+            else:
+                self.logger.error(f"Failed to start connection: {name}")
                 
         except Exception as e:
-            logger.debug(f"Send market data error: {e}")
+            self.logger.error(f"Connection {name} error: {e}")
+            self.error_handler.handle_error(e, f"websocket_connection_{name}")
     
-    def send_signal_update(self, signal_data: Dict):
-        """Send trading signal update"""
+    async def stop_all_connections(self):
+        """Stop all WebSocket connections"""
         try:
-            message = {
-                'type': 'trading_signal',
-                'data': signal_data,
-                'timestamp': datetime.now().isoformat()
-            }
+            self.is_running = False
             
-            if not self.signal_queue.full():
-                self.signal_queue.put(message)
+            # Disconnect all connections
+            for connection in self.connections.values():
+                await connection.disconnect()
             
-            # Immediate broadcast for signals
-            if self.clients:
-                asyncio.run(self.broadcast_message(message))
+            self.logger.info("All WebSocket connections stopped")
+            
+        except Exception as e:
+            self.logger.error(f"Error stopping connections: {e}")
+    
+    async def _message_callback(self, feed_type: DataFeedType, data: Any):
+        """Handle incoming WebSocket messages"""
+        try:
+            # Update statistics
+            self.stats['messages_received'][feed_type] += 1
+            self.stats['last_message_time'][feed_type] = datetime.now()
+            
+            # Route to appropriate handler
+            handler = self.data_handlers.get(feed_type)
+            if handler:
+                await handler(data)
+            else:
+                self.logger.warning(f"No handler for feed type: {feed_type}")
                 
         except Exception as e:
-            logger.debug(f"Send signal error: {e}")
+            self.logger.error(f"Message callback error: {e}")
+            self.error_handler.handle_error(e, f"websocket_callback_{feed_type}")
     
-    def send_portfolio_update(self, portfolio_data: Dict):
-        """Send portfolio update"""
+    async def _handle_live_quotes(self, tick: MarketTick):
+        """Handle live quote data"""
         try:
-            message = {
-                'type': 'portfolio_update',
-                'data': portfolio_data,
-                'timestamp': datetime.now().isoformat()
-            }
+            # Validate data
+            if not self.data_validator.validate_price(tick.ltp):
+                self.logger.warning(f"Invalid price for {tick.symbol}: {tick.ltp}")
+                return
             
-            if not self.portfolio_queue.full():
-                self.portfolio_queue.put(message)
+            # Update data manager
+            await self.data_manager.update_live_price(tick.symbol, tick.ltp, tick.volume)
             
-            # Broadcast portfolio updates
-            if self.clients:
-                asyncio.run(self.broadcast_message(message))
+            # Update database cache
+            await self.trading_db.update_realtime_quote(
+                self.trading_db.MarketData(
+                    symbol=tick.symbol,
+                    timestamp=tick.timestamp,
+                    open_price=tick.ltp,  # Simplified
+                    high_price=tick.ltp,
+                    low_price=tick.ltp,
+                    close_price=tick.ltp,
+                    volume=tick.volume,
+                    ltp=tick.ltp
+                )
+            )
+            
+            # Log for monitoring
+            self.logger.debug(f"Quote update: {tick.symbol} @ {tick.ltp}")
+            
+        except Exception as e:
+            self.logger.error(f"Live quotes handling error: {e}")
+    
+    async def _handle_order_updates(self, order_update: OrderUpdate):
+        """Handle order status updates"""
+        try:
+            # Update database
+            await self.trading_db.update_order_status(
+                order_update.order_id,
+                order_update.status,
+                order_update.executed_price if order_update.executed_price > 0 else None,
+                order_update.executed_qty if order_update.executed_qty > 0 else None
+            )
+            
+            # Log order update
+            self.logger.info(f"Order update: {order_update.order_id} - {order_update.status}")
+            
+            # Notify trading bot if order is filled
+            if order_update.status == 'FILLED':
+                # This would trigger portfolio updates, etc.
+                pass
                 
         except Exception as e:
-            logger.debug(f"Send portfolio error: {e}")
+            self.logger.error(f"Order updates handling error: {e}")
     
-    def send_alert(self, alert_type: str, message: str, data: Dict = None):
-        """Send alert message"""
+    async def _handle_market_depth(self, depth_data: Dict):
+        """Handle market depth data"""
         try:
-            alert_message = {
-                'type': 'alert',
-                'alert_type': alert_type,
-                'message': message,
-                'data': data or {},
-                'timestamp': datetime.now().isoformat()
-            }
+            symbol = depth_data['symbol']
             
-            if not self.alert_queue.full():
-                self.alert_queue.put(alert_message)
-            
-            # Immediate broadcast for alerts
-            if self.clients:
-                asyncio.run(self.broadcast_message(alert_message))
-                
-        except Exception as e:
-            logger.debug(f"Send alert error: {e}")
-    
-    def get_connection_stats(self) -> Dict:
-        """Get WebSocket connection statistics"""
-        try:
-            return {
-                'connected_clients': len(self.clients),
-                'server_running': self.running,
-                'host': self.host,
-                'port': self.port,
-                'queue_sizes': {
-                    'market_data': self.market_data_queue.qsize(),
-                    'signals': self.signal_queue.qsize(),
-                    'portfolio': self.portfolio_queue.qsize(),
-                    'alerts': self.alert_queue.qsize()
-                }
-            }
+            # Store market depth for analysis
+            # This could be used for advanced order execution strategies
+            self.logger.debug(f"Market depth update: {symbol}")
             
         except Exception as e:
-            logger.error(f"❌ Connection stats error: {e}")
-            return {'error': str(e)}
-
-
-# Usage example and testing
-if __name__ == "__main__":
-    # Test WebSocket server
-    import random
+            self.logger.error(f"Market depth handling error: {e}")
     
-    ws_manager = WebSocketManager()
-    ws_manager.start_server()
+    async def _handle_trade_updates(self, trade_data: Dict):
+        """Handle trade execution updates"""
+        try:
+            # Log trade execution
+            self.logger.info(f"Trade executed: {trade_data}")
+            
+            # Update portfolio if it's our trade
+            # This would be matched against our orders
+            
+        except Exception as e:
+            self.logger.error(f"Trade updates handling error: {e}")
     
-    print("🔌 WebSocket server running on ws://localhost:9001")
-    print("📱 Connect with a WebSocket client to test")
-    print("💬 Send JSON messages like: {'type': 'ping'}")
+    async def _handle_news_feed(self, news_data: Dict):
+        """Handle news feed data"""
+        try:
+            # Store news for sentiment analysis
+            self.logger.info(f"News update: {news_data.get('headline', '')[:50]}...")
+            
+            # Could trigger strategy adjustments based on news
+            
+        except Exception as e:
+            self.logger.error(f"News feed handling error: {e}")
     
-    # Simulate some data updates
-    def simulate_updates():
-        time.sleep(2)  # Wait for server to start
+    def get_connection_status(self) -> Dict:
+        """Get status of all WebSocket connections"""
+        status = {}
         
-        for i in range(10):
-            # Simulate market data
-            ws_manager.send_market_data_update('RELIANCE', {
-                'ltp': 2500 + random.uniform(-10, 10),
-                'volume': random.randint(1000, 10000),
-                'bid': 2499.95,
-                'ask': 2500.05
-            })
-            
-            # Simulate trading signal
-            if random.random() > 0.7:  # 30% chance
-                ws_manager.send_signal_update({
-                    'symbol': 'RELIANCE',
-                    'signal': 'BUY',
-                    'confidence': random.uniform(70, 95),
-                    'strategy': 'Strategy1_BidAskScalping'
-                })
-            
-            # Simulate alert
-            if random.random() > 0.9:  # 10% chance
-                ws_manager.send_alert('HIGH_VOLATILITY', 'RELIANCE volatility spike detected')
-            
-            time.sleep(3)
+        for name, connection in self.connections.items():
+            status[name] = {
+                'status': connection.status.value,
+                'reconnect_attempts': connection.reconnect_attempts,
+                'last_message_time': self.stats['last_message_time'][connection.config.feed_type],
+                'messages_received': self.stats['messages_received'][connection.config.feed_type],
+                'uptime': datetime.now() - self.stats['connection_uptime'][name] if self.stats['connection_uptime'][name] else None,
+                'feed_type': connection.config.feed_type.value
+            }
+        
+        return status
     
-    # Start simulation in background
-    sim_thread = threading.Thread(target=simulate_updates, daemon=True)
-    sim_thread.start()
+    def get_statistics(self) -> Dict:
+        """Get WebSocket statistics"""
+        return {
+            'total_connections': len(self.connections),
+            'active_connections': sum(1 for conn in self.connections.values() 
+                                    if conn.status == ConnectionStatus.CONNECTED),
+            'total_messages': sum(self.stats['messages_received'].values()),
+            'messages_by_feed': dict(self.stats['messages_received']),
+            'last_activity': max(self.stats['last_message_time'].values()) if self.stats['last_message_time'] else None
+        }
+    
+    async def add_symbols(self, connection_name: str, symbols: List[str]):
+        """Add symbols to WebSocket subscription"""
+        try:
+            if connection_name in self.connections:
+                connection = self.connections[connection_name]
+                connection.config.symbols.extend(symbols)
+                
+                # Re-subscribe if connected
+                if connection.status == ConnectionStatus.CONNECTED:
+                    await connection._subscribe_to_feeds()
+                
+                self.logger.info(f"Added symbols to {connection_name}: {symbols}")
+            else:
+                self.logger.error(f"Connection not found: {connection_name}")
+                
+        except Exception as e:
+            self.logger.error(f"Error adding symbols: {e}")
+    
+    async def remove_symbols(self, connection_name: str, symbols: List[str]):
+        """Remove symbols from WebSocket subscription"""
+        try:
+            if connection_name in self.connections:
+                connection = self.connections[connection_name]
+                for symbol in symbols:
+                    if symbol in connection.config.symbols:
+                        connection.config.symbols.remove(symbol)
+                
+                # Re-subscribe if connected
+                if connection.status == ConnectionStatus.CONNECTED:
+                    await connection._subscribe_to_feeds()
+                
+                self.logger.info(f"Removed symbols from {connection_name}: {symbols}")
+            else:
+                self.logger.error(f"Connection not found: {connection_name}")
+                
+        except Exception as e:
+            self.logger.error(f"Error removing symbols: {e}")
+
+# Example usage and testing
+async def main():
+    """Example usage of WebSocketManager"""
+    from config_manager import ConfigManager
+    from data_manager import DataManager
+    from database_setup import TradingDatabase
+    from security_manager import SecurityManager
+    
+    # Initialize components
+    config_manager = ConfigManager("config/config.yaml")
+    trading_db = TradingDatabase(config_manager)
+    await trading_db.initialize()
+    
+    data_manager = DataManager(config_manager, trading_db)
+    await data_manager.initialize()
+    
+    security_manager = SecurityManager(trading_db, config_manager)
+    await security_manager.initialize()
+    
+    # Initialize WebSocket manager
+    ws_manager = WebSocketManager(config_manager, data_manager, trading_db, security_manager)
+    await ws_manager.initialize()
     
     try:
-        # Keep running
-        while True:
-            time.sleep(1)
-            
-            # Print stats every 10 seconds
-            if int(time.time()) % 10 == 0:
-                stats = ws_manager.get_connection_stats()
-                print(f"📊 Connection Stats: {stats}")
-                
+        # Start WebSocket connections
+        print("Starting WebSocket connections...")
+        
+        # This would run indefinitely in production
+        task = asyncio.create_task(ws_manager.start_all_connections())
+        
+        # Let it run for a bit to test
+        await asyncio.sleep(30)
+        
+        # Check status
+        status = ws_manager.get_connection_status()
+        print(f"Connection Status: {json.dumps(status, indent=2, default=str)}")
+        
+        stats = ws_manager.get_statistics()
+        print(f"Statistics: {json.dumps(stats, indent=2, default=str)}")
+        
     except KeyboardInterrupt:
-        print("\n⏹️ Stopping WebSocket server...")
-        ws_manager.stop_server()
+        print("Stopping WebSocket connections...")
+    finally:
+        await ws_manager.stop_all_connections()
+        await trading_db.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
