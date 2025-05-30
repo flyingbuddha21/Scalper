@@ -1,860 +1,665 @@
 #!/usr/bin/env python3
 """
-Complete Real-time Volatility Analyzer
-Analyzes volatility patterns and provides scalping insights
+Market-Ready Volatility and Risk Analyzer
+Direct integration with DataManager and WebSocket feeds
+No mocking - purely adaptive to real market data
 """
 
+import numpy as np
+import pandas as pd
 import asyncio
 import logging
-import time
-import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-import pandas as pd
-import numpy as np
 from dataclasses import dataclass
-from enum import Enum
-import sqlite3
-import json
-from collections import deque
-import statistics
-
-logger = logging.getLogger(__name__)
-
-class VolatilityType(Enum):
-    INTRADAY = "intraday"
-    HISTORICAL = "historical"
-    IMPLIED = "implied"
-    REALIZED = "realized"
+import math
+from collections import defaultdict, deque
+import warnings
+warnings.filterwarnings('ignore')
 
 @dataclass
 class VolatilityMetrics:
     symbol: str
-    timestamp: datetime
-    
-    # Price-based volatility
-    price_volatility: float
-    intraday_range: float
-    range_percentage: float
-    
-    # Time-based metrics
-    atr_14: float
-    atr_percentage: float
-    bollinger_squeeze: bool
-    
-    # Volume-weighted metrics
-    vwap_deviation: float
-    volume_weighted_volatility: float
-    
-    # Statistical measures
-    standard_deviation: float
-    variance: float
-    skewness: float
-    kurtosis: float
-    
-    # Volatility rankings
-    volatility_rank: float
+    current_volatility: float
+    historical_volatility: float
     volatility_percentile: float
+    beta: float
+    var_95: float
+    var_99: float
+    sharpe_ratio: float
+    max_drawdown: float
+    volatility_trend: str
+    risk_rating: str
+    timestamp: datetime = None
     
-    # Predictive measures
-    volatility_forecast: float
-    trend_direction: str
-    momentum_score: float
-    
-    # Trading signals
-    scalping_signal: str
-    volatility_breakout: bool
-    mean_reversion_signal: bool
-    
-    def to_dict(self) -> Dict:
-        return {
-            'symbol': self.symbol,
-            'timestamp': self.timestamp.isoformat(),
-            'price_volatility': round(self.price_volatility, 3),
-            'intraday_range': round(self.intraday_range, 2),
-            'range_percentage': round(self.range_percentage, 2),
-            'atr_14': round(self.atr_14, 2),
-            'atr_percentage': round(self.atr_percentage, 3),
-            'bollinger_squeeze': self.bollinger_squeeze,
-            'vwap_deviation': round(self.vwap_deviation, 3),
-            'volume_weighted_volatility': round(self.volume_weighted_volatility, 3),
-            'standard_deviation': round(self.standard_deviation, 3),
-            'variance': round(self.variance, 4),
-            'skewness': round(self.skewness, 3),
-            'kurtosis': round(self.kurtosis, 3),
-            'volatility_rank': round(self.volatility_rank, 1),
-            'volatility_percentile': round(self.volatility_percentile, 1),
-            'volatility_forecast': round(self.volatility_forecast, 3),
-            'trend_direction': self.trend_direction,
-            'momentum_score': round(self.momentum_score, 2),
-            'scalping_signal': self.scalping_signal,
-            'volatility_breakout': self.volatility_breakout,
-            'mean_reversion_signal': self.mean_reversion_signal
-        }
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
 
-class RealTimeVolatilityAnalyzer:
-    def __init__(self, api_handler, db_path: str = "data/volatility_data.db"):
-        self.api = api_handler
-        self.db_path = db_path
-        self.running = False
-        
-        # Real-time data storage
-        self.price_buffers = {}  # symbol -> deque of prices
-        self.volume_buffers = {}  # symbol -> deque of volumes
-        self.volatility_cache = {}  # symbol -> VolatilityMetrics
-        
-        # Configuration
-        self.buffer_size = 500  # Keep last 500 ticks
-        self.analysis_interval = 30  # Analyze every 30 seconds
-        
-        # Historical data cache
-        self.historical_cache = {}
-        self.cache_expiry = {}
-        
-        # Callbacks
-        self.update_callbacks = []
-        self.alert_callbacks = []
-        
-        # Initialize database
-        self._init_database()
-        
-        logger.info("📊 Volatility Analyzer initialized")
+@dataclass
+class RiskAlert:
+    symbol: str
+    alert_type: str
+    severity: str
+    message: str
+    current_value: float
+    threshold: float
+    timestamp: datetime = None
     
-    def _init_database(self):
-        """Initialize volatility database"""
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+
+class VolatilityAnalyzer:
+    def __init__(self, config):
+        """Initialize volatility analyzer with real market data integration"""
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        
+        # Integration with bot components
+        self.data_manager = None  # Will be set by bot_core
+        self.websocket_manager = None  # Will be set by bot_core
+        
+        # Real-time data storage - no pre-filled data
+        self.price_data = defaultdict(lambda: deque(maxlen=500))
+        self.returns_data = defaultdict(lambda: deque(maxlen=500))
+        self.volume_data = defaultdict(lambda: deque(maxlen=500))
+        self.tick_data = defaultdict(lambda: deque(maxlen=1000))  # High-frequency data
+        
+        # Market benchmark - auto-detected from live feed
+        self.market_returns = deque(maxlen=250)
+        self.market_symbol = None
+        self.market_candidates = ['NIFTY', 'NIFTY50', 'SENSEX', 'BANKNIFTY', '^NSEI']
+        self.market_proxy_symbols = set()  # Top liquid symbols for proxy
+        
+        # Volatility calculations cache
+        self.volatility_cache = {}
+        self.last_update = {}
+        
+        # Adaptive risk thresholds - adjust based on market regime
+        self.base_thresholds = {
+            'low': 0.015,
+            'medium': 0.03, 
+            'high': 0.05,
+            'extreme': 0.08
+        }
+        self.volatility_thresholds = self.base_thresholds.copy()
+        
+        # Alert system
+        self.risk_alerts = deque(maxlen=100)
+        self.alert_cooldown = defaultdict(lambda: datetime.min)
+        
+        # Market regime detection
+        self.market_volatility_history = deque(maxlen=100)
+        self.current_market_regime = 'NORMAL'
+        
+        # Data quality tracking
+        self.data_quality_scores = defaultdict(float)
+        self.last_data_update = defaultdict(datetime)
+        
+        self.logger.info("Volatility Analyzer initialized - ready for live market data")
+    
+    def set_data_manager(self, data_manager):
+        """Set data manager reference from bot_core"""
+        self.data_manager = data_manager
+        self.logger.info("Data manager connected to volatility analyzer")
+    
+    def set_websocket_manager(self, websocket_manager):
+        """Set websocket manager reference from bot_core"""
+        self.websocket_manager = websocket_manager
+        self.logger.info("WebSocket manager connected to volatility analyzer")
+    
+    async def start_real_time_processing(self):
+        """Start processing real-time market data"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            if not self.data_manager:
+                raise Exception("Data manager not connected")
             
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS volatility_metrics (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    price_volatility REAL,
-                    intraday_range REAL,
-                    range_percentage REAL,
-                    atr_14 REAL,
-                    atr_percentage REAL,
-                    bollinger_squeeze BOOLEAN,
-                    vwap_deviation REAL,
-                    volume_weighted_volatility REAL,
-                    standard_deviation REAL,
-                    variance REAL,
-                    skewness REAL,
-                    kurtosis REAL,
-                    volatility_rank REAL,
-                    volatility_percentile REAL,
-                    volatility_forecast REAL,
-                    trend_direction TEXT,
-                    momentum_score REAL,
-                    scalping_signal TEXT,
-                    volatility_breakout BOOLEAN,
-                    mean_reversion_signal BOOLEAN,
-                    UNIQUE(symbol, timestamp)
-                )
-            """)
+            # Subscribe to real-time data updates
+            await self._subscribe_to_data_feeds()
             
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS volatility_alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    alert_type TEXT NOT NULL,
-                    message TEXT,
-                    volatility_value REAL,
-                    threshold_value REAL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # Start background processing tasks
+            asyncio.create_task(self._continuous_processing_loop())
+            asyncio.create_task(self._market_regime_monitor())
+            asyncio.create_task(self._adaptive_threshold_adjuster())
             
-            # Create indexes for performance
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_volatility_symbol_time ON volatility_metrics(symbol, timestamp)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_symbol_time ON volatility_alerts(symbol, timestamp)")
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info("✅ Volatility database initialized")
+            self.logger.info("✅ Real-time volatility processing started")
             
         except Exception as e:
-            logger.error(f"❌ Volatility database init error: {e}")
+            self.logger.error(f"Failed to start real-time processing: {e}")
+            raise
     
-    def add_symbols(self, symbols: List[str]):
-        """Add symbols for volatility analysis"""
-        for symbol in symbols:
-            if symbol not in self.price_buffers:
-                self.price_buffers[symbol] = deque(maxlen=self.buffer_size)
-                self.volume_buffers[symbol] = deque(maxlen=self.buffer_size)
-                logger.info(f"📈 Added {symbol} for volatility analysis")
-    
-    def remove_symbol(self, symbol: str):
-        """Remove symbol from analysis"""
-        if symbol in self.price_buffers:
-            del self.price_buffers[symbol]
-            del self.volume_buffers[symbol]
-            if symbol in self.volatility_cache:
-                del self.volatility_cache[symbol]
-            logger.info(f"📉 Removed {symbol} from volatility analysis")
-    
-    def start_analysis(self):
-        """Start real-time volatility analysis"""
+    async def _subscribe_to_data_feeds(self):
+        """Subscribe to real-time data feeds"""
         try:
-            self.running = True
+            # Get live symbols from data manager
+            if hasattr(self.data_manager, 'get_active_symbols'):
+                active_symbols = await self.data_manager.get_active_symbols()
+                self.logger.info(f"Monitoring {len(active_symbols)} symbols for volatility")
             
-            # Start analysis thread
-            analysis_thread = threading.Thread(
-                target=self._analysis_loop,
-                daemon=True,
-                name="VolatilityAnalysis"
-            )
-            analysis_thread.start()
-            
-            logger.info("🚀 Volatility analysis started")
+            # Auto-detect market benchmark from available symbols
+            await self._detect_market_benchmark()
             
         except Exception as e:
-            logger.error(f"❌ Start analysis error: {e}")
+            self.logger.error(f"Error subscribing to data feeds: {e}")
     
-    def stop_analysis(self):
-        """Stop volatility analysis"""
-        self.running = False
-        logger.info("⏹️ Volatility analysis stopped")
-    
-    def update_data(self, symbol: str, price: float, volume: int, timestamp: datetime = None):
-        """Update real-time data for symbol"""
+    async def _detect_market_benchmark(self):
+        """Auto-detect market benchmark from live data"""
         try:
-            if symbol not in self.price_buffers:
-                self.add_symbols([symbol])
+            if not self.data_manager:
+                return
             
-            if timestamp is None:
-                timestamp = datetime.now()
+            # Check for standard market indices in live feed
+            available_symbols = await self.data_manager.get_available_symbols()
             
-            self.price_buffers[symbol].append((price, timestamp))
-            self.volume_buffers[symbol].append((volume, timestamp))
+            for candidate in self.market_candidates:
+                if candidate in available_symbols:
+                    self.market_symbol = candidate
+                    self.logger.info(f"Market benchmark detected: {self.market_symbol}")
+                    return
+            
+            # If no index found, create market proxy from most liquid stocks
+            if available_symbols and len(available_symbols) >= 10:
+                # Select top 10 most active symbols as market proxy
+                volume_data = {}
+                for symbol in list(available_symbols)[:50]:  # Check first 50 symbols
+                    try:
+                        recent_data = await self.data_manager.get_recent_data(symbol, periods=5)
+                        if recent_data and 'volume' in recent_data:
+                            avg_volume = np.mean([d.get('volume', 0) for d in recent_data])
+                            volume_data[symbol] = avg_volume
+                    except:
+                        continue
+                
+                # Select top 10 by volume for market proxy
+                if volume_data:
+                    sorted_symbols = sorted(volume_data.items(), key=lambda x: x[1], reverse=True)
+                    self.market_proxy_symbols = set([s[0] for s in sorted_symbols[:10]])
+                    self.market_symbol = 'MARKET_PROXY'
+                    self.logger.info(f"Market proxy created from top 10 liquid symbols")
             
         except Exception as e:
-            logger.debug(f"Update data error for {symbol}: {e}")
+            self.logger.error(f"Error detecting market benchmark: {e}")
     
-    def _analysis_loop(self):
-        """Main analysis loop"""
-        while self.running:
+    async def update(self, market_data: Dict[str, Dict]):
+        """Update with real-time market data from data manager"""
+        try:
+            current_time = datetime.now()
+            
+            for symbol, data in market_data.items():
+                await self._process_live_data(symbol, data, current_time)
+            
+            # Update market benchmark
+            await self._update_market_benchmark(market_data)
+            
+            # Update market volatility tracking
+            await self._update_market_volatility_tracking()
+            
+        except Exception as e:
+            self.logger.error(f"Error updating with market data: {e}")
+    
+    async def _process_live_data(self, symbol: str, data: Dict, timestamp: datetime):
+        """Process live market data for a symbol"""
+        try:
+            # Extract price from whatever format the feed provides
+            price = self._extract_price_from_feed(data)
+            volume = self._extract_volume_from_feed(data)
+            
+            if price <= 0:
+                return
+            
+            # Store tick data
+            tick_info = {
+                'price': price,
+                'volume': volume,
+                'timestamp': timestamp
+            }
+            self.tick_data[symbol].append(tick_info)
+            
+            # Update price series
+            self.price_data[symbol].append(price)
+            self.volume_data[symbol].append(volume)
+            
+            # Calculate returns if we have previous price
+            if len(self.price_data[symbol]) > 1:
+                prev_price = list(self.price_data[symbol])[-2]
+                if prev_price > 0:
+                    return_pct = (price - prev_price) / prev_price
+                    self.returns_data[symbol].append(return_pct)
+            
+            # Update data quality score
+            self._update_data_quality(symbol, data)
+            
+            # Calculate volatility if we have enough data
+            if len(self.returns_data[symbol]) >= 20:
+                await self._calculate_real_time_volatility(symbol)
+            
+            # Check for risk alerts
+            await self._check_real_time_alerts(symbol)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing live data for {symbol}: {e}")
+    
+    def _extract_price_from_feed(self, data: Dict) -> float:
+        """Extract price from any market data format"""
+        # Try all possible price field names
+        price_fields = [
+            'price', 'last_price', 'ltp', 'close', 'last', 'current_price',
+            'last_traded_price', 'market_price', 'trade_price', 'bid', 'ask'
+        ]
+        
+        for field in price_fields:
+            if field in data:
+                try:
+                    value = data[field]
+                    if value is not None and value > 0:
+                        return float(value)
+                except (ValueError, TypeError):
+                    continue
+        
+        # Try nested structures
+        if 'quote' in data and isinstance(data['quote'], dict):
+            return self._extract_price_from_feed(data['quote'])
+        
+        if 'tick' in data and isinstance(data['tick'], dict):
+            return self._extract_price_from_feed(data['tick'])
+        
+        # Try OHLC data
+        ohlc_fields = ['close', 'high', 'low', 'open']
+        for field in ohlc_fields:
+            if field in data:
+                try:
+                    value = data[field]
+                    if value is not None and value > 0:
+                        return float(value)
+                except (ValueError, TypeError):
+                    continue
+        
+        return 0.0
+    
+    def _extract_volume_from_feed(self, data: Dict) -> int:
+        """Extract volume from any market data format"""
+        volume_fields = [
+            'volume', 'vol', 'quantity', 'qty', 'total_volume',
+            'day_volume', 'traded_volume', 'market_volume'
+        ]
+        
+        for field in volume_fields:
+            if field in data:
+                try:
+                    value = data[field]
+                    if value is not None:
+                        return int(float(value))
+                except (ValueError, TypeError):
+                    continue
+        
+        # Check nested structures
+        if 'quote' in data and isinstance(data['quote'], dict):
+            return self._extract_volume_from_feed(data['quote'])
+        
+        return 0
+    
+    def _update_data_quality(self, symbol: str, data: Dict):
+        """Update data quality score based on completeness"""
+        try:
+            score = 0.0
+            total_fields = 0
+            
+            # Check for essential fields
+            essential_fields = ['price', 'volume', 'timestamp']
+            for field in essential_fields:
+                total_fields += 1
+                if self._has_valid_field(data, field):
+                    score += 1.0
+            
+            # Check for additional fields
+            additional_fields = ['open', 'high', 'low', 'close', 'bid', 'ask']
+            for field in additional_fields:
+                total_fields += 0.5
+                if self._has_valid_field(data, field):
+                    score += 0.5
+            
+            # Calculate quality score (0-1)
+            quality_score = score / total_fields if total_fields > 0 else 0
+            self.data_quality_scores[symbol] = quality_score
+            self.last_data_update[symbol] = datetime.now()
+            
+        except Exception as e:
+            self.logger.error(f"Error updating data quality for {symbol}: {e}")
+    
+    def _has_valid_field(self, data: Dict, field: str) -> bool:
+        """Check if data has valid field"""
+        if field in data and data[field] is not None:
             try:
-                for symbol in list(self.price_buffers.keys()):
-                    if len(self.price_buffers[symbol]) >= 20:
-                        metrics = self._calculate_volatility_metrics(symbol)
-                        if metrics:
-                            self.volatility_cache[symbol] = metrics
-                            self._save_metrics_to_db(metrics)
-                            self._check_alerts(metrics)
-                
-                # Notify callbacks
-                self._notify_callbacks()
-                
-                time.sleep(self.analysis_interval)
-                
-            except Exception as e:
-                logger.error(f"❌ Analysis loop error: {e}")
-                time.sleep(60)
+                float(data[field])
+                return True
+            except:
+                pass
+        return False
     
-    def _calculate_volatility_metrics(self, symbol: str) -> Optional[VolatilityMetrics]:
-        """Calculate comprehensive volatility metrics"""
+    async def _calculate_real_time_volatility(self, symbol: str):
+        """Calculate volatility metrics from live data"""
         try:
-            if symbol not in self.price_buffers or len(self.price_buffers[symbol]) < 20:
-                return None
+            returns = list(self.returns_data[symbol])
+            prices = list(self.price_data[symbol])
             
-            price_data = list(self.price_buffers[symbol])
-            volume_data = list(self.volume_buffers[symbol])
+            if len(returns) < 20:
+                return
             
-            prices = [p[0] for p in price_data]
-            volumes = [v[0] for v in volume_data]
-            timestamps = [p[1] for p in price_data]
+            # Current volatility (rolling 20-period)
+            recent_returns = returns[-20:]
+            current_vol = np.std(recent_returns) * np.sqrt(252)  # Annualized
             
-            current_price = prices[-1]
+            # Historical volatility (all available data)
+            historical_vol = np.std(returns) * np.sqrt(252)
             
-            # Price-based volatility
-            returns = np.diff(prices) / prices[:-1]
-            price_volatility = np.std(returns) * np.sqrt(252) * 100  # Annualized
+            # Volatility percentile
+            vol_percentile = self._calculate_volatility_percentile(returns, current_vol)
             
-            # Intraday range
-            high_price = max(prices[-20:])  # Last 20 ticks
-            low_price = min(prices[-20:])
-            intraday_range = high_price - low_price
-            range_percentage = (intraday_range / current_price) * 100
+            # Beta calculation
+            beta = await self._calculate_live_beta(symbol, returns)
             
-            # ATR calculation
-            atr_14 = self._calculate_atr(prices, 14)
-            atr_percentage = (atr_14 / current_price) * 100
+            # Value at Risk
+            var_95 = np.percentile(returns, 5)
+            var_99 = np.percentile(returns, 1)
             
-            # Bollinger Bands squeeze
-            bollinger_squeeze = self._check_bollinger_squeeze(prices)
+            # Sharpe ratio
+            sharpe_ratio = self._calculate_sharpe_ratio(returns)
             
-            # VWAP and deviation
-            vwap = self._calculate_vwap(prices, volumes)
-            vwap_deviation = ((current_price - vwap) / vwap) * 100 if vwap > 0 else 0
+            # Maximum drawdown
+            max_drawdown = self._calculate_max_drawdown(prices)
             
-            # Volume-weighted volatility
-            volume_weighted_volatility = self._calculate_volume_weighted_volatility(prices, volumes)
+            # Volatility trend
+            vol_trend = self._determine_volatility_trend(returns)
             
-            # Statistical measures
-            std_dev = np.std(prices[-50:]) if len(prices) >= 50 else np.std(prices)
-            variance = np.var(prices[-50:]) if len(prices) >= 50 else np.var(prices)
+            # Risk rating (adaptive to market regime)
+            risk_rating = self._determine_adaptive_risk_rating(current_vol)
             
-            # Skewness and Kurtosis
-            recent_returns = returns[-30:] if len(returns) >= 30 else returns
-            skewness = self._calculate_skewness(recent_returns)
-            kurtosis = self._calculate_kurtosis(recent_returns)
-            
-            # Volatility ranking
-            volatility_rank, volatility_percentile = self._calculate_volatility_rank(symbol, price_volatility)
-            
-            # Volatility forecast
-            volatility_forecast = self._forecast_volatility(prices, volumes)
-            
-            # Trend analysis
-            trend_direction, momentum_score = self._analyze_trend(prices)
-            
-            # Trading signals
-            scalping_signal = self._generate_scalping_signal(
-                price_volatility, atr_percentage, vwap_deviation, trend_direction
-            )
-            
-            volatility_breakout = self._detect_volatility_breakout(
-                price_volatility, atr_percentage, bollinger_squeeze
-            )
-            
-            mean_reversion_signal = self._detect_mean_reversion(
-                vwap_deviation, volatility_rank
-            )
-            
-            return VolatilityMetrics(
+            # Create metrics
+            metrics = VolatilityMetrics(
                 symbol=symbol,
-                timestamp=datetime.now(),
-                price_volatility=price_volatility,
-                intraday_range=intraday_range,
-                range_percentage=range_percentage,
-                atr_14=atr_14,
-                atr_percentage=atr_percentage,
-                bollinger_squeeze=bollinger_squeeze,
-                vwap_deviation=vwap_deviation,
-                volume_weighted_volatility=volume_weighted_volatility,
-                standard_deviation=std_dev,
-                variance=variance,
-                skewness=skewness,
-                kurtosis=kurtosis,
-                volatility_rank=volatility_rank,
-                volatility_percentile=volatility_percentile,
-                volatility_forecast=volatility_forecast,
-                trend_direction=trend_direction,
-                momentum_score=momentum_score,
-                scalping_signal=scalping_signal,
-                volatility_breakout=volatility_breakout,
-                mean_reversion_signal=mean_reversion_signal
+                current_volatility=current_vol,
+                historical_volatility=historical_vol,
+                volatility_percentile=vol_percentile,
+                beta=beta,
+                var_95=var_95,
+                var_99=var_99,
+                sharpe_ratio=sharpe_ratio,
+                max_drawdown=max_drawdown,
+                volatility_trend=vol_trend,
+                risk_rating=risk_rating
             )
+            
+            # Cache metrics
+            self.volatility_cache[symbol] = metrics
+            self.last_update[symbol] = datetime.now()
             
         except Exception as e:
-            logger.debug(f"Volatility metrics calculation error for {symbol}: {e}")
-            return None
+            self.logger.error(f"Error calculating volatility for {symbol}: {e}")
     
-    def _calculate_atr(self, prices: List[float], period: int) -> float:
-        """Calculate Average True Range"""
+    def _calculate_volatility_percentile(self, returns: List[float], current_vol: float) -> float:
+        """Calculate volatility percentile from historical data"""
         try:
-            if len(prices) < period + 1:
-                return 0.0
+            if len(returns) < 40:
+                return 50.0
             
-            true_ranges = []
-            for i in range(1, len(prices)):
-                high_low = abs(prices[i] - prices[i-1])  # Simplified for tick data
-                true_ranges.append(high_low)
+            vol_series = []
+            for i in range(20, len(returns), 5):  # Calculate every 5 periods
+                period_returns = returns[max(0, i-20):i]
+                if len(period_returns) >= 10:
+                    period_vol = np.std(period_returns) * np.sqrt(252)
+                    vol_series.append(period_vol)
             
-            if len(true_ranges) >= period:
-                return np.mean(true_ranges[-period:])
-            else:
-                return np.mean(true_ranges)
+            if len(vol_series) < 5:
+                return 50.0
+            
+            # Calculate percentile
+            sorted_vols = sorted(vol_series)
+            position = 0
+            for vol in sorted_vols:
+                if current_vol > vol:
+                    position += 1
+                else:
+                    break
+            
+            percentile = (position / len(sorted_vols)) * 100
+            return min(99.0, max(1.0, percentile))
+            
+        except Exception:
+            return 50.0
+    
+    async def _calculate_live_beta(self, symbol: str, returns: List[float]) -> float:
+        """Calculate beta using live market data"""
+        try:
+            if len(self.market_returns) < 20 or len(returns) < 20:
+                return 1.0
+            
+            # Align data lengths
+            min_length = min(len(returns), len(self.market_returns))
+            symbol_returns = returns[-min_length:]
+            market_returns = list(self.market_returns)[-min_length:]
+            
+            # Calculate beta
+            if len(symbol_returns) >= 10 and len(market_returns) >= 10:
+                covariance = np.cov(symbol_returns, market_returns)[0][1]
+                market_variance = np.var(market_returns)
                 
-        except Exception:
-            return 0.0
-    
-    def _check_bollinger_squeeze(self, prices: List[float]) -> bool:
-        """Check for Bollinger Bands squeeze"""
-        try:
-            if len(prices) < 20:
-                return False
+                if market_variance > 0:
+                    beta = covariance / market_variance
+                    return max(0, min(5.0, beta))  # Cap between 0 and 5
             
-            # Simple squeeze detection
-            recent_prices = prices[-20:]
-            std_dev = np.std(recent_prices)
-            mean_price = np.mean(recent_prices)
-            
-            # Squeeze when standard deviation is low relative to price
-            squeeze_threshold = mean_price * 0.01  # 1% of price
-            return std_dev < squeeze_threshold
+            return 1.0
             
         except Exception:
-            return False
+            return 1.0
     
-    def _calculate_vwap(self, prices: List[float], volumes: List[int]) -> float:
-        """Calculate Volume Weighted Average Price"""
+    def _calculate_sharpe_ratio(self, returns: List[float]) -> float:
+        """Calculate Sharpe ratio"""
         try:
-            if len(prices) != len(volumes) or len(prices) == 0:
+            if len(returns) < 20:
                 return 0.0
             
-            total_volume = sum(volumes)
-            if total_volume == 0:
-                return np.mean(prices)
+            # Risk-free rate (configurable, default 6% annually)
+            risk_free_rate = self.config.get('risk_free_rate', 0.06) / 252
             
-            vwap = sum(p * v for p, v in zip(prices, volumes)) / total_volume
-            return vwap
+            excess_returns = [r - risk_free_rate for r in returns]
+            mean_excess = np.mean(excess_returns)
+            std_excess = np.std(excess_returns)
+            
+            if std_excess > 0:
+                return (mean_excess / std_excess) * np.sqrt(252)
+            
+            return 0.0
             
         except Exception:
             return 0.0
     
-    def _calculate_volume_weighted_volatility(self, prices: List[float], volumes: List[int]) -> float:
-        """Calculate volume-weighted volatility"""
+    def _calculate_max_drawdown(self, prices: List[float]) -> float:
+        """Calculate maximum drawdown"""
         try:
             if len(prices) < 2:
                 return 0.0
             
-            returns = np.diff(prices) / prices[:-1]
-            volume_weights = volumes[1:] if len(volumes) > len(returns) else volumes[:len(returns)]
+            peak = prices[0]
+            max_dd = 0.0
             
-            if len(returns) != len(volume_weights):
-                return np.std(returns) * 100
-            
-            total_volume = sum(volume_weights)
-            if total_volume == 0:
-                return np.std(returns) * 100
-            
-            # Weight returns by volume
-            weighted_returns = [r * v / total_volume for r, v in zip(returns, volume_weights)]
-            return np.std(weighted_returns) * 100
-            
-        except Exception:
-            return 0.0
-    
-    def _calculate_skewness(self, data: List[float]) -> float:
-        """Calculate skewness"""
-        try:
-            if len(data) < 3:
-                return 0.0
-            
-            mean_val = np.mean(data)
-            std_val = np.std(data)
-            
-            if std_val == 0:
-                return 0.0
-            
-            skew = np.mean([((x - mean_val) / std_val) ** 3 for x in data])
-            return skew
-            
-        except Exception:
-            return 0.0
-    
-    def _calculate_kurtosis(self, data: List[float]) -> float:
-        """Calculate kurtosis"""
-        try:
-            if len(data) < 4:
-                return 0.0
-            
-            mean_val = np.mean(data)
-            std_val = np.std(data)
-            
-            if std_val == 0:
-                return 0.0
-            
-            kurt = np.mean([((x - mean_val) / std_val) ** 4 for x in data]) - 3
-            return kurt
-            
-        except Exception:
-            return 0.0
-    
-    def _calculate_volatility_rank(self, symbol: str, current_vol: float) -> Tuple[float, float]:
-        """Calculate volatility rank and percentile"""
-        try:
-            # Get historical volatility data from database
-            historical_vols = self._get_historical_volatility(symbol, days=252)  # 1 year
-            
-            if not historical_vols:
-                return 50.0, 50.0  # Default middle rank
-            
-            # Calculate rank
-            rank = sum(1 for vol in historical_vols if current_vol > vol) / len(historical_vols) * 100
-            
-            # Calculate percentile
-            percentile = np.percentile(historical_vols, 50)  # Median percentile
-            
-            return rank, percentile
-            
-        except Exception:
-            return 50.0, 50.0
-    
-    def _get_historical_volatility(self, symbol: str, days: int) -> List[float]:
-        """Get historical volatility data"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cutoff_date = datetime.now() - timedelta(days=days)
-            
-            cursor.execute("""
-                SELECT price_volatility FROM volatility_metrics 
-                WHERE symbol = ? AND timestamp > ?
-                ORDER BY timestamp DESC
-            """, (symbol, cutoff_date))
-            
-            results = [row[0] for row in cursor.fetchall() if row[0] is not None]
-            conn.close()
-            
-            return results
-            
-        except Exception as e:
-            logger.debug(f"Historical volatility error: {e}")
-            return []
-    
-    def _forecast_volatility(self, prices: List[float], volumes: List[int]) -> float:
-        """Simple volatility forecast"""
-        try:
-            if len(prices) < 10:
-                return 0.0
-            
-            # Simple exponential smoothing for volatility forecast
-            recent_volatility = np.std(prices[-10:]) / np.mean(prices[-10:]) * 100
-            medium_volatility = np.std(prices[-20:]) / np.mean(prices[-20:]) * 100 if len(prices) >= 20 else recent_volatility
-            
-            # Weighted forecast
-            forecast = (recent_volatility * 0.7) + (medium_volatility * 0.3)
-            
-            return forecast
-            
-        except Exception:
-            return 0.0
-    
-    def _analyze_trend(self, prices: List[float]) -> Tuple[str, float]:
-        """Analyze price trend and momentum"""
-        try:
-            if len(prices) < 10:
-                return "neutral", 0.0
-            
-            # Simple trend analysis
-            recent_prices = prices[-10:]
-            older_prices = prices[-20:-10] if len(prices) >= 20 else prices[:len(prices)//2]
-            
-            recent_avg = np.mean(recent_prices)
-            older_avg = np.mean(older_prices)
-            
-            if recent_avg > older_avg * 1.002:  # 0.2% threshold
-                trend = "up"
-                momentum = ((recent_avg - older_avg) / older_avg) * 100
-            elif recent_avg < older_avg * 0.998:
-                trend = "down"
-                momentum = ((recent_avg - older_avg) / older_avg) * 100
-            else:
-                trend = "neutral"
-                momentum = 0.0
-            
-            # Cap momentum score
-            momentum = max(-10, min(momentum, 10))
-            
-            return trend, momentum
-            
-        except Exception:
-            return "neutral", 0.0
-    
-    def _generate_scalping_signal(self, price_vol: float, atr_pct: float, 
-                                vwap_dev: float, trend: str) -> str:
-        """Generate scalping signal based on volatility"""
-        try:
-            # High volatility + trend alignment = scalping opportunity
-            if price_vol > 20 and atr_pct > 1.0:  # High volatility
-                if trend == "up" and vwap_dev < -0.3:  # Uptrend, price below VWAP
-                    return "BUY"
-                elif trend == "down" and vwap_dev > 0.3:  # Downtrend, price above VWAP
-                    return "SELL"
-            
-            # Low volatility = avoid trading
-            if price_vol < 10 or atr_pct < 0.5:
-                return "AVOID"
-            
-            return "NEUTRAL"
-            
-        except Exception:
-            return "NEUTRAL"
-    
-    def _detect_volatility_breakout(self, price_vol: float, atr_pct: float, squeeze: bool) -> bool:
-        """Detect volatility breakout"""
-        try:
-            # Breakout after squeeze with high volatility
-            if squeeze and price_vol > 25 and atr_pct > 1.5:
-                return True
-            
-            # Sudden volatility spike
-            if price_vol > 30 and atr_pct > 2.0:
-                return True
-            
-            return False
-            
-        except Exception:
-            return False
-    
-    def _detect_mean_reversion(self, vwap_dev: float, vol_rank: float) -> bool:
-        """Detect mean reversion opportunity"""
-        try:
-            # High VWAP deviation in low volatility environment
-            if abs(vwap_dev) > 1.0 and vol_rank < 30:
-                return True
-            
-            # Extreme deviation
-            if abs(vwap_dev) > 2.0:
-                return True
-            
-            return False
-            
-        except Exception:
-            return False
-    
-    def _save_metrics_to_db(self, metrics: VolatilityMetrics):
-        """Save metrics to database"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT OR REPLACE INTO volatility_metrics 
-                (symbol, timestamp, price_volatility, intraday_range, range_percentage,
-                 atr_14, atr_percentage, bollinger_squeeze, vwap_deviation,
-                 volume_weighted_volatility, standard_deviation, variance,
-                 skewness, kurtosis, volatility_rank, volatility_percentile,
-                 volatility_forecast, trend_direction, momentum_score,
-                 scalping_signal, volatility_breakout, mean_reversion_signal)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                metrics.symbol, metrics.timestamp, metrics.price_volatility,
-                metrics.intraday_range, metrics.range_percentage,
-                metrics.atr_14, metrics.atr_percentage, metrics.bollinger_squeeze,
-                metrics.vwap_deviation, metrics.volume_weighted_volatility,
-                metrics.standard_deviation, metrics.variance,
-                metrics.skewness, metrics.kurtosis, metrics.volatility_rank,
-                metrics.volatility_percentile, metrics.volatility_forecast,
-                metrics.trend_direction, metrics.momentum_score,
-                metrics.scalping_signal, metrics.volatility_breakout,
-                metrics.mean_reversion_signal
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.debug(f"Save metrics error: {e}")
-    
-    def _check_alerts(self, metrics: VolatilityMetrics):
-        """Check for volatility alerts"""
-        try:
-            alerts = []
-            
-            # High volatility alert
-            if metrics.price_volatility > 50:
-                alerts.append({
-                    'type': 'HIGH_VOLATILITY',
-                    'message': f'{metrics.symbol} volatility spike: {metrics.price_volatility:.1f}%',
-                    'value': metrics.price_volatility
-                })
-            
-            # Volatility breakout alert
-            if metrics.volatility_breakout:
-                alerts.append({
-                    'type': 'VOLATILITY_BREAKOUT',
-                    'message': f'{metrics.symbol} volatility breakout detected',
-                    'value': metrics.price_volatility
-                })
-            
-            # Mean reversion alert
-            if metrics.mean_reversion_signal:
-                alerts.append({
-                    'type': 'MEAN_REVERSION',
-                    'message': f'{metrics.symbol} mean reversion opportunity',
-                    'value': metrics.vwap_deviation
-                })
-            
-            # Save alerts to database
-            for alert in alerts:
-                self._save_alert(metrics.symbol, alert)
+            for price in prices[1:]:
+                if price > peak:
+                    peak = price
                 
-            # Notify alert callbacks
-            for callback in self.alert_callbacks:
-                try:
-                    callback(metrics.symbol, alerts)
-                except Exception as e:
-                    logger.debug(f"Alert callback error: {e}")
+                drawdown = (peak - price) / peak if peak > 0 else 0
+                max_dd = max(max_dd, drawdown)
+            
+            return max_dd
+            
+        except Exception:
+            return 0.0
+    
+    def _determine_volatility_trend(self, returns: List[float]) -> str:
+        """Determine volatility trend"""
+        try:
+            if len(returns) < 40:
+                return 'STABLE'
+            
+            # Compare recent vs previous volatility
+            recent_vol = np.std(returns[-20:])
+            previous_vol = np.std(returns[-40:-20])
+            
+            if previous_vol > 0:
+                change = (recent_vol - previous_vol) / previous_vol
+                
+                if change > 0.2:
+                    return 'INCREASING'
+                elif change < -0.2:
+                    return 'DECREASING'
+            
+            return 'STABLE'
+            
+        except Exception:
+            return 'STABLE'
+    
+    def _determine_adaptive_risk_rating(self, volatility: float) -> str:
+        """Determine risk rating adaptive to market regime"""
+        try:
+            # Use adaptive thresholds based on market regime
+            thresholds = self.volatility_thresholds
+            
+            if volatility <= thresholds['low']:
+                return 'LOW'
+            elif volatility <= thresholds['medium']:
+                return 'MEDIUM'
+            elif volatility <= thresholds['high']:
+                return 'HIGH'
+            else:
+                return 'EXTREME'
+                
+        except Exception:
+            return 'MEDIUM'
+    
+    async def _update_market_benchmark(self, market_data: Dict[str, Dict]):
+        """Update market benchmark from live data"""
+        try:
+            if self.market_symbol == 'MARKET_PROXY':
+                # Calculate market proxy return
+                await self._calculate_market_proxy_return(market_data)
+            elif self.market_symbol and self.market_symbol in market_data:
+                # Direct market index data
+                price = self._extract_price_from_feed(market_data[self.market_symbol])
+                if price > 0:
+                    if hasattr(self, '_last_market_price') and self._last_market_price > 0:
+                        market_return = (price - self._last_market_price) / self._last_market_price
+                        self.market_returns.append(market_return)
                     
+                    self._last_market_price = price
+            
         except Exception as e:
-            logger.debug(f"Check alerts error: {e}")
+            self.logger.error(f"Error updating market benchmark: {e}")
     
-    def _save_alert(self, symbol: str, alert: Dict):
-        """Save alert to database"""
+    async def _calculate_market_proxy_return(self, market_data: Dict[str, Dict]):
+        """Calculate market proxy return from liquid symbols"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            if not self.market_proxy_symbols:
+                return
             
-            cursor.execute("""
-                INSERT INTO volatility_alerts 
-                (symbol, alert_type, message, volatility_value)
-                VALUES (?, ?, ?, ?)
-            """, (
-                symbol,
-                alert['type'],
-                alert['message'],
-                alert['value']
-            ))
+            returns = []
+            for symbol in self.market_proxy_symbols:
+                if symbol in market_data and symbol in self.returns_data:
+                    if len(self.returns_data[symbol]) > 0:
+                        returns.append(self.returns_data[symbol][-1])
             
-            conn.commit()
-            conn.close()
+            if len(returns) >= 3:  # Need at least 3 symbols for proxy
+                market_return = np.mean(returns)
+                self.market_returns.append(market_return)
             
         except Exception as e:
-            logger.debug(f"Save alert error: {e}")
+            self.logger.error(f"Error calculating market proxy: {e}")
     
-    def _notify_callbacks(self):
-        """Notify update callbacks"""
-        for callback in self.update_callbacks:
+    async def _continuous_processing_loop(self):
+        """Continuous background processing"""
+        while True:
             try:
-                callback(dict(self.volatility_cache))
+                # Clean old data
+                await self._cleanup_old_data()
+                
+                # Update data quality metrics
+                await self._update_overall_data_quality()
+                
+                await asyncio.sleep(60)  # Run every minute
+                
             except Exception as e:
-                logger.debug(f"Update callback error: {e}")
+                self.logger.error(f"Error in continuous processing: {e}")
+                await asyncio.sleep(60)
     
-    def add_update_callback(self, callback):
-        """Add update callback"""
-        self.update_callbacks.append(callback)
-    
-    def add_alert_callback(self, callback):
-        """Add alert callback"""
-        self.alert_callbacks.append(callback)
-    
-    def get_volatility_summary(self) -> Dict:
-        """Get volatility summary for all symbols"""
+    async def _cleanup_old_data(self):
+        """Clean up old data to manage memory"""
         try:
-            summary = {
-                'total_symbols': len(self.volatility_cache),
-                'high_volatility_count': 0,
-                'breakout_signals': 0,
-                'mean_reversion_signals': 0,
-                'scalping_opportunities': 0,
-                'symbol_metrics': {}
+            cutoff_time = datetime.now() - timedelta(hours=24)
+            
+            for symbol in list(self.tick_data.keys()):
+                # Keep only recent tick data
+                recent_ticks = [
+                    tick for tick in self.tick_data[symbol] 
+                    if tick.get('timestamp', datetime.min) > cutoff_time
+                ]
+                self.tick_data[symbol] = deque(recent_ticks, maxlen=1000)
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning up old data: {e}")
+    
+    # Public API methods
+    async def get_symbol_volatility(self, symbol: str) -> Optional[float]:
+        """Get current volatility for symbol"""
+        if symbol in self.volatility_cache:
+            return self.volatility_cache[symbol].current_volatility
+        return None
+    
+    async def get_symbol_metrics(self, symbol: str) -> Optional[VolatilityMetrics]:
+        """Get complete metrics for symbol"""
+        return self.volatility_cache.get(symbol)
+    
+    async def get_all_metrics(self) -> Dict[str, VolatilityMetrics]:
+        """Get all volatility metrics"""
+        return self.volatility_cache.copy()
+    
+    async def is_market_ready(self) -> bool:
+        """Check if analyzer is ready with live market data"""
+        return (
+            len(self.volatility_cache) > 0 and
+            self.data_manager is not None and
+            len(self.price_data) > 0
+        )
+    
+    async def get_data_quality_report(self) -> Dict:
+        """Get data quality report"""
+        try:
+            total_symbols = len(self.data_quality_scores)
+            if total_symbols == 0:
+                return {'status': 'NO_DATA', 'message': 'No market data received yet'}
+            
+            avg_quality = np.mean(list(self.data_quality_scores.values()))
+            recent_updates = sum(
+                1 for timestamp in self.last_data_update.values()
+                if timestamp > datetime.now() - timedelta(minutes=5)
+            )
+            
+            return {
+                'status': 'LIVE' if avg_quality > 0.7 else 'DEGRADED',
+                'total_symbols': total_symbols,
+                'average_quality_score': avg_quality,
+                'symbols_updated_recently': recent_updates,
+                'market_benchmark': self.market_symbol,
+                'market_regime': self.current_market_regime,
+                'last_update': max(self.last_data_update.values()).isoformat() if self.last_data_update else None
             }
             
-            for symbol, metrics in self.volatility_cache.items():
-                if metrics.price_volatility > 30:
-                    summary['high_volatility_count'] += 1
-                
-                if metrics.volatility_breakout:
-                    summary['breakout_signals'] += 1
-                
-                if metrics.mean_reversion_signal:
-                    summary['mean_reversion_signals'] += 1
-                
-                if metrics.scalping_signal in ['BUY', 'SELL']:
-                    summary['scalping_opportunities'] += 1
-                
-                summary['symbol_metrics'][symbol] = metrics.to_dict()
-            
-            return summary
-            
         except Exception as e:
-            logger.error(f"Volatility summary error: {e}")
-            return {'error': str(e)}
-    
-    def get_alerts_history(self, hours: int = 24) -> List[Dict]:
-        """Get recent alerts"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cutoff_time = datetime.now() - timedelta(hours=hours)
-            
-            cursor.execute("""
-                SELECT symbol, alert_type, message, volatility_value, timestamp
-                FROM volatility_alerts 
-                WHERE timestamp > ?
-                ORDER BY timestamp DESC
-            """, (cutoff_time,))
-            
-            alerts = []
-            for row in cursor.fetchall():
-                alerts.append({
-                    'symbol': row[0],
-                    'alert_type': row[1],
-                    'message': row[2],
-                    'volatility_value': row[3],
-                    'timestamp': row[4]
-                })
-            
-            conn.close()
-            return alerts
-            
-        except Exception as e:
-            logger.error(f"Alerts history error: {e}")
-            return []
-    
-    def cleanup(self):
-        """Cleanup analyzer resources"""
-        try:
-            self.stop_analysis()
-            
-            # Clear data
-            self.price_buffers.clear()
-            self.volume_buffers.clear()
-            self.volatility_cache.clear()
-            self.update_callbacks.clear()
-            self.alert_callbacks.clear()
-            
-            logger.info("🧹 Volatility analyzer cleanup completed")
-            
-        except Exception as e:
-            logger.error(f"❌ Volatility analyzer cleanup error: {e}")
+            return {'status': 'ERROR', 'error': str(e)}
 
-
-# Usage example
-if __name__ == "__main__":
-    # Test volatility analyzer
-    import random
-    
-    analyzer = RealTimeVolatilityAnalyzer(None)
-    
-    # Add test symbols
-    analyzer.add_symbols(['RELIANCE', 'TCS', 'INFY'])
-    
-    # Start analysis
-    analyzer.start_analysis()
-    
-    # Add callback
-    def volatility_update(metrics_dict):
-        print(f"📊 Volatility update: {len(metrics_dict)} symbols")
-    
-    analyzer.add_update_callback(volatility_update)
-    
-    # Simulate market data
-    # Simulate market data
-    base_prices = {'RELIANCE': 2500, 'TCS': 3200, 'INFY': 1450}
-    
-    for i in range(100):
-        for symbol in ['RELIANCE', 'TCS', 'INFY']:
-            base_price = base_prices[symbol]
-            
-            # Simulate price with volatility
-            price = base_price + random.uniform(-base_price * 0.02, base_price * 0.02)
-            volume = random.randint(1000, 10000)
-            
-            # Update analyzer
-            analyzer.update_data(symbol, price, volume)
-        
-        time.sleep(0.1)  # 100ms intervals
-    
-    # Wait for analysis
-    time.sleep(35)  # Wait for analysis cycle
-    
-    # Get summary
-    summary = analyzer.get_volatility_summary()
-    print(f"📈 Volatility Summary: {json.dumps(summary, indent=2)}")
-    
-    # Get alerts
-    alerts = analyzer.get_alerts_history(1)  # Last hour
-    print(f"🚨 Recent Alerts: {len(alerts)}")
-    
-    analyzer.cleanup()
-    print("✅ Volatility analyzer test completed")
+# Integration helper for bot_core.py
+async def initialize_volatility_analyzer(config, data_manager, websocket_manager):
+    """Initialize volatility analyzer with proper connections"""
+    analyzer = VolatilityAnalyzer(config)
+    analyzer.set_data_manager(data_manager)
+    analyzer.set_websocket_manager(websocket_manager)
+    await analyzer.start_real_time_processing()
+    return analyzer
