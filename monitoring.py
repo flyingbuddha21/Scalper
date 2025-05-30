@@ -1,742 +1,694 @@
 #!/usr/bin/env python3
 """
-System Monitoring and Health Checks
-Monitors all system components and provides alerts
+Production Monitoring System for Trading Database
+Comprehensive monitoring, alerting, and health checks
 """
 
-import time
-import threading
+import asyncio
 import logging
+import time
 import psutil
-import os
+import asyncpg
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Dict, List, Any
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from enum import Enum
 import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import aiohttp
+import schedule
 from pathlib import Path
 
+# Import system components
+from database_setup import TradingDatabase
+from config_manager import ConfigManager
+from notification_system import NotificationManager
+from utils import Logger, ErrorHandler
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('monitoring.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-class SystemMonitor:
-    """Monitors system health and performance"""
-    
-    def __init__(self, services: Dict):
-        self.services = services
-        self.running = False
-        self.monitoring_interval = 60  # 1 minute
-        
-        # Health status
-        self.health_status = {
-            'overall': 'unknown',
-            'services': {},
-            'system': {},
-            'alerts': []
-        }
-        
-        # Performance metrics
-        self.metrics = {
-            'system': [],
-            'services': [],
-            'alerts': []
-        }
-        
-        # Alert thresholds
-        self.thresholds = {
-            'cpu_usage': 80.0,  # Percent
-            'memory_usage': 85.0,  # Percent
-            'disk_usage': 90.0,  # Percent
-            'response_time': 5.0,  # Seconds
-            'error_rate': 10.0  # Percent
-        }
-        
-        logger.info("📊 System Monitor initialized")
-    
-    def start_monitoring(self):
-        """Start system monitoring"""
+class AlertLevel(Enum):
+    """Alert severity levels"""
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    EMERGENCY = "EMERGENCY"
+
+class ServiceStatus(Enum):
+    """Service status enumeration"""
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    UNHEALTHY = "UNHEALTHY"
+    DOWN = "DOWN"
+
+@dataclass
+class HealthCheck:
+    """Health check result"""
+    service: str
+    status: ServiceStatus
+    message: str
+    timestamp: datetime
+    metrics: Dict[str, Any]
+    response_time: float
+
+@dataclass
+class Alert:
+    """Alert notification"""
+    level: AlertLevel
+    service: str
+    message: str
+    timestamp: datetime
+    resolved: bool = False
+    resolution_time: Optional[datetime] =     async def initialize(self):
+        """Initialize database connections"""
         try:
-            self.running = True
-            
-            logger.info("🚀 System monitoring started")
-            
-            while self.running:
-                try:
-                    # Check system health
-                    self._check_system_health()
-                    
-                    # Check service health
-                    self._check_service_health()
-                    
-                    # Update overall status
-                    self._update_overall_status()
-                    
-                    # Clean old metrics
-                    self._cleanup_old_metrics()
-                    
-                    time.sleep(self.monitoring_interval)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Monitoring loop error: {e}")
-                    time.sleep(30)  # Wait before retry
-                    
+            # Use existing trading
+
+class DatabaseMonitor:
+    """PostgreSQL and SQLite database monitoring"""
+    
+    def __init__(self, trading_db: TradingDatabase, config_manager: ConfigManager):
+        self.trading_db = trading_db
+        self.config = config_manager.get_config()['monitoring']
+        self.pg_pool = trading_db.pg_pool
+        self.sqlite_path = trading_db.sqlite_path
+        self.alert_thresholds = {
+            'connection_usage': 80,  # % of max connections
+            'query_time': 5.0,       # seconds
+            'disk_space': 85,        # % used
+            'cache_hit_ratio': 90,   # % minimum
+            'deadlocks': 5,          # per hour
+            'replication_lag': 60    # seconds
+        }
+    
+    async def initialize(self):
+        """Initialize database connections"""
+        try:
+            self.connection_pool = await asyncpg.create_pool(
+                **self.pg_config,
+                min_size=2,
+                max_size=10
+            )
+            logger.info("Database monitor initialized successfully")
         except Exception as e:
-            logger.error(f"❌ Monitoring start error: {e}")
-            self.running = False
+            logger.error(f"Failed to initialize database monitor: {e}")
+            raise
     
-    def stop_monitoring(self):
-        """Stop system monitoring"""
-        self.running = False
-        logger.info("⏹️ System monitoring stopped")
-    
-    def _check_system_health(self):
-        """Check system resource health"""
+    async def check_postgresql_health(self) -> HealthCheck:
+        """Comprehensive PostgreSQL health check"""
+        start_time = time.time()
+        metrics = {}
+        
         try:
-            timestamp = datetime.now()
+            async with self.connection_pool.acquire() as conn:
+                # Basic connectivity
+                await conn.execute("SELECT 1")
+                
+                # Connection statistics
+                conn_stats = await conn.fetchrow("""
+                    SELECT 
+                        numbackends as active_connections,
+                        xact_commit as transactions_committed,
+                        xact_rollback as transactions_rolled_back,
+                        blks_read as blocks_read,
+                        blks_hit as blocks_hit,
+                        tup_returned as tuples_returned,
+                        tup_fetched as tuples_fetched,
+                        tup_inserted as tuples_inserted,
+                        tup_updated as tuples_updated,
+                        tup_deleted as tuples_deleted
+                    FROM pg_stat_database 
+                    WHERE datname = current_database()
+                """)
+                
+                # Cache hit ratio
+                cache_hit_ratio = (conn_stats['blocks_hit'] / 
+                                 max(conn_stats['blocks_hit'] + conn_stats['blocks_read'], 1)) * 100
+                
+                # Long running queries
+                long_queries = await conn.fetch("""
+                    SELECT pid, query, state, query_start
+                    FROM pg_stat_activity 
+                    WHERE state = 'active' 
+                    AND query_start < NOW() - INTERVAL '30 seconds'
+                    AND query NOT LIKE '%pg_stat_activity%'
+                """)
+                
+                # Lock statistics
+                locks = await conn.fetchrow("""
+                    SELECT COUNT(*) as total_locks,
+                           COUNT(CASE WHEN NOT granted THEN 1 END) as waiting_locks
+                    FROM pg_locks
+                """)
+                
+                # Database size
+                db_size = await conn.fetchrow("""
+                    SELECT pg_size_pretty(pg_database_size(current_database())) as size,
+                           pg_database_size(current_database()) as size_bytes
+                """)
+                
+                # Replication lag (if applicable)
+                replication_lag = await conn.fetchrow("""
+                    SELECT EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())) as lag_seconds
+                """)
+                
+                metrics.update({
+                    'active_connections': conn_stats['active_connections'],
+                    'cache_hit_ratio': round(cache_hit_ratio, 2),
+                    'long_running_queries': len(long_queries),
+                    'waiting_locks': locks['waiting_locks'],
+                    'database_size_bytes': db_size['size_bytes'],
+                    'database_size_pretty': db_size['size'],
+                    'transactions_per_second': conn_stats['transactions_committed'],
+                    'replication_lag_seconds': replication_lag['lag_seconds'] if replication_lag['lag_seconds'] else 0
+                })
+                
+                # Determine health status
+                status = ServiceStatus.HEALTHY
+                issues = []
+                
+                if cache_hit_ratio < self.alert_thresholds['cache_hit_ratio']:
+                    status = ServiceStatus.DEGRADED
+                    issues.append(f"Low cache hit ratio: {cache_hit_ratio:.1f}%")
+                
+                if len(long_queries) > 5:
+                    status = ServiceStatus.DEGRADED
+                    issues.append(f"Too many long-running queries: {len(long_queries)}")
+                
+                if locks['waiting_locks'] > 10:
+                    status = ServiceStatus.DEGRADED
+                    issues.append(f"High lock contention: {locks['waiting_locks']} waiting locks")
+                
+                message = "PostgreSQL healthy" if not issues else "; ".join(issues)
+                
+        except Exception as e:
+            status = ServiceStatus.DOWN
+            message = f"PostgreSQL connection failed: {str(e)}"
+            logger.error(message)
+        
+        response_time = time.time() - start_time
+        
+        return HealthCheck(
+            service="postgresql",
+            status=status,
+            message=message,
+            timestamp=datetime.now(),
+            metrics=metrics,
+            response_time=response_time
+        )
+    
+    async def check_sqlite_health(self) -> HealthCheck:
+        """SQLite database health check"""
+        start_time = time.time()
+        metrics = {}
+        
+        try:
+            # Check file exists and is accessible
+            sqlite_file = Path(self.sqlite_path)
+            if not sqlite_file.exists():
+                raise FileNotFoundError(f"SQLite file not found: {self.sqlite_path}")
             
+            # Get file size
+            file_size = sqlite_file.stat().st_size
+            
+            # Connect and run diagnostics
+            conn = sqlite3.connect(self.sqlite_path)
+            cursor = conn.cursor()
+            
+            # Basic connectivity
+            cursor.execute("SELECT 1")
+            
+            # Get database info
+            cursor.execute("PRAGMA database_list")
+            db_info = cursor.fetchall()
+            
+            # Check integrity
+            cursor.execute("PRAGMA integrity_check")
+            integrity = cursor.fetchone()[0]
+            
+            # Get page count and size
+            cursor.execute("PRAGMA page_count")
+            page_count = cursor.fetchone()[0]
+            
+            cursor.execute("PRAGMA page_size")
+            page_size = cursor.fetchone()[0]
+            
+            # Get table statistics
+            cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            """)
+            tables = [row[0] for row in cursor.fetchall()]
+            
+            table_stats = {}
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                count = cursor.fetchone()[0]
+                table_stats[table] = count
+            
+            conn.close()
+            
+            metrics.update({
+                'file_size_bytes': file_size,
+                'file_size_mb': round(file_size / (1024 * 1024), 2),
+                'page_count': page_count,
+                'page_size': page_size,
+                'total_pages_size': page_count * page_size,
+                'table_counts': table_stats,
+                'integrity_check': integrity
+            })
+            
+            # Determine status
+            status = ServiceStatus.HEALTHY
+            message = "SQLite healthy"
+            
+            if integrity != "ok":
+                status = ServiceStatus.UNHEALTHY
+                message = f"SQLite integrity check failed: {integrity}"
+            
+        except Exception as e:
+            status = ServiceStatus.DOWN
+            message = f"SQLite check failed: {str(e)}"
+            logger.error(message)
+        
+        response_time = time.time() - start_time
+        
+        return HealthCheck(
+            service="sqlite",
+            status=status,
+            message=message,
+            timestamp=datetime.now(),
+            metrics=metrics,
+            response_time=response_time
+        )
+
+class SystemMonitor:
+    """System resource monitoring"""
+    
+    def __init__(self):
+        self.alert_thresholds = {
+            'cpu_usage': 80.0,      # %
+            'memory_usage': 85.0,   # %
+            'disk_usage': 90.0,     # %
+            'network_errors': 100,  # per minute
+            'load_average': 4.0     # 1-minute load average
+        }
+    
+    def check_system_health(self) -> HealthCheck:
+        """Comprehensive system health check"""
+        start_time = time.time()
+        metrics = {}
+        
+        try:
             # CPU usage
-            cpu_usage = psutil.cpu_percent(interval=1)
+            cpu_percent = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            load_avg = psutil.getloadavg()[0]  # 1-minute load average
             
             # Memory usage
             memory = psutil.virtual_memory()
-            memory_usage = memory.percent
+            swap = psutil.swap_memory()
             
             # Disk usage
             disk = psutil.disk_usage('/')
-            disk_usage = (disk.used / disk.total) * 100
+            disk_io = psutil.disk_io_counters()
             
-            # Network I/O
+            # Network statistics
             network = psutil.net_io_counters()
             
-            # Process count
+            # Process information
             process_count = len(psutil.pids())
             
-            # System load
-            load_avg = os.getloadavg()[0] if hasattr(os, 'getloadavg') else 0.0
+            metrics.update({
+                'cpu_percent': cpu_percent,
+                'cpu_count': cpu_count,
+                'load_average_1min': load_avg,
+                'memory_total_gb': round(memory.total / (1024**3), 2),
+                'memory_used_gb': round(memory.used / (1024**3), 2),
+                'memory_percent': memory.percent,
+                'swap_percent': swap.percent,
+                'disk_total_gb': round(disk.total / (1024**3), 2),
+                'disk_used_gb': round(disk.used / (1024**3), 2),
+                'disk_percent': (disk.used / disk.total) * 100,
+                'disk_read_mb': round(disk_io.read_bytes / (1024**2), 2),
+                'disk_write_mb': round(disk_io.write_bytes / (1024**2), 2),
+                'network_sent_mb': round(network.bytes_sent / (1024**2), 2),
+                'network_recv_mb': round(network.bytes_recv / (1024**2), 2),
+                'network_errors': network.errin + network.errout,
+                'process_count': process_count
+            })
             
-            system_metrics = {
-                'timestamp': timestamp.isoformat(),
-                'cpu_usage': round(cpu_usage, 2),
-                'memory_usage': round(memory_usage, 2),
-                'memory_available_gb': round(memory.available / (1024**3), 2),
-                'disk_usage': round(disk_usage, 2),
-                'disk_free_gb': round(disk.free / (1024**3), 2),
-                'network_bytes_sent': network.bytes_sent,
-                'network_bytes_recv': network.bytes_recv,
-                'process_count': process_count,
-                'load_average': round(load_avg, 2)
-            }
+            # Determine health status
+            status = ServiceStatus.HEALTHY
+            issues = []
             
-            # Add to metrics history
-            self.metrics['system'].append(system_metrics)
+            if cpu_percent > self.alert_thresholds['cpu_usage']:
+                status = ServiceStatus.DEGRADED
+                issues.append(f"High CPU usage: {cpu_percent:.1f}%")
             
-            # Update health status
-            self.health_status['system'] = system_metrics
+            if memory.percent > self.alert_thresholds['memory_usage']:
+                status = ServiceStatus.DEGRADED
+                issues.append(f"High memory usage: {memory.percent:.1f}%")
             
-            # Check thresholds and create alerts
-            self._check_system_thresholds(system_metrics)
+            if (disk.used / disk.total) * 100 > self.alert_thresholds['disk_usage']:
+                status = ServiceStatus.CRITICAL
+                issues.append(f"High disk usage: {(disk.used / disk.total) * 100:.1f}%")
             
-        except Exception as e:
-            logger.error(f"❌ System health check error: {e}")
-    
-    def _check_service_health(self):
-        """Check health of all services"""
-        try:
-            timestamp = datetime.now()
-            service_status = {}
+            if load_avg > self.alert_thresholds['load_average']:
+                status = ServiceStatus.DEGRADED
+                issues.append(f"High load average: {load_avg:.2f}")
             
-            for service_name, service_data in self.services.items():
-                try:
-                    status = self._check_individual_service(service_name, service_data)
-                    service_status[service_name] = status
-                    
-                except Exception as e:
-                    logger.error(f"❌ Service check error for {service_name}: {e}")
-                    service_status[service_name] = {
-                        'status': 'error',
-                        'error': str(e),
-                        'last_check': timestamp.isoformat()
-                    }
-            
-            # Update health status
-            self.health_status['services'] = service_status
-            
-            # Add to metrics history
-            service_metrics = {
-                'timestamp': timestamp.isoformat(),
-                'services': service_status
-            }
-            self.metrics['services'].append(service_metrics)
+            message = "System healthy" if not issues else "; ".join(issues)
             
         except Exception as e:
-            logger.error(f"❌ Service health check error: {e}")
+            status = ServiceStatus.DOWN
+            message = f"System check failed: {str(e)}"
+            logger.error(message)
+        
+        response_time = time.time() - start_time
+        
+        return HealthCheck(
+            service="system",
+            status=status,
+            message=message,
+            timestamp=datetime.now(),
+            metrics=metrics,
+            response_time=response_time
+        )
+
+class AlertManager:
+    """Alert management and notification system"""
     
-    def _check_individual_service(self, service_name: str, service_data: Dict) -> Dict:
-        """Check health of individual service"""
-        try:
-            status = {
-                'status': 'unknown',
-                'last_check': datetime.now().isoformat(),
-                'details': {}
-            }
-            
-            if service_name == 'bot':
-                # Check trading bot
-                if 'core' in service_data:
-                    bot_core = service_data['core']
-                    if hasattr(bot_core, 'running') and bot_core.running:
-                        status['status'] = 'healthy'
-                        status['details'] = {
-                            'running': True,
-                            'paper_mode': getattr(bot_core, 'paper_mode', True)
-                        }
-                    else:
-                        status['status'] = 'stopped'
-                        
-            elif service_name == 'webapp':
-                # Check Flask webapp
-                if 'thread' in service_data:
-                    thread = service_data['thread']
-                    if thread.is_alive():
-                        status['status'] = 'healthy'
-                        status['details'] = {'thread_alive': True}
-                    else:
-                        status['status'] = 'stopped'
-                        
-            elif service_name == 'websocket':
-                # Check WebSocket server
-                if 'manager' in service_data:
-                    ws_manager = service_data['manager']
-                    if hasattr(ws_manager, 'running') and ws_manager.running:
-                        status['status'] = 'healthy'
-                        status['details'] = {
-                            'running': True,
-                            'connected_clients': len(getattr(ws_manager, 'clients', set()))
-                        }
-                    else:
-                        status['status'] = 'stopped'
-                        
-            elif service_name == 'scanner':
-                # Check dynamic scanner
-                if 'scanner' in service_data:
-                    scanner = service_data['scanner']
-                    if hasattr(scanner, 'running') and scanner.running:
-                        status['status'] = 'healthy'
-                        status['details'] = {
-                            'running': True,
-                            'scanned_stocks': len(getattr(scanner, 'scanned_stocks', {}))
-                        }
-                    else:
-                        status['status'] = 'stopped'
-                        
-            elif service_name == 'execution':
-                # Check execution manager
-                if 'manager' in service_data:
-                    exec_manager = service_data['manager']
-                    if hasattr(exec_manager, 'running') and exec_manager.running:
-                        status['status'] = 'healthy'
-                        status['details'] = {
-                            'running': True,
-                            'active_stocks': len(getattr(exec_manager, 'active_stocks', {}))
-                        }
-                    else:
-                        status['status'] = 'stopped'
-                        
-            else:
-                # Generic service check
-                if service_data.get('status') == 'running':
-                    status['status'] = 'healthy'
-                else:
-                    status['status'] = 'stopped'
-            
-            return status
-            
-        except Exception as e:
-            return {
-                'status': 'error',
-                'error': str(e),
-                'last_check': datetime.now().isoformat()
-            }
+    def __init__(self, config: Dict, notification_manager: NotificationManager):
+        self.config = config
+        self.notification_manager = notification_manager
+        self.alerts: List[Alert] = []
+        self.logger = Logger(__name__)
+        
+        # Setup notification channels
+        self.notification_channels = []
+        if config.get('email'):
+            self.notification_channels.append(self._send_email_alert)
+        if config.get('webhook'):
+            self.notification_channels.append(self._send_webhook_alert)
     
-    def _check_system_thresholds(self, metrics: Dict):
-        """Check system metrics against thresholds"""
-        try:
-            timestamp = datetime.now()
+    async def process_health_check(self, health_check: HealthCheck):
+        """Process health check and generate alerts if needed"""
+        alert_level = self._determine_alert_level(health_check.status)
+        
+        if alert_level:
+            alert = Alert(
+                level=alert_level,
+                service=health_check.service,
+                message=f"{health_check.service}: {health_check.message}",
+                timestamp=health_check.timestamp
+            )
             
-            # CPU threshold
-            if metrics['cpu_usage'] > self.thresholds['cpu_usage']:
-                self._create_alert(
-                    'HIGH_CPU_USAGE',
-                    f"CPU usage is {metrics['cpu_usage']}% (threshold: {self.thresholds['cpu_usage']}%)",
-                    'warning',
-                    {'cpu_usage': metrics['cpu_usage']}
-                )
+            await self._send_alert(alert)
+            self.alerts.append(alert)
             
-            # Memory threshold
-            if metrics['memory_usage'] > self.thresholds['memory_usage']:
-                self._create_alert(
-                    'HIGH_MEMORY_USAGE',
-                    f"Memory usage is {metrics['memory_usage']}% (threshold: {self.thresholds['memory_usage']}%)",
-                    'warning',
-                    {'memory_usage': metrics['memory_usage']}
-                )
-            
-            # Disk threshold
-            if metrics['disk_usage'] > self.thresholds['disk_usage']:
-                self._create_alert(
-                    'HIGH_DISK_USAGE',
-                    f"Disk usage is {metrics['disk_usage']}% (threshold: {self.thresholds['disk_usage']}%)",
-                    'critical',
-                    {'disk_usage': metrics['disk_usage']}
-                )
-            
-        except Exception as e:
-            logger.error(f"❌ Threshold check error: {e}")
+            # Also send through notification manager
+            await self.notification_manager.send_alert(
+                f"System Alert: {alert.service}",
+                alert.message,
+                alert.level.value
+            )
     
-    def _create_alert(self, alert_type: str, message: str, severity: str, data: Dict = None):
-        """Create system alert"""
-        try:
-            alert = {
-                'timestamp': datetime.now().isoformat(),
-                'type': alert_type,
-                'message': message,
-                'severity': severity,
-                'data': data or {},
-                'resolved': False
-            }
-            
-            # Add to alerts
-            self.health_status['alerts'].append(alert)
-            self.metrics['alerts'].append(alert)
-            
-            # Log alert
-            if severity == 'critical':
-                logger.critical(f"🚨 CRITICAL ALERT: {message}")
-            elif severity == 'warning':
-                logger.warning(f"⚠️ WARNING: {message}")
-            else:
-                logger.info(f"ℹ️ INFO: {message}")
+    def _determine_alert_level(self, status: ServiceStatus) -> Optional[AlertLevel]:
+        """Determine alert level based on service status"""
+        status_to_alert = {
+            ServiceStatus.HEALTHY: None,
+            ServiceStatus.DEGRADED: AlertLevel.WARNING,
+            ServiceStatus.UNHEALTHY: AlertLevel.CRITICAL,
+            ServiceStatus.DOWN: AlertLevel.EMERGENCY
+        }
+        return status_to_alert.get(status)
+    
+    async def _send_alert(self, alert: Alert):
+        """Send alert through all configured channels"""
+        for channel in self.notification_channels:
+            try:
+                await channel(alert)
+            except Exception as e:
+                self.logger.error(f"Failed to send alert via {channel.__name__}: {e}")
+    
+    async def _send_email_alert(self, alert: Alert):
+        """Send email alert"""
+        if not self.config.get('email'):
+            return
+        
+        email_config = self.config['email']
+        
+        msg = MIMEMultipart()
+        msg['From'] = email_config['from']
+        msg['To'] = ', '.join(email_config['to'])
+        msg['Subject'] = f"[{alert.level.value}] Trading System Alert - {alert.service}"
+        
+        body = f"""
+        Alert Level: {alert.level.value}
+        Service: {alert.service}
+        Message: {alert.message}
+        Timestamp: {alert.timestamp}
+        
+        Please investigate immediately.
+        """
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # Send email
+        with smtplib.SMTP(email_config['smtp_server'], email_config['smtp_port']) as server:
+            if email_config.get('use_tls'):
+                server.starttls()
+            if email_config.get('username'):
+                server.login(email_config['username'], email_config['password'])
+            server.send_message(msg)
+    
+    async def _send_webhook_alert(self, alert: Alert):
+        """Send webhook alert"""
+        if not self.config.get('webhook'):
+            return
+        
+        webhook_config = self.config['webhook']
+        
+        payload = {
+            'level': alert.level.value,
+            'service': alert.service,
+            'message': alert.message,
+            'timestamp': alert.timestamp.isoformat(),
+            'resolved': alert.resolved
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                webhook_config['url'],
+                json=payload,
+                headers=webhook_config.get('headers', {}),
+                timeout=10
+            ) as response:
+                if response.status >= 300:
+                    logger.error(f"Webhook alert failed: {response.status}")
+
+class TradingSystemMonitor:
+    """Main trading system monitoring orchestrator"""
+    
+    def __init__(self, trading_db: TradingDatabase, config_manager: ConfigManager, notification_manager: NotificationManager):
+        self.trading_db = trading_db
+        self.config_manager = config_manager
+        self.config = config_manager.get_config()['monitoring']
+        self.notification_manager = notification_manager
+        
+        self.db_monitor = DatabaseMonitor(trading_db, config_manager)
+        self.system_monitor = SystemMonitor()
+        self.alert_manager = AlertManager(self.config.get('alerts', {}), notification_manager)
+        self.monitoring_active = False
+        
+        # Initialize logger and error handler
+        self.logger = Logger(__name__)
+        self.error_handler = ErrorHandler()
+        
+        # Health check results storage
+        self.health_history: List[HealthCheck] = []
+        self.max_history = 1000  # Keep last 1000 health checks
+    
+    async def initialize(self):
+        """Initialize monitoring system"""
+        await self.db_monitor.initialize()
+        self.logger.info("Trading system monitor initialized")
+        
+        # Register with the main trading bot for health callbacks
+        if hasattr(self.trading_db, 'register_monitor'):
+            self.trading_db.register_monitor(self)
+    
+    async def run_health_checks(self) -> Dict[str, HealthCheck]:
+        """Run all health checks"""
+        results = {}
+        
+        # Database health checks
+        pg_health = await self.db_monitor.check_postgresql_health()
+        sqlite_health = await self.db_monitor.check_sqlite_health()
+        
+        # System health check
+        system_health = self.system_monitor.check_system_health()
+        
+        results = {
+            'postgresql': pg_health,
+            'sqlite': sqlite_health,
+            'system': system_health
+        }
+        
+        # Process alerts
+        for health_check in results.values():
+            await self.alert_manager.process_health_check(health_check)
+        
+        # Store in history
+        for health_check in results.values():
+            self.health_history.append(health_check)
+        
+        # Trim history
+        if len(self.health_history) > self.max_history:
+            self.health_history = self.health_history[-self.max_history:]
+        
+        return results
+    
+    async def start_monitoring(self, interval: int = 60):
+        """Start continuous monitoring"""
+        self.monitoring_active = True
+        logger.info(f"Starting continuous monitoring (interval: {interval}s)")
+        
+        while self.monitoring_active:
+            try:
+                results = await self.run_health_checks()
                 
-        except Exception as e:
-            logger.error(f"❌ Create alert error: {e}")
-    
-    def _update_overall_status(self):
-        """Update overall system status"""
-        try:
-            # Check if any critical alerts exist
-            critical_alerts = [a for a in self.health_status['alerts'] 
-                             if a['severity'] == 'critical' and not a['resolved']]
-            
-            # Check service statuses
-            service_issues = []
-            for service_name, service_status in self.health_status['services'].items():
-                if service_status['status'] in ['error', 'stopped']:
-                    service_issues.append(service_name)
-            
-            # Determine overall status
-            if critical_alerts:
-                self.health_status['overall'] = 'critical'
-            elif service_issues:
-                self.health_status['overall'] = 'warning'
-            elif self.health_status['system'].get('cpu_usage', 0) > 90:
-                self.health_status['overall'] = 'warning'
-            else:
-                self.health_status['overall'] = 'healthy'
+                # Log summary
+                healthy_services = sum(1 for r in results.values() if r.status == ServiceStatus.HEALTHY)
+                total_services = len(results)
                 
-        except Exception as e:
-            logger.error(f"❌ Update overall status error: {e}")
-            self.health_status['overall'] = 'error'
+                logger.info(f"Health check completed: {healthy_services}/{total_services} services healthy")
+                
+                # Wait for next interval
+                await asyncio.sleep(interval)
+                
+            except Exception as e:
+                logger.error(f"Error during monitoring cycle: {e}")
+                await asyncio.sleep(10)  # Short sleep before retry
     
-    def _cleanup_old_metrics(self):
-        """Clean up old metrics to prevent memory issues"""
-        try:
-            cutoff_time = datetime.now() - timedelta(hours=24)  # Keep 24 hours
-            
-            # Clean system metrics
-            self.metrics['system'] = [
-                m for m in self.metrics['system'] 
-                if datetime.fromisoformat(m['timestamp']) > cutoff_time
-            ]
-            
-            # Clean service metrics
-            self.metrics['services'] = [
-                m for m in self.metrics['services']
-                if datetime.fromisoformat(m['timestamp']) > cutoff_time
-            ]
-            
-            # Clean old alerts (keep for 7 days)
-            alert_cutoff = datetime.now() - timedelta(days=7)
-            self.metrics['alerts'] = [
-                a for a in self.metrics['alerts']
-                if datetime.fromisoformat(a['timestamp']) > alert_cutoff
-            ]
-            
-            # Clean resolved alerts from health status (keep only last 10)
-            resolved_alerts = [a for a in self.health_status['alerts'] if a['resolved']]
-            unresolved_alerts = [a for a in self.health_status['alerts'] if not a['resolved']]
-            
-            self.health_status['alerts'] = unresolved_alerts + resolved_alerts[-10:]
-            
-        except Exception as e:
-            logger.error(f"❌ Cleanup metrics error: {e}")
+    def stop_monitoring(self):
+        """Stop monitoring"""
+        self.monitoring_active = False
+        logger.info("Monitoring stopped")
     
-    def get_health_status(self) -> Dict:
-        """Get current health status"""
-        return self.health_status.copy()
-    
-    def get_system_metrics(self, hours: int = 1) -> List[Dict]:
-        """Get system metrics for specified hours"""
-        try:
-            cutoff_time = datetime.now() - timedelta(hours=hours)
-            
-            return [
-                m for m in self.metrics['system']
-                if datetime.fromisoformat(m['timestamp']) > cutoff_time
-            ]
-            
-        except Exception as e:
-            logger.error(f"❌ Get system metrics error: {e}")
-            return []
-    
-    def get_service_metrics(self, hours: int = 1) -> List[Dict]:
-        """Get service metrics for specified hours"""
-        try:
-            cutoff_time = datetime.now() - timedelta(hours=hours)
-            
-            return [
-                m for m in self.metrics['services']
-                if datetime.fromisoformat(m['timestamp']) > cutoff_time
-            ]
-            
-        except Exception as e:
-            logger.error(f"❌ Get service metrics error: {e}")
-            return []
-    
-    def get_alerts(self, resolved: bool = None, hours: int = 24) -> List[Dict]:
-        """Get alerts with optional filtering"""
-        try:
-            cutoff_time = datetime.now() - timedelta(hours=hours)
-            
-            alerts = [
-                a for a in self.metrics['alerts']
-                if datetime.fromisoformat(a['timestamp']) > cutoff_time
-            ]
-            
-            if resolved is not None:
-                alerts = [a for a in alerts if a['resolved'] == resolved]
-            
-            # Sort by timestamp (newest first)
-            alerts.sort(key=lambda x: x['timestamp'], reverse=True)
-            
-            return alerts
-            
-        except Exception as e:
-            logger.error(f"❌ Get alerts error: {e}")
-            return []
-    
-    def resolve_alert(self, alert_timestamp: str) -> bool:
-        """Mark alert as resolved"""
-        try:
-            # Find and resolve alert in health status
-            for alert in self.health_status['alerts']:
-                if alert['timestamp'] == alert_timestamp:
-                    alert['resolved'] = True
-                    alert['resolved_at'] = datetime.now().isoformat()
-                    break
-            
-            # Find and resolve alert in metrics
-            for alert in self.metrics['alerts']:
-                if alert['timestamp'] == alert_timestamp:
-                    alert['resolved'] = True
-                    alert['resolved_at'] = datetime.now().isoformat()
-                    break
-            
-            logger.info(f"✅ Alert resolved: {alert_timestamp}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Resolve alert error: {e}")
-            return False
-    
-    def get_performance_summary(self) -> Dict:
-        """Get performance summary"""
-        try:
-            # Get recent metrics
-            recent_system = self.get_system_metrics(1)  # Last hour
-            recent_services = self.get_service_metrics(1)
-            recent_alerts = self.get_alerts(resolved=False, hours=24)
-            
-            summary = {
-                'timestamp': datetime.now().isoformat(),
-                'overall_status': self.health_status['overall'],
-                'uptime_hours': self._calculate_uptime(),
-                'system_performance': self._calculate_system_performance(recent_system),
-                'service_performance': self._calculate_service_performance(recent_services),
-                'alert_summary': {
-                    'critical_count': len([a for a in recent_alerts if a['severity'] == 'critical']),
-                    'warning_count': len([a for a in recent_alerts if a['severity'] == 'warning']),
-                    'total_unresolved': len(recent_alerts)
+    def get_system_status(self) -> Dict:
+        """Get current system status summary"""
+        if not self.health_history:
+            return {"status": "No data", "services": {}}
+        
+        # Get latest health checks
+        latest_checks = {}
+        for check in reversed(self.health_history):
+            if check.service not in latest_checks:
+                latest_checks[check.service] = check
+        
+        # Calculate overall status
+        statuses = [check.status for check in latest_checks.values()]
+        if ServiceStatus.DOWN in statuses:
+            overall_status = "DOWN"
+        elif ServiceStatus.UNHEALTHY in statuses:
+            overall_status = "UNHEALTHY"
+        elif ServiceStatus.DEGRADED in statuses:
+            overall_status = "DEGRADED"
+        else:
+            overall_status = "HEALTHY"
+        
+        return {
+            "status": overall_status,
+            "timestamp": datetime.now().isoformat(),
+            "services": {
+                service: {
+                    "status": check.status.value,
+                    "message": check.message,
+                    "response_time": check.response_time,
+                    "timestamp": check.timestamp.isoformat(),
+                    "metrics": check.metrics
                 }
-            }
-            
-            return summary
-            
-        except Exception as e:
-            logger.error(f"❌ Performance summary error: {e}")
-            return {'error': str(e)}
-    
-    def _calculate_uptime(self) -> float:
-        """Calculate system uptime in hours"""
-        try:
-            # Get system boot time
-            boot_time = datetime.fromtimestamp(psutil.boot_time())
-            uptime = datetime.now() - boot_time
-            return round(uptime.total_seconds() / 3600, 2)
-            
-        except Exception:
-            return 0.0
-    
-    def _calculate_system_performance(self, metrics: List[Dict]) -> Dict:
-        """Calculate system performance statistics"""
-        try:
-            if not metrics:
-                return {}
-            
-            cpu_values = [m['cpu_usage'] for m in metrics]
-            memory_values = [m['memory_usage'] for m in metrics]
-            disk_values = [m['disk_usage'] for m in metrics]
-            
-            return {
-                'cpu': {
-                    'current': cpu_values[-1] if cpu_values else 0,
-                    'average': round(sum(cpu_values) / len(cpu_values), 2),
-                    'max': max(cpu_values),
-                    'min': min(cpu_values)
-                },
-                'memory': {
-                    'current': memory_values[-1] if memory_values else 0,
-                    'average': round(sum(memory_values) / len(memory_values), 2),
-                    'max': max(memory_values),
-                    'min': min(memory_values)
-                },
-                'disk': {
-                    'current': disk_values[-1] if disk_values else 0,
-                    'average': round(sum(disk_values) / len(disk_values), 2),
-                    'max': max(disk_values),
-                    'min': min(disk_values)
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ System performance calculation error: {e}")
-            return {}
-    
-    def _calculate_service_performance(self, metrics: List[Dict]) -> Dict:
-        """Calculate service performance statistics"""
-        try:
-            if not metrics:
-                return {}
-            
-            performance = {}
-            
-            # Analyze each service
-            for service_name in self.services.keys():
-                service_statuses = []
-                
-                for metric in metrics:
-                    service_data = metric.get('services', {}).get(service_name, {})
-                    if service_data:
-                        service_statuses.append(service_data['status'])
-                
-                if service_statuses:
-                    healthy_count = service_statuses.count('healthy')
-                    total_count = len(service_statuses)
-                    
-                    performance[service_name] = {
-                        'availability_percent': round((healthy_count / total_count) * 100, 2),
-                        'current_status': service_statuses[-1],
-                        'total_checks': total_count,
-                        'healthy_checks': healthy_count
-                    }
-            
-            return performance
-            
-        except Exception as e:
-            logger.error(f"❌ Service performance calculation error: {e}")
-            return {}
-    
-    def export_metrics(self, hours: int = 24) -> Dict:
-        """Export metrics for analysis"""
-        try:
-            cutoff_time = datetime.now() - timedelta(hours=hours)
-            
-            export_data = {
-                'export_timestamp': datetime.now().isoformat(),
-                'period_hours': hours,
-                'system_metrics': [
-                    m for m in self.metrics['system']
-                    if datetime.fromisoformat(m['timestamp']) > cutoff_time
-                ],
-                'service_metrics': [
-                    m for m in self.metrics['services']
-                    if datetime.fromisoformat(m['timestamp']) > cutoff_time
-                ],
-                'alerts': [
-                    a for a in self.metrics['alerts']
-                    if datetime.fromisoformat(a['timestamp']) > cutoff_time
-                ],
-                'health_status': self.health_status,
-                'performance_summary': self.get_performance_summary()
-            }
-            
-            return export_data
-            
-        except Exception as e:
-            logger.error(f"❌ Export metrics error: {e}")
-            return {'error': str(e)}
-    
-    def update_thresholds(self, new_thresholds: Dict) -> bool:
-        """Update monitoring thresholds"""
-        try:
-            for key, value in new_thresholds.items():
-                if key in self.thresholds:
-                    self.thresholds[key] = value
-                    logger.info(f"✅ Updated threshold {key}: {value}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Update thresholds error: {e}")
-            return False
-    
-    def get_thresholds(self) -> Dict:
-        """Get current monitoring thresholds"""
-        return self.thresholds.copy()
-    
-    def force_health_check(self) -> Dict:
-        """Force immediate health check"""
-        try:
-            logger.info("🔍 Force health check initiated")
-            
-            self._check_system_health()
-            self._check_service_health()
-            self._update_overall_status()
-            
-            return {
-                'success': True,
-                'timestamp': datetime.now().isoformat(),
-                'health_status': self.get_health_status()
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Force health check error: {e}")
-            return {
-                'success': False,
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
+                for service, check in latest_checks.items()
+            },
+            "active_alerts": len([a for a in self.alert_manager.alerts if not a.resolved]),
+            "total_health_checks": len(self.health_history)
+        }
 
-
-# Health check utilities
-class HealthChecker:
-    """Utility class for health checks"""
-    
-    @staticmethod
-    def check_database_connection(db_path: str) -> bool:
-        """Check database connection"""
-        try:
-            import sqlite3
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            conn.close()
-            return True
-        except Exception:
-            return False
-    
-    @staticmethod
-    def check_network_connectivity(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> bool:
-        """Check network connectivity"""
-        try:
-            import socket
-            socket.setdefaulttimeout(timeout)
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
-            return True
-        except Exception:
-            return False
-    
-    @staticmethod
-    def check_file_permissions(file_path: str) -> Dict:
-        """Check file permissions"""
-        try:
-            path = Path(file_path)
-            return {
-                'exists': path.exists(),
-                'readable': os.access(path, os.R_OK) if path.exists() else False,
-                'writable': os.access(path, os.W_OK) if path.exists() else False,
-                'executable': os.access(path, os.X_OK) if path.exists() else False
-            }
-        except Exception as e:
-            return {'error': str(e)}
-    
-    @staticmethod
-    def check_disk_space(path: str = "/", min_free_gb: float = 1.0) -> Dict:
-        """Check available disk space"""
-        try:
-            disk_usage = psutil.disk_usage(path)
-            free_gb = disk_usage.free / (1024**3)
-            
-            return {
-                'free_gb': round(free_gb, 2),
-                'total_gb': round(disk_usage.total / (1024**3), 2),
-                'used_percent': round((disk_usage.used / disk_usage.total) * 100, 2),
-                'sufficient_space': free_gb >= min_free_gb
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-
-# Usage example and testing
-if __name__ == "__main__":
-    import time
-    
-    # Test system monitor
-    print("📊 Testing System Monitor...")
-    
-    # Mock services for testing
-    mock_services = {
-        'bot': {
-            'core': type('MockBot', (), {'running': True, 'paper_mode': True})(),
-            'status': 'running'
+# Example configuration
+EXAMPLE_CONFIG = {
+    "postgresql": {
+        "host": "localhost",
+        "port": 5432,
+        "database": "trading_db",
+        "user": "trading_user",
+        "password": "secure_password"
+    },
+    "sqlite_path": "data/realtime_cache.db",
+    "alerts": {
+        "email": {
+            "smtp_server": "smtp.gmail.com",
+            "smtp_port": 587,
+            "use_tls": True,
+            "from": "alerts@trading-system.com",
+            "to": ["admin@trading-system.com"],
+            "username": "alerts@trading-system.com",
+            "password": "app_password"
         },
-        'webapp': {
-            'thread': threading.current_thread(),
-            'status': 'running'
+        "webhook": {
+            "url": "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK",
+            "headers": {
+                "Content-Type": "application/json"
+            }
         }
     }
+}
+
+async def main():
+    """Example usage with integrated components"""
+    # Initialize system components
+    config_manager = ConfigManager("config/config.yaml")
+    trading_db = TradingDatabase(config_manager)
+    await trading_db.initialize()
     
-    monitor = SystemMonitor(mock_services)
+    # Initialize notification system (placeholder - will be implemented)
+    notification_manager = NotificationManager(config_manager)
     
-    # Test health checks
-    print("🔍 Running health checks...")
+    # Initialize monitoring system
+    monitor = TradingSystemMonitor(trading_db, config_manager, notification_manager)
+    await monitor.initialize()
     
-    # Force health check
-    result = monitor.force_health_check()
-    print(f"Health check result: {result['success']}")
+    # Run single health check
+    results = await monitor.run_health_checks()
     
-    # Get health status
-    health = monitor.get_health_status()
-    print(f"Overall status: {health['overall']}")
-    print(f"System CPU: {health['system'].get('cpu_usage', 0)}%")
+    print("Health Check Results:")
+    print("=" * 50)
+    for service, result in results.items():
+        print(f"{service.upper()}: {result.status.value}")
+        print(f"  Message: {result.message}")
+        print(f"  Response Time: {result.response_time:.3f}s")
+        print(f"  Key Metrics: {json.dumps(result.metrics, indent=2)}")
+        print()
     
-    # Test performance summary
-    summary = monitor.get_performance_summary()
-    print(f"Uptime: {summary.get('uptime_hours', 0)} hours")
+    # Print system status
+    status = monitor.get_system_status()
+    print(f"Overall System Status: {status['status']}")
     
-    # Test thresholds
-    monitor.update_thresholds({'cpu_usage': 75.0})
-    thresholds = monitor.get_thresholds()
-    print(f"CPU threshold: {thresholds['cpu_usage']}%")
-    
-    # Test export
-    export_data = monitor.export_metrics(1)
-    print(f"Exported metrics for 1 hour: {len(export_data.get('system_metrics', []))} data points")
-    
-    print("✅ System monitor test completed")
+    # Start continuous monitoring (uncomment to run)
+    # await monitor.start_monitoring(interval=30)
+
+if __name__ == "__main__":
+    asyncio.run(main())
