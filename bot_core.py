@@ -1,1478 +1,1204 @@
 #!/usr/bin/env python3
 """
-Enhanced Bot Core with Integrated Scheduling
-Complete trading bot with market hours scheduling, paper trading, and production features
+Advanced Multi-Strategy Trading Bot Core
+Market-ready for live trading with Goodwill API integration
+Includes automatic scheduling: starts 1 hour before market, stops 1 hour after
 """
 
-import os
-import sys
-import json
-import time
+import asyncio
 import logging
+import time
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import threading
-import signal
-import atexit
-from datetime import datetime, timedelta, time as dt_time
-from typing import Dict, Optional, List, Any, Union
-from dataclasses import dataclass, asdict
-import pytz
-import requests
-import traceback
+import queue
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('trading_bot.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+from config_manager import ConfigManager
+from strategy_manager import StrategyManager
+from data_manager import DataManager
+from execution_manager import ExecutionManager
+from paper_trading_engine import PaperTradingEngine
+from goodwill_api_handler import GoodwillAPIHandler
+from volatility_analyzer import VolatilityAnalyzer
+from dynamic_scanner import DynamicScanner
+from database_setup import DatabaseManager
+from monitoring import SystemMonitor
+from websocket_manager import WebSocketManager
 
 @dataclass
-class TradingSession:
-    """Trading session information"""
-    session_id: str
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    total_trades: int = 0
-    total_pnl: float = 0.0
-    strategies_used: List[str] = None
-    market_conditions: str = "NORMAL"
-    session_status: str = "ACTIVE"  # ACTIVE, COMPLETED, INTERRUPTED
-
+class TradingSignal:
+    symbol: str
+    action: str  # BUY, SELL, HOLD
+    strategy: str
+    confidence: float
+    price: float
+    quantity: int
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    timestamp: datetime = None
+    
     def __post_init__(self):
-        if self.strategies_used is None:
-            self.strategies_used = []
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
 
-class MarketScheduler:
-    """Market Hours Scheduler for automated operations"""
-    
-    def __init__(self):
-        """Initialize market scheduler"""
-        self.ist_timezone = pytz.timezone('Asia/Kolkata')
+class TradingBotCore:
+    def __init__(self, config_path: str = "config.json"):
+        """Initialize the trading bot core system with auto-scheduling"""
+        # Core components
+        self.config = ConfigManager(config_path)
+        self.logger = self._setup_logging()
         
-        # NSE Market Hours (IST)
-        self.market_open = dt_time(9, 15)    # 9:15 AM
-        self.market_close = dt_time(15, 30)  # 3:30 PM
-        
-        # VM Operation Hours (1 hour buffer)
-        self.vm_start_time = dt_time(8, 15)   # 8:15 AM
-        self.vm_stop_time = dt_time(16, 30)   # 4:30 PM
-        
-        # Market Days (Monday=0, Sunday=6)
-        self.market_days = [0, 1, 2, 3, 4]  # Monday to Friday
-        
-        # Market Holidays (YYYY-MM-DD format)
-        self.market_holidays = [
-            "2025-01-26", "2025-03-14", "2025-03-31", "2025-04-14", 
-            "2025-04-18", "2025-05-01", "2025-08-15", "2025-08-16",
-            "2025-10-02", "2025-10-20", "2025-11-05", "2025-12-25"
-        ]
-    
-    def get_current_ist_time(self) -> datetime:
-        """Get current time in IST"""
-        return datetime.now(self.ist_timezone)
-    
-    def is_market_day(self, date_obj: datetime = None) -> bool:
-        """Check if given date is a market day"""
-        if date_obj is None:
-            date_obj = self.get_current_ist_time()
-        
-        if date_obj.weekday() not in self.market_days:
-            return False
-        
-        date_str = date_obj.strftime('%Y-%m-%d')
-        return date_str not in self.market_holidays
-    
-    def is_market_hours(self, check_time: datetime = None) -> bool:
-        """Check if current time is within market hours"""
-        if check_time is None:
-            check_time = self.get_current_ist_time()
-        
-        if not self.is_market_day(check_time):
-            return False
-        
-        current_time = check_time.time()
-        return self.market_open <= current_time <= self.market_close
-    
-    def is_vm_operation_hours(self, check_time: datetime = None) -> bool:
-        """Check if VM should be running (market hours + buffer)"""
-        if check_time is None:
-            check_time = self.get_current_ist_time()
-        
-        if not self.is_market_day(check_time):
-            return False
-        
-        current_time = check_time.time()
-        return self.vm_start_time <= current_time <= self.vm_stop_time
-    
-    def time_until_next_vm_start(self) -> Optional[timedelta]:
-        """Calculate time until next VM start"""
-        now = self.get_current_ist_time()
-        
-        # Check today first
-        today_start = now.replace(hour=8, minute=15, second=0, microsecond=0)
-        if now < today_start and self.is_market_day(now):
-            return today_start - now
-        
-        # Check next 7 days
-        for days_ahead in range(1, 8):
-            next_date = now + timedelta(days=days_ahead)
-            if self.is_market_day(next_date):
-                next_start = next_date.replace(hour=8, minute=15, second=0, microsecond=0)
-                return next_start - now
-        
-        return None
-
-class APIConnector:
-    """API connector for broker integration"""
-    
-    def __init__(self, config: Dict):
-        """Initialize API connector"""
-        self.config = config
-        self.session = requests.Session()
-        self.is_connected = False
-        self.last_heartbeat = 0
-        
-        # Session management
-        self.session_token = None
-        self.session_expiry = None
-        
-        logger.info("🔌 API Connector initialized")
-    
-    def authenticate(self, credentials: Dict) -> bool:
-        """Authenticate with broker API"""
-        try:
-            # Mock authentication - replace with actual broker API
-            self.session_token = "mock_token_12345"
-            self.session_expiry = datetime.now() + timedelta(hours=8)
-            self.is_connected = True
-            
-            logger.info("✅ API authentication successful")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ API authentication failed: {e}")
-            return False
-    
-    def is_authenticated(self) -> bool:
-        """Check if API session is valid"""
-        if not self.session_token:
-            return False
-        
-        if self.session_expiry and datetime.now() > self.session_expiry:
-            return False
-        
-        return self.is_connected
-    
-    def get_quote(self, symbol: str) -> Optional[Dict]:
-        """Get market quote for symbol"""
-        try:
-            if not self.is_authenticated():
-                return None
-            
-            # Mock market data - replace with actual broker API
-            import random
-            base_prices = {
-                'RELIANCE': 2500, 'TCS': 3500, 'INFY': 1500,
-                'NIFTY': 19500, 'BANKNIFTY': 45000
-            }
-            
-            base_price = base_prices.get(symbol, 1000)
-            current_price = base_price + random.uniform(-50, 50)
-            
-            return {
-                'symbol': symbol,
-                'ltp': round(current_price, 2),
-                'high': round(current_price * 1.02, 2),
-                'low': round(current_price * 0.98, 2),
-                'volume': random.randint(100000, 1000000),
-                'prev_close': base_price,
-                'timestamp': time.time()
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Quote fetch error for {symbol}: {e}")
-            return None
-    
-    def place_order(self, order_params: Dict) -> Optional[Dict]:
-        """Place order via API"""
-        try:
-            if not self.is_authenticated():
-                logger.error("❌ Cannot place order - not authenticated")
-                return None
-            
-            # Mock order placement - replace with actual broker API
-            order_id = f"ORD_{int(time.time())}_{random.randint(1000, 9999)}"
-            
-            return {
-                'order_id': order_id,
-                'status': 'PLACED',
-                'symbol': order_params.get('symbol'),
-                'side': order_params.get('side'),
-                'quantity': order_params.get('quantity'),
-                'price': order_params.get('price'),
-                'timestamp': datetime.now().isoformat()
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Order placement error: {e}")
-            return None
-    
-    def get_positions(self) -> List[Dict]:
-        """Get current positions"""
-        try:
-            if not self.is_authenticated():
-                return []
-            
-            # Mock positions - replace with actual broker API
-            return []
-            
-        except Exception as e:
-            logger.error(f"❌ Positions fetch error: {e}")
-            return []
-    
-    def get_orders(self) -> List[Dict]:
-        """Get order history"""
-        try:
-            if not self.is_authenticated():
-                return []
-            
-            # Mock orders - replace with actual broker API
-            return []
-            
-        except Exception as e:
-            logger.error(f"❌ Orders fetch error: {e}")
-            return []
-
-class RiskManager:
-    """Risk management system"""
-    
-    def __init__(self, config: Dict):
-        """Initialize risk manager"""
-        self.config = config
-        self.daily_pnl = 0.0
-        self.daily_trades = 0
-        self.max_drawdown = 0.0
-        self.peak_capital = config.get('initial_capital', 100000)
-        
-        logger.info("🛡️ Risk Manager initialized")
-    
-    def check_position_size(self, symbol: str, quantity: int, price: float) -> bool:
-        """Check if position size is within limits"""
-        try:
-            max_position_value = self.config.get('max_position_size', 100000)
-            position_value = quantity * price
-            
-            if position_value > max_position_value:
-                logger.warning(f"⚠️ Position size too large: ₹{position_value:,.2f}")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Position size check error: {e}")
-            return False
-    
-    def check_daily_limits(self) -> bool:
-        """Check daily trading limits"""
-        try:
-            max_daily_loss = self.config.get('max_daily_loss', 5000)
-            max_daily_trades = self.config.get('max_daily_trades', 50)
-            
-            if self.daily_pnl < -max_daily_loss:
-                logger.warning(f"⚠️ Daily loss limit reached: ₹{self.daily_pnl:.2f}")
-                return False
-            
-            if self.daily_trades >= max_daily_trades:
-                logger.warning(f"⚠️ Daily trades limit reached: {self.daily_trades}")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Daily limits check error: {e}")
-            return True
-    
-    def update_trade_pnl(self, pnl: float):
-        """Update daily P&L from trade"""
-        self.daily_pnl += pnl
-        self.daily_trades += 1
-        
-        # Update drawdown
-        current_capital = self.peak_capital + self.daily_pnl
-        if current_capital > self.peak_capital:
-            self.peak_capital = current_capital
-        
-        drawdown = self.peak_capital - current_capital
-        if drawdown > self.max_drawdown:
-            self.max_drawdown = drawdown
-
-class StrategyEngine:
-    """Trading strategy execution engine"""
-    
-    def __init__(self, config: Dict):
-        """Initialize strategy engine"""
-        self.config = config
-        self.active_strategies = []
-        self.strategy_performance = {}
-        
-        logger.info("⚙️ Strategy Engine initialized")
-    
-    def load_strategies(self):
-        """Load and initialize trading strategies"""
-        try:
-            strategies_config = self.config.get('strategies', {})
-            
-            for strategy_name, strategy_config in strategies_config.items():
-                if strategy_config.get('enabled', False):
-                    self.active_strategies.append(strategy_name)
-                    self.strategy_performance[strategy_name] = {
-                        'trades': 0,
-                        'pnl': 0.0,
-                        'allocation': strategy_config.get('allocation', 0.1)
-                    }
-            
-            logger.info(f"✅ Loaded strategies: {self.active_strategies}")
-            
-        except Exception as e:
-            logger.error(f"❌ Strategy loading error: {e}")
-    
-    def generate_signals(self, symbol: str, market_data: Dict) -> List[Dict]:
-        """Generate trading signals from active strategies"""
-        try:
-            signals = []
-            
-            # Mock signal generation - implement actual strategies
-            for strategy in self.active_strategies:
-                if strategy == 'momentum':
-                    signal = self._momentum_strategy(symbol, market_data)
-                elif strategy == 'mean_reversion':
-                    signal = self._mean_reversion_strategy(symbol, market_data)
-                else:
-                    continue
-                
-                if signal:
-                    signals.append(signal)
-            
-            return signals
-            
-        except Exception as e:
-            logger.error(f"❌ Signal generation error: {e}")
-            return []
-    
-    def _momentum_strategy(self, symbol: str, market_data: Dict) -> Optional[Dict]:
-        """Simple momentum strategy"""
-        try:
-            # Mock momentum logic
-            import random
-            if random.random() > 0.7:  # 30% chance of signal
-                return {
-                    'strategy': 'momentum',
-                    'symbol': symbol,
-                    'side': 'BUY' if random.random() > 0.5 else 'SELL',
-                    'confidence': random.uniform(0.6, 0.9),
-                    'target_price': market_data['ltp'] * random.uniform(1.01, 1.03)
-                }
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Momentum strategy error: {e}")
-            return None
-    
-    def _mean_reversion_strategy(self, symbol: str, market_data: Dict) -> Optional[Dict]:
-        """Simple mean reversion strategy"""
-        try:
-            # Mock mean reversion logic
-            import random
-            if random.random() > 0.8:  # 20% chance of signal
-                return {
-                    'strategy': 'mean_reversion',
-                    'symbol': symbol,
-                    'side': 'SELL' if random.random() > 0.5 else 'BUY',
-                    'confidence': random.uniform(0.5, 0.8),
-                    'target_price': market_data['ltp'] * random.uniform(0.97, 0.99)
-                }
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Mean reversion strategy error: {e}")
-            return None
-
-class TradingBot:
-    """
-    Main Trading Bot with Integrated Scheduling
-    Complete solution with market hours automation, paper trading, and production features
-    """
-    
-    def __init__(self, config_file: str = "bot_config.json"):
-        """Initialize the trading bot"""
-        self.config_file = config_file
-        self.state_file = "bot_state.json"
-        self.performance_file = "daily_performance.json"
-        
-        # Load configuration
-        self.config = self.load_configuration()
+        # Trading mode (live or paper)
+        self.trading_mode = self.config.get('trading_mode', 'paper')  # 'live' or 'paper'
         
         # Initialize components
-        self.market_scheduler = MarketScheduler()
-        self.api = APIConnector(self.config.get('api_settings', {}))
-        self.risk_manager = RiskManager(self.config.get('risk_management', {}))
-        self.strategy_engine = StrategyEngine(self.config.get('strategies', {}))
+        self.data_manager = DataManager(self.config)
+        self.strategy_manager = StrategyManager(self.config)
+        self.execution_manager = ExecutionManager(self.config)
+        self.paper_engine = PaperTradingEngine(self.config)
+        self.goodwill_api = GoodwillAPIHandler(self.config)
+        self.volatility_analyzer = VolatilityAnalyzer(self.config)
+        self.scanner = DynamicScanner(self.config)
+        self.db_manager = DatabaseManager(self.config)
+        self.monitor = SystemMonitor(self.config)
+        self.websocket_manager = WebSocketManager(self.config)
         
-        # Session management
-        self.current_session: Optional[TradingSession] = None
-        self.session_history: List[TradingSession] = []
-        
-        # Control flags
+        # State management
         self.is_running = False
-        self.auto_mode = True
-        self.scheduler_enabled = True
-        self.paper_mode = self.config.get('paper_trading', {}).get('enabled', False)
+        self.active_positions = {}
+        self.pending_orders = {}
+        self.trading_signals = queue.Queue()
+        self.performance_metrics = {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_pnl': 0.0,
+            'daily_pnl': 0.0,
+            'max_drawdown': 0.0,
+            'sharpe_ratio': 0.0
+        }
         
-        # Threading
-        self.scheduler_thread = None
-        self.trading_thread = None
-        self.health_check_interval = 300  # 5 minutes
-        self.last_health_check = time.time()
+        # Threading and Auto-Scheduling
+        self.executor = ThreadPoolExecutor(max_workers=10)
+        self.lock = threading.RLock()
+        self.scheduler = AsyncIOScheduler()
         
-        # Paper trading
-        self.paper_engine = None
-        if self.paper_mode:
-            self.init_paper_trading()
+        # Market hours and auto-schedule times (IST)
+        self.market_open_time = "09:15"
+        self.market_close_time = "15:30"
+        self.pre_market_start = "08:15"   # 1 hour before market open
+        self.post_market_stop = "16:30"   # 1 hour after market close
         
-        # Load previous state
-        self.load_state()
+        # Auto-scheduling configuration
+        self.auto_schedule_enabled = self.config.get('auto_schedule', True)
+        self.is_scheduled_session = False
+        self.new_positions_allowed = True
         
-        # Setup lifecycle handlers
-        self.setup_lifecycle_handlers()
-        
-        logger.info("🤖 FlyingBuddha Trading Bot initialized")
+        self.logger.info(f"Trading Bot initialized in {self.trading_mode.upper()} mode")
+        if self.auto_schedule_enabled:
+            self.logger.info(f"Auto-schedule enabled: {self.pre_market_start} - {self.post_market_stop} IST")
     
-    def load_configuration(self) -> Dict:
-        """Load bot configuration from file"""
+    def _setup_logging(self):
+        """Setup comprehensive logging"""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('trading_bot.log'),
+                logging.StreamHandler()
+            ]
+        )
+        return logging.getLogger(__name__)
+    
+    async def start(self):
+        """Start the trading bot system with auto-scheduling"""
         try:
-            default_config = {
-                "trading_settings": {
-                    "symbols": ["RELIANCE", "TCS", "INFY"],
-                    "max_daily_trades": 50,
-                    "max_position_size": 100000,
-                    "auto_square_off": True,
-                    "square_off_time": "15:15"
-                },
-                "strategies": {
-                    "momentum": {"enabled": True, "allocation": 0.4},
-                    "mean_reversion": {"enabled": True, "allocation": 0.3}
-                },
-                "risk_management": {
-                    "max_daily_loss": 5000,
-                    "max_position_size": 100000,
-                    "max_daily_trades": 50
-                },
-                "paper_trading": {
-                    "enabled": True,
-                    "initial_capital": 100000
-                },
-                "api_settings": {
-                    "retry_attempts": 3,
-                    "request_timeout": 30
-                }
-            }
+            self.logger.info("Starting Trading Bot Core System...")
             
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    user_config = json.load(f)
-                    # Merge configurations
-                    return {**default_config, **user_config}
+            # Setup auto-scheduling first if enabled
+            if self.auto_schedule_enabled:
+                await self._setup_auto_schedule()
+            
+            # Initialize database
+            await self.db_manager.initialize()
+            
+            # Start monitoring
+            await self.monitor.start()
+            
+            # Initialize API connections
+            if self.trading_mode == 'live':
+                await self.goodwill_api.initialize()
+                if not await self.goodwill_api.authenticate():
+                    raise Exception("Failed to authenticate with Goodwill API")
+                self.logger.info("✅ Live trading mode - Goodwill API connected")
             else:
-                # Save default config
-                with open(self.config_file, 'w') as f:
-                    json.dump(default_config, f, indent=4)
-                return default_config
-                
-        except Exception as e:
-            logger.error(f"❌ Configuration load error: {e}")
-            return {}
-    
-    def save_configuration(self):
-        """Save current configuration"""
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config, f, indent=4)
-        except Exception as e:
-            logger.error(f"❌ Configuration save error: {e}")
-    
-    def init_paper_trading(self):
-        """Initialize paper trading engine"""
-        try:
-            from paper_trading_engine import PaperTradingEngine
+                await self.paper_engine.initialize()
+                self.logger.info("✅ Paper trading mode - Simulation engine ready")
             
-            initial_capital = self.config.get('paper_trading', {}).get('initial_capital', 100000)
-            self.paper_engine = PaperTradingEngine(self.api, initial_capital)
-            self.paper_engine.start_realtime_updates()
+            # Start data feeds
+            await self.data_manager.start()
             
-            logger.info(f"📊 Paper trading initialized with ₹{initial_capital:,.2f}")
+            # Start WebSocket connections for real-time data
+            await self.websocket_manager.start()
             
-        except ImportError:
-            logger.warning("⚠️ Paper trading engine not available")
-        except Exception as e:
-            logger.error(f"❌ Paper trading initialization error: {e}")
-    
-    def setup_lifecycle_handlers(self):
-        """Setup graceful shutdown handlers"""
-        def signal_handler(signum, frame):
-            logger.info(f"🛑 Received signal {signum}, initiating graceful shutdown")
-            self.graceful_shutdown()
-            sys.exit(0)
-        
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
-        atexit.register(self.graceful_shutdown)
-    
-    def start(self) -> bool:
-        """Start the trading bot"""
-        try:
-            logger.info("🚀 Starting FlyingBuddha Trading Bot")
+            # Initialize market scanner
+            await self.scanner.start()
             
-            # Load strategies
-            self.strategy_engine.load_strategies()
+            # Start main trading loop
+            self.is_running = True
             
-            # Start scheduled operations
-            self.start_scheduled_operations()
+            # Start scheduler if auto-schedule is enabled
+            if self.auto_schedule_enabled and not self.scheduler.running:
+                self.scheduler.start()
+                self.logger.info("✅ Auto-scheduler started")
             
-            logger.info("✅ Trading bot started successfully")
-            return True
+            # Run concurrent tasks
+            tasks = [
+                self._market_data_processor(),
+                self._strategy_execution_loop(),
+                self._order_management_loop(),
+                self._risk_management_loop(),
+                self._performance_tracking_loop(),
+                self._market_scanner_loop(),
+                self._schedule_monitor_loop()
+            ]
+            
+            await asyncio.gather(*tasks)
             
         except Exception as e:
-            logger.error(f"❌ Bot startup error: {e}")
-            return False
+            self.logger.error(f"Failed to start trading bot: {e}")
+            await self.stop()
+            raise
     
-    def start_scheduled_operations(self):
-        """Start scheduled trading operations"""
-        def scheduler_loop():
-            logger.info("🕒 Scheduled operations started")
-            
-            while self.scheduler_enabled:
-                try:
-                    current_time = self.market_scheduler.get_current_ist_time()
-                    
-                    # Check if we should start trading
-                    if self.should_start_trading():
-                        self.start_trading_session()
-                    
-                    # Check if we should stop trading
-                    elif self.should_stop_trading() and self.is_running:
-                        self.stop_trading_session()
-                    
-                    # Health checks
-                    self.perform_health_checks()
-                    
-                    # Log status periodically
-                    if current_time.minute % 15 == 0 and current_time.second < 30:
-                        self.log_status()
-                    
-                    # Auto square-off check
-                    if self.is_running:
-                        self.check_auto_square_off()
-                    
-                    time.sleep(30)  # Check every 30 seconds
-                    
-                except Exception as e:
-                    logger.error(f"❌ Scheduler loop error: {e}")
-                    time.sleep(60)
-            
-            logger.info("🛑 Scheduled operations stopped")
+    async def stop(self):
+        """Stop the trading bot system"""
+        self.logger.info("Stopping Trading Bot Core System...")
         
-        self.scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
-        self.scheduler_thread.start()
+        self.is_running = False
+        
+        # Close all positions if configured
+        if self.config.get('close_positions_on_stop', True):
+            await self._close_all_positions()
+        
+        # Stop components
+        await self.websocket_manager.stop()
+        await self.data_manager.stop()
+        await self.scanner.stop()
+        await self.monitor.stop()
+        
+        if self.trading_mode == 'live':
+            await self.goodwill_api.disconnect()
+        
+        # Stop scheduler
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+        
+        self.executor.shutdown(wait=True)
+        self.logger.info("Trading Bot stopped successfully")
     
-    def should_start_trading(self) -> bool:
-        """Determine if trading should start"""
-        if not self.auto_mode:
-            return False
-        
-        if not self.market_scheduler.is_vm_operation_hours():
-            return False
-        
-        if self.is_running:
-            return False
-        
-        if not self.api.is_authenticated():
-            logger.warning("⚠️ Cannot start - not authenticated")
-            return False
-        
-        if not self.risk_manager.check_daily_limits():
-            logger.warning("⚠️ Cannot start - daily limits reached")
-            return False
-        
-        return True
-    
-    def should_stop_trading(self) -> bool:
-        """Determine if trading should stop"""
-        if not self.auto_mode:
-            return False
-        
-        if not self.market_scheduler.is_market_hours():
-            return True
-        
-        if not self.risk_manager.check_daily_limits():
-            return True
-        
-        # Check auto square-off time
-        current_time = self.market_scheduler.get_current_ist_time()
-        square_off_time = self.config.get("trading_settings", {}).get("square_off_time", "15:15")
-        
+    async def _setup_auto_schedule(self):
+        """Setup automatic start/stop scheduling"""
         try:
-            hour, minute = map(int, square_off_time.split(':'))
-            square_off_dt = current_time.replace(hour=hour, minute=minute, second=0)
+            self.logger.info("Setting up automatic trading schedule...")
             
-            if current_time >= square_off_dt:
-                return True
-        except:
-            pass
-        
-        return False
-    
-    def start_trading_session(self):
-        """Start a new trading session"""
-        try:
-            if self.current_session:
-                logger.warning("⚠️ Trading session already active")
-                return False
-            
-            # Create new session
-            session_id = f"SESSION_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self.current_session = TradingSession(
-                session_id=session_id,
-                start_time=datetime.now(),
-                strategies_used=list(self.strategy_engine.active_strategies)
+            # Pre-market start (8:15 AM IST) - Monday to Friday
+            self.scheduler.add_job(
+                self._scheduled_pre_market_start,
+                CronTrigger(hour=8, minute=15, day_of_week='0-4'),
+                id='pre_market_start',
+                replace_existing=True
             )
             
-            # Start trading
+            # Market open preparation (9:10 AM IST)
+            self.scheduler.add_job(
+                self._scheduled_market_open_prep,
+                CronTrigger(hour=9, minute=10, day_of_week='0-4'),
+                id='market_open_prep',
+                replace_existing=True
+            )
+            
+            # Market close preparation (15:25 PM IST)
+            self.scheduler.add_job(
+                self._scheduled_market_close_prep,
+                CronTrigger(hour=15, minute=25, day_of_week='0-4'),
+                id='market_close_prep',
+                replace_existing=True
+            )
+            
+            # Post-market stop (16:30 PM IST)
+            self.scheduler.add_job(
+                self._scheduled_post_market_stop,
+                CronTrigger(hour=16, minute=30, day_of_week='0-4'),
+                id='post_market_stop',
+                replace_existing=True
+            )
+            
+            # Weekend maintenance (Saturday 2:00 AM)
+            self.scheduler.add_job(
+                self._scheduled_weekend_maintenance,
+                CronTrigger(hour=2, minute=0, day_of_week='5'),
+                id='weekend_maintenance',
+                replace_existing=True
+            )
+            
+            self.logger.info("✅ Auto-schedule configured:")
+            self.logger.info(f"  📅 Pre-market: {self.pre_market_start} IST")
+            self.logger.info(f"  📅 Market prep: 09:10 IST")
+            self.logger.info(f"  📅 Close prep: 15:25 IST")
+            self.logger.info(f"  📅 Post-market: {self.post_market_stop} IST")
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up auto-schedule: {e}")
+    
+    async def _scheduled_pre_market_start(self):
+        """Pre-market startup (1 hour before market open)"""
+        try:
+            self.logger.info("🌅 PRE-MARKET STARTUP - Initializing systems...")
+            self.is_scheduled_session = True
+            
+            # System health check
+            await self._system_health_check()
+            
+            # Initialize data connections
+            if not self.data_manager.is_connected:
+                await self.data_manager.start()
+            if not self.websocket_manager.is_connected:
+                await self.websocket_manager.start()
+            
+            # Pre-market analysis
+            await self._pre_market_analysis()
+            
+            await self.monitor.send_alert("PRE-MARKET START", "Trading systems initialized")
+            
+        except Exception as e:
+            self.logger.error(f"Pre-market startup error: {e}")
+            await self.monitor.send_alert("PRE-MARKET ERROR", f"Startup failed: {e}")
+    
+    async def _scheduled_market_open_prep(self):
+        """Market open preparation (5 minutes before open)"""
+        try:
+            self.logger.info("🔔 MARKET OPEN PREP - Final checks...")
+            
+            # Authenticate APIs
+            if self.trading_mode == 'live':
+                if not await self.goodwill_api.is_authenticated():
+                    await self.goodwill_api.authenticate()
+            
+            # Final system checks
+            await self._pre_trading_checks()
+            
+            # Enable trading
             self.is_running = True
-            self.start_trading_loop()
+            self.new_positions_allowed = True
             
-            logger.info(f"🚀 Trading session started: {session_id}")
-            self.save_state()
-            return True
+            # Load daily trading plan
+            await self._load_daily_trading_plan()
+            
+            self.logger.info("✅ Ready for market open!")
+            await self.monitor.send_alert("MARKET READY", "All systems ready for trading")
             
         except Exception as e:
-            logger.error(f"❌ Trading session start error: {e}")
-            self.current_session = None
-            return False
+            self.logger.error(f"Market prep error: {e}")
+            await self.monitor.send_alert("MARKET PREP ERROR", f"Prep failed: {e}")
     
-    def stop_trading_session(self, reason: str = "SCHEDULED"):
-        """Stop current trading session"""
+    async def _scheduled_market_close_prep(self):
+        """Market close preparation (5 minutes before close)"""
         try:
-            if not self.current_session:
-                return
+            self.logger.info("🔔 MARKET CLOSE PREP - Preparing for close...")
             
-            # Close all positions if auto square-off enabled
-            if self.config.get("trading_settings", {}).get("auto_square_off", True):
-                self.close_all_positions()
+            # Stop new positions
+            self.new_positions_allowed = False
             
-            # Stop trading
+            # Close positions if configured
+            if self.config.get('close_positions_at_market_close', True):
+                await self._close_risky_positions()
+            
+            await self.monitor.send_alert("MARKET CLOSING", "Preparing for market close")
+            
+        except Exception as e:
+            self.logger.error(f"Market close prep error: {e}")
+    
+    async def _scheduled_post_market_stop(self):
+        """Post-market shutdown (1 hour after market close)"""
+        try:
+            self.logger.info("🌙 POST-MARKET SHUTDOWN - Ending trading session...")
+            
+            # Generate daily report
+            await self._generate_daily_report()
+            
+            # Close remaining positions if any
+            await self._close_all_positions()
+            
+            # Stop trading operations
             self.is_running = False
+            self.is_scheduled_session = False
             
-            # Update session
-            self.current_session.end_time = datetime.now()
-            self.current_session.session_status = "COMPLETED"
+            # Backup data
+            await self._backup_daily_data()
             
-            # Calculate performance
-            if self.paper_engine:
-                portfolio = self.paper_engine.get_portfolio_summary()
-                self.current_session.total_pnl = portfolio.get('account_summary', {}).get('total_pnl', 0)
-                self.current_session.total_trades = portfolio.get('performance_metrics', {}).get('total_trades', 0)
-            
-            # Save to history
-            self.session_history.append(self.current_session)
-            
-            # Log session summary
-            duration = (self.current_session.end_time - self.current_session.start_time).total_seconds() / 3600
-            logger.info(f"🏁 Session ended: {self.current_session.session_id}")
-            logger.info(f"   Duration: {duration:.1f}h | Trades: {self.current_session.total_trades} | P&L: ₹{self.current_session.total_pnl:.2f}")
-            
-            # Clear session
-            self.current_session = None
-            self.save_state()
+            self.logger.info("✅ Trading session ended successfully")
+            await self.monitor.send_alert("SESSION END", "Trading session completed")
             
         except Exception as e:
-            logger.error(f"❌ Session stop error: {e}")
+            self.logger.error(f"Post-market shutdown error: {e}")
     
-    def start_trading_loop(self):
-        """Start the main trading loop"""
-        def trading_loop():
-            logger.info("📈 Trading loop started")
+    async def _scheduled_weekend_maintenance(self):
+        """Weekend maintenance tasks"""
+        try:
+            self.logger.info("🔧 WEEKEND MAINTENANCE - System optimization...")
             
-            while self.is_running:
-                try:
-                    # Process each symbol
-                    symbols = self.config.get('trading_settings', {}).get('symbols', [])
-                    
-                    for symbol in symbols:
-                        if not self.is_running:
-                            break
-                        
-                        # Get market data
-                        market_data = self.api.get_quote(symbol)
-                        if not market_data:
-                            continue
-                        
-                        # Generate signals
-                        signals = self.strategy_engine.generate_signals(symbol, market_data)
-                        
-                        # Process signals
-                        for signal in signals:
-                            self.process_trading_signal(signal, market_data)
-                    
-                    time.sleep(5)  # Wait 5 seconds between cycles
-                    
-                except Exception as e:
-                    logger.error(f"❌ Trading loop error: {e}")
-                    time.sleep(10)
+            # Database maintenance
+            await self.db_manager.optimize_database()
             
-            logger.info("📉 Trading loop stopped")
+            # Performance analysis
+            await self._weekly_performance_analysis()
+            
+            # System cleanup
+            await self._cleanup_logs()
+            
+            self.logger.info("✅ Weekend maintenance completed")
+            
+        except Exception as e:
+            self.logger.error(f"Weekend maintenance error: {e}")
+    
+    async def _schedule_monitor_loop(self):
+        """Monitor scheduled events and auto-scheduling"""
+        while self.is_running:
+            try:
+                current_time = datetime.now()
+                
+                # Log next scheduled job
+                if self.scheduler.running:
+                    next_job = self.scheduler.get_jobs()[0] if self.scheduler.get_jobs() else None
+                    if next_job:
+                        self.logger.debug(f"Next scheduled event: {next_job.id} at {next_job.next_run_time}")
+                
+                # Check if we're in a scheduled session
+                if self.auto_schedule_enabled:
+                    await self._check_schedule_compliance(current_time)
+                
+                await asyncio.sleep(300)  # Check every 5 minutes
+                
+            except Exception as e:
+                self.logger.error(f"Schedule monitor error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _check_schedule_compliance(self, current_time: datetime):
+        """Ensure bot is running according to schedule"""
+        try:
+            # Parse times
+            pre_market = current_time.replace(hour=8, minute=15, second=0, microsecond=0)
+            post_market = current_time.replace(hour=16, minute=30, second=0, microsecond=0)
+            
+            # Check if we should be running
+            should_be_running = (
+                current_time.weekday() < 5 and  # Monday-Friday
+                pre_market <= current_time <= post_market
+            )
+            
+            if should_be_running and not self.is_running:
+                self.logger.warning("Bot should be running but isn't - auto-starting...")
+                await self._emergency_start()
+            elif not should_be_running and self.is_running and self.is_scheduled_session:
+                self.logger.warning("Bot running outside schedule - auto-stopping...")
+                await self._emergency_stop()
+                
+        except Exception as e:
+            self.logger.error(f"Schedule compliance check error: {e}")
+    
+    async def set_trading_mode(self, mode: str):
+        """Switch between live and paper trading modes"""
+        if mode not in ['live', 'paper']:
+            raise ValueError("Trading mode must be 'live' or 'paper'")
         
-        self.trading_thread = threading.Thread(target=trading_loop, daemon=True)
-        self.trading_thread.start()
+        if mode == self.trading_mode:
+            self.logger.info(f"Already in {mode} mode")
+            return
+        
+        self.logger.info(f"Switching from {self.trading_mode} to {mode} mode...")
+        
+        # Stop current mode
+        if self.trading_mode == 'live':
+            await self.goodwill_api.disconnect()
+        else:
+            await self.paper_engine.stop()
+        
+        # Start new mode
+        self.trading_mode = mode
+        if mode == 'live':
+            await self.goodwill_api.initialize()
+            await self.goodwill_api.authenticate()
+        else:
+            await self.paper_engine.initialize()
+        
+        # Update configuration
+        self.config.set('trading_mode', mode)
+        await self.config.save()
+        
+        self.logger.info(f"✅ Switched to {mode.upper()} mode")
     
-    def process_trading_signal(self, signal: Dict, market_data: Dict):
-        """Process a trading signal"""
+    async def _market_data_processor(self):
+        """Process real-time market data"""
+        while self.is_running:
+            try:
+                market_data = await self.data_manager.get_realtime_data()
+                
+                if market_data:
+                    await self.volatility_analyzer.update(market_data)
+                    
+                    for symbol, data in market_data.items():
+                        signals = await self.strategy_manager.analyze(symbol, data)
+                        
+                        for signal in signals:
+                            self.trading_signals.put(signal)
+                
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                self.logger.error(f"Market data processing error: {e}")
+                await asyncio.sleep(1)
+    
+    async def _strategy_execution_loop(self):
+        """Execute trading strategies and generate signals"""
+        while self.is_running:
+            try:
+                if not self.trading_signals.empty():
+                    signal = self.trading_signals.get_nowait()
+                    
+                    if await self._validate_signal(signal):
+                        if self.trading_mode == 'live':
+                            await self._execute_live_signal(signal)
+                        else:
+                            await self._execute_paper_signal(signal)
+                
+                await asyncio.sleep(0.05)
+                
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                self.logger.error(f"Strategy execution error: {e}")
+                await asyncio.sleep(1)
+    
+    async def _execute_live_signal(self, signal: TradingSignal):
+        """Execute signal in live trading mode"""
         try:
-            symbol = signal['symbol']
-            side = signal['side']
-            
-            # Risk checks
-            if not self.risk_manager.check_daily_limits():
+            if not self._is_market_open():
+                self.logger.warning(f"Market closed - skipping {signal.symbol}")
                 return
             
-            # Calculate position size (simple logic)
-            allocation = self.strategy_engine.strategy_performance[signal['strategy']]['allocation']
-            capital = self.config.get('paper_trading', {}).get('initial_capital', 100000)
-            position_value = capital * allocation * 0.1  # 10% of allocation per trade
-            quantity = int(position_value / market_data['ltp'])
-            
-            if quantity <= 0:
+            if not self.new_positions_allowed and signal.action == 'BUY':
+                self.logger.warning(f"New positions disabled - skipping BUY {signal.symbol}")
                 return
             
-            # Position size check
-            if not self.risk_manager.check_position_size(symbol, quantity, market_data['ltp']):
+            if not await self._risk_check(signal):
+                self.logger.warning(f"Risk check failed for {signal.symbol}")
                 return
             
-            # Place order
-            if self.paper_mode and self.paper_engine:
-                from paper_trading_engine import OrderType
-                order_id = self.paper_engine.place_order(
-                    symbol=symbol,
-                    side=side,
-                    quantity=quantity,
-                    order_type=OrderType.MARKET
+            if signal.action == 'BUY':
+                order_result = await self.goodwill_api.place_buy_order(
+                    symbol=signal.symbol,
+                    quantity=signal.quantity,
+                    price=signal.price,
+                    order_type='LIMIT',
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit
                 )
-                
-                if order_id:
-                    logger.info(f"📝 Paper order placed: {side} {quantity} {symbol}")
+            elif signal.action == 'SELL':
+                order_result = await self.goodwill_api.place_sell_order(
+                    symbol=signal.symbol,
+                    quantity=signal.quantity,
+                    price=signal.price,
+                    order_type='LIMIT'
+                )
+            
+            if order_result and order_result.get('success'):
+                await self._log_trade(signal, order_result, 'live')
+                self.logger.info(f"✅ Live: {signal.action} {signal.quantity} {signal.symbol} @ {signal.price}")
             else:
-                # Live trading
-                order_params = {
-                    'symbol': symbol,
-                    'side': side,
-                    'quantity': quantity,
-                    'order_type': 'MARKET'
-                }
-                
-                result = self.api.place_order(order_params)
-                if result:
-                    logger.info(f"📝 Live order placed: {side} {quantity} {symbol}")
-            
-        except Exception as e:
-            logger.error(f"❌ Signal processing error: {e}")
-    
-    def close_all_positions(self):
-        """Close all open positions"""
-        try:
-            if self.paper_mode and self.paper_engine:
-                order_ids = self.paper_engine.close_all_positions()
-                logger.info(f"🔒 Paper positions closed: {len(order_ids)} orders")
-            else:
-                positions = self.api.get_positions()
-                for position in positions:
-                    # Close position logic for live trading
-                    pass
-                logger.info("🔒 Live positions closed")
+                self.logger.error(f"❌ Live order failed: {order_result}")
                 
         except Exception as e:
-            logger.error(f"❌ Position closing error: {e}")
+            self.logger.error(f"Live signal execution error: {e}")
     
-    def check_auto_square_off(self):
-        """Check and execute auto square-off"""
+    async def _execute_paper_signal(self, signal: TradingSignal):
+        """Execute signal in paper trading mode"""
         try:
-            if not self.config.get("trading_settings", {}).get("auto_square_off", True):
-                return
+            result = await self.paper_engine.execute_trade(
+                symbol=signal.symbol,
+                action=signal.action,
+                quantity=signal.quantity,
+                price=signal.price,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                strategy=signal.strategy
+            )
             
-            current_time = self.market_scheduler.get_current_ist_time()
-            square_off_time = self.config.get("trading_settings", {}).get("square_off_time", "15:15")
+            if result.get('success'):
+                await self._log_trade(signal, result, 'paper')
+                self.logger.info(f"📄 Paper: {signal.action} {signal.quantity} {signal.symbol} @ {signal.price}")
             
-            hour, minute = map(int, square_off_time.split(':'))
-            square_off_dt = current_time.replace(hour=hour, minute=minute, second=0)
-            square_off_trigger = square_off_dt - timedelta(minutes=5)
-            
-            if current_time >= square_off_trigger and self.is_running:
-                logger.info("🔒 Auto square-off triggered")
-                self.close_all_positions()
+        except Exception as e:
+            self.logger.error(f"Paper signal execution error: {e}")
+    
+    async def _order_management_loop(self):
+        """Manage active orders and positions"""
+        while self.is_running:
+            try:
+                if self.trading_mode == 'live':
+                    orders = await self.goodwill_api.get_order_status()
+                    positions = await self.goodwill_api.get_positions()
+                else:
+                    orders = await self.paper_engine.get_active_orders()
+                    positions = await self.paper_engine.get_positions()
                 
-        except Exception as e:
-            logger.error(f"❌ Auto square-off error: {e}")
-    
-    def perform_health_checks(self):
-        """Perform system health checks"""
-        try:
-            current_time = time.time()
-            if current_time - self.last_health_check < self.health_check_interval:
-                return
-            
-            health_status = {
-                'timestamp': datetime.now().isoformat(),
-                'api_connected': self.api.is_authenticated(),
-                'trading_active': self.is_running,
-                'paper_mode': self.paper_mode,
-                'memory_usage': self.get_memory_usage(),
-                'session_active': self.current_session is not None
-            }
-            
-            # Log critical issues
-            if not health_status['api_connected'] and self.is_running:
-                logger.error("❌ API disconnected during active trading")
-            
-            if health_status['memory_usage'] > 80:
-                logger.warning(f"⚠️ High memory usage: {health_status['memory_usage']:.1f}%")
-            
-            self.last_health_check = current_time
-            
-        except Exception as e:
-            logger.error(f"❌ Health check error: {e}")
-    
-    def get_memory_usage(self) -> float:
-        """Get current memory usage percentage"""
-        try:
-            import psutil
-            return psutil.virtual_memory().percent
-        except ImportError:
-            return 0.0
-        except Exception:
-            return 0.0
-    
-    def log_status(self):
-        """Log current bot status"""
-        try:
-            current_time = self.market_scheduler.get_current_ist_time()
-            
-            status = {
-                'time': current_time.strftime('%Y-%m-%d %H:%M:%S IST'),
-                'market_hours': self.market_scheduler.is_market_hours(),
-                'vm_hours': self.market_scheduler.is_vm_operation_hours(),
-                'auto_mode': self.auto_mode,
-                'trading_active': self.is_running,
-                'paper_mode': self.paper_mode,
-                'session_active': self.current_session is not None,
-                'authenticated': self.api.is_authenticated()
-            }
-            
-            if self.current_session:
-                status['session_id'] = self.current_session.session_id
-                status['session_trades'] = self.current_session.total_trades
-                status['session_pnl'] = self.current_session.total_pnl
-            
-            logger.info(f"📊 Bot Status: {status}")
-            
-        except Exception as e:
-            logger.error(f"❌ Status logging error: {e}")
-    
-    def load_state(self):
-        """Load previous state from file"""
-        try:
-            if not os.path.exists(self.state_file):
-                return
-            
-            with open(self.state_file, 'r') as f:
-                state_data = json.load(f)
-            
-            self.auto_mode = state_data.get('auto_mode', True)
-            self.scheduler_enabled = state_data.get('scheduler_enabled', True)
-            
-            # Load session history
-            session_history = state_data.get('session_history', [])
-            self.session_history = []
-            
-            for session_data in session_history:
-                session_data['start_time'] = datetime.fromisoformat(session_data['start_time'])
-                if session_data['end_time']:
-                    session_data['end_time'] = datetime.fromisoformat(session_data['end_time'])
+                with self.lock:
+                    self.active_positions = positions or {}
+                    self.pending_orders = orders or {}
                 
-                session = TradingSession(**session_data)
-                self.session_history.append(session)
-            
-            logger.info("✅ Previous state loaded")
-            
-        except Exception as e:
-            logger.error(f"❌ State load error: {e}")
-    
-    def save_state(self):
-        """Save current state to file"""
-        try:
-            state_data = {
-                'current_session': asdict(self.current_session) if self.current_session else None,
-                'session_history': [asdict(session) for session in self.session_history[-10:]],
-                'auto_mode': self.auto_mode,
-                'scheduler_enabled': self.scheduler_enabled,
-                'last_updated': datetime.now().isoformat()
-            }
-            
-            def datetime_serializer(obj):
-                if isinstance(obj, datetime):
-                    return obj.isoformat()
-                raise TypeError(f"Object {obj} is not JSON serializable")
-            
-            with open(self.state_file, 'w') as f:
-                json.dump(state_data, f, indent=4, default=datetime_serializer)
+                await self._process_exit_conditions()
                 
-        except Exception as e:
-            logger.error(f"❌ State save error: {e}")
-    
-    def save_daily_performance(self):
-        """Save daily performance metrics"""
-        try:
-            today = datetime.now().strftime('%Y-%m-%d')
-            
-            performance_data = {}
-            if os.path.exists(self.performance_file):
-                with open(self.performance_file, 'r') as f:
-                    performance_data = json.load(f)
-            
-            # Calculate today's metrics
-            today_sessions = [s for s in self.session_history 
-                            if s.start_time.strftime('%Y-%m-%d') == today]
-            
-            total_trades = sum(s.total_trades for s in today_sessions)
-            total_pnl = sum(s.total_pnl for s in today_sessions)
-            total_time = sum((s.end_time - s.start_time).total_seconds() 
-                           for s in today_sessions if s.end_time) / 3600
-            
-            performance_data[today] = {
-                'total_sessions': len(today_sessions),
-                'total_trades': total_trades,
-                'total_pnl': round(total_pnl, 2),
-                'total_hours': round(total_time, 2),
-                'avg_pnl_per_trade': round(total_pnl / total_trades, 2) if total_trades > 0 else 0,
-                'paper_mode': self.paper_mode,
-                'last_updated': datetime.now().isoformat()
-            }
-            
-            with open(self.performance_file, 'w') as f:
-                json.dump(performance_data, f, indent=4)
+                await asyncio.sleep(1)
                 
-        except Exception as e:
-            logger.error(f"❌ Performance save error: {e}")
+            except Exception as e:
+                self.logger.error(f"Order management error: {e}")
+                await asyncio.sleep(5)
     
-    def get_dashboard_data(self) -> Dict[str, Any]:
-        """Get comprehensive dashboard data"""
-        try:
-            current_time = self.market_scheduler.get_current_ist_time()
-            
-            dashboard_data = {
-                'system_status': {
-                    'current_time': current_time.strftime('%Y-%m-%d %H:%M:%S IST'),
-                    'market_day': self.market_scheduler.is_market_day(),
-                    'market_hours': self.market_scheduler.is_market_hours(),
-                    'vm_operation_hours': self.market_scheduler.is_vm_operation_hours(),
-                    'auto_mode': self.auto_mode,
-                    'scheduler_enabled': self.scheduler_enabled,
-                    'trading_active': self.is_running,
-                    'paper_mode': self.paper_mode,
-                    'authenticated': self.api.is_authenticated()
-                },
-                'session_info': {
-                    'current_session': asdict(self.current_session) if self.current_session else None,
-                    'total_sessions_today': len([s for s in self.session_history 
-                                               if s.start_time.date() == datetime.now().date()]),
-                    'last_session': asdict(self.session_history[-1]) if self.session_history else None
-                },
-                'market_schedule': {
-                    'next_vm_start': None,
-                    'next_vm_stop': None
-                },
-                'performance': {
-                    'today_pnl': 0.0,
-                    'today_trades': 0,
-                    'session_count': 0
-                },
-                'risk_status': {
-                    'daily_pnl': self.risk_manager.daily_pnl,
-                    'daily_trades': self.risk_manager.daily_trades,
-                    'max_drawdown': self.risk_manager.max_drawdown,
-                    'within_limits': self.risk_manager.check_daily_limits()
-                }
-            }
-            
-            # Add timing information
-            next_start = self.market_scheduler.time_until_next_vm_start()
-            next_stop = self.market_scheduler.time_until_vm_stop()
-            
-            dashboard_data['market_schedule']['next_vm_start'] = next_start.total_seconds() if next_start else None
-            dashboard_data['market_schedule']['next_vm_stop'] = next_stop.total_seconds() if next_stop else None
-            
-            # Add performance data
-            today = datetime.now().date()
-            today_sessions = [s for s in self.session_history if s.start_time.date() == today]
-            
-            dashboard_data['performance'] = {
-                'today_pnl': sum(s.total_pnl for s in today_sessions),
-                'today_trades': sum(s.total_trades for s in today_sessions),
-                'session_count': len(today_sessions)
-            }
-            
-            # Add paper trading data if available
-            if self.paper_mode and self.paper_engine:
-                portfolio = self.paper_engine.get_portfolio_summary()
-                dashboard_data['portfolio'] = portfolio
+    async def _risk_management_loop(self):
+        """Continuous risk management"""
+        while self.is_running:
+            try:
+                portfolio_value = await self._calculate_portfolio_value()
+                daily_pnl = await self._calculate_daily_pnl()
                 
-                analytics = self.paper_engine.get_trade_analytics()
-                dashboard_data['analytics'] = analytics
-            
-            return dashboard_data
-            
-        except Exception as e:
-            logger.error(f"❌ Dashboard data error: {e}")
-            return {'error': str(e)}
+                # Daily loss limit check
+                max_daily_loss = self.config.get('max_daily_loss', 5000)
+                if abs(daily_pnl) > max_daily_loss and daily_pnl < 0:
+                    self.logger.warning(f"Daily loss limit exceeded: {daily_pnl}")
+                    await self._emergency_stop()
+                
+                # Position size checks
+                await self._check_position_sizes()
+                
+                with self.lock:
+                    self.performance_metrics['daily_pnl'] = daily_pnl
+                    self.performance_metrics['total_pnl'] = portfolio_value - self.config.get('initial_capital', 100000)
+                
+                await asyncio.sleep(10)
+                
+            except Exception as e:
+                self.logger.error(f"Risk management error: {e}")
+                await asyncio.sleep(30)
     
-    def authenticate_api(self, credentials: Dict) -> bool:
-        """Authenticate with broker API"""
-        try:
-            return self.api.authenticate(credentials)
-        except Exception as e:
-            logger.error(f"❌ Authentication error: {e}")
+    async def _performance_tracking_loop(self):
+        """Track and update performance metrics"""
+        while self.is_running:
+            try:
+                metrics = await self._calculate_performance_metrics()
+                
+                with self.lock:
+                    self.performance_metrics.update(metrics)
+                
+                await self.db_manager.save_performance_metrics(self.performance_metrics)
+                
+                await asyncio.sleep(60)
+                
+            except Exception as e:
+                self.logger.error(f"Performance tracking error: {e}")
+                await asyncio.sleep(60)
+    
+    async def _market_scanner_loop(self):
+        """Continuous market scanning"""
+        while self.is_running:
+            try:
+                if self._is_market_open():
+                    opportunities = await self.scanner.scan_market()
+                    
+                    for opp in opportunities:
+                        if opp.get('probability', 0) > 0.7:
+                            await self.data_manager.add_to_watchlist(opp['symbol'])
+                
+                await asyncio.sleep(30)
+                
+            except Exception as e:
+                self.logger.error(f"Market scanning error: {e}")
+                await asyncio.sleep(60)
+    
+    def _is_market_open(self) -> bool:
+        """Check if market is currently open"""
+        now = datetime.now()
+        
+        if now.weekday() >= 5:  # Weekend
             return False
+        
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
+        return market_open <= now <= market_close
     
-    def manual_start_session(self) -> bool:
-        """Manually start trading session"""
+    async def _validate_signal(self, signal: TradingSignal) -> bool:
+        """Validate trading signal"""
         try:
-            if not self.api.is_authenticated():
-                logger.error("❌ Cannot start - not authenticated")
+            if not signal.symbol or not signal.action or signal.confidence < 0.6:
                 return False
             
-            return self.start_trading_session()
+            if self.trading_mode == 'live':
+                is_tradeable = await self.goodwill_api.is_symbol_tradeable(signal.symbol)
+                if not is_tradeable:
+                    return False
+            
+            max_position_size = self.config.get('max_position_size', 10000)
+            if signal.quantity * signal.price > max_position_size:
+                return False
+            
+            return await self._risk_check(signal)
             
         except Exception as e:
-            logger.error(f"❌ Manual start error: {e}")
+            self.logger.error(f"Signal validation error: {e}")
             return False
     
-    def manual_stop_session(self) -> bool:
-        """Manually stop trading session"""
+    async def _risk_check(self, signal: TradingSignal) -> bool:
+        """Comprehensive risk check"""
         try:
-            self.stop_trading_session("MANUAL")
+            # Portfolio exposure
+            current_exposure = sum(pos.get('value', 0) for pos in self.active_positions.values())
+            max_exposure = self.config.get('max_portfolio_exposure', 80000)
+            
+            new_exposure = signal.quantity * signal.price
+            if current_exposure + new_exposure > max_exposure:
+                return False
+            
+            # Symbol concentration
+            symbol_exposure = self.active_positions.get(signal.symbol, {}).get('value', 0)
+            max_symbol_exposure = self.config.get('max_symbol_exposure', 20000)
+            
+            if symbol_exposure + new_exposure > max_symbol_exposure:
+                return False
+            
+            # Volatility check
+            volatility = await self.volatility_analyzer.get_symbol_volatility(signal.symbol)
+            if volatility and volatility > self.config.get('max_volatility', 0.05):
+                return False
+            
             return True
             
         except Exception as e:
-            logger.error(f"❌ Manual stop error: {e}")
+            self.logger.error(f"Risk check error: {e}")
             return False
     
-    def emergency_stop(self) -> bool:
-        """Emergency stop all trading activities"""
+    # Helper methods for auto-scheduling
+    async def _system_health_check(self):
+        """Pre-market system health check"""
+        self.logger.info("Performing system health check...")
+        # Add health check logic here
+    
+    async def _pre_market_analysis(self):
+        """Pre-market analysis and preparation"""
+        self.logger.info("Running pre-market analysis...")
+        # Add pre-market analysis logic here
+    
+    async def _pre_trading_checks(self):
+        """Final checks before trading starts"""
+        self.logger.info("Running pre-trading checks...")
+        # Add pre-trading check logic here
+    
+    async def _load_daily_trading_plan(self):
+        """Load today's trading plan"""
+        self.logger.info("Loading daily trading plan...")
+        # Add trading plan logic here
+    
+    async def _close_risky_positions(self):
+        """Close risky positions before market close"""
+        self.logger.info("Closing risky positions...")
+        # Add position closing logic here
+    
+    async def _generate_daily_report(self):
+        """Generate end-of-day trading report"""
+        self.logger.info("Generating daily trading report...")
+        # Add report generation logic here
+    
+    async def _backup_daily_data(self):
+        """Backup daily trading data"""
+        self.logger.info("Backing up daily data...")
+        # Add backup logic here
+    
+    async def _weekly_performance_analysis(self):
+        """Weekly performance analysis"""
+        self.logger.info("Running weekly performance analysis...")
+        # Add weekly analysis logic here
+    
+    async def _cleanup_logs(self):
+        """Clean up old log files"""
+        self.logger.info("Cleaning up old logs...")
+        # Add log cleanup logic here
+    
+    async def _emergency_start(self):
+        """Emergency start procedure"""
+        self.logger.warning("Emergency start triggered")
+        if not self.is_running:
+            await self.start()
+    
+    async def _emergency_stop(self):
+        """Emergency stop procedure"""
+        self.logger.critical("EMERGENCY STOP TRIGGERED")
+        
         try:
-            logger.warning("🚨 EMERGENCY STOP TRIGGERED")
-            
-            # Stop trading immediately
+            await self._close_all_positions()
             self.is_running = False
             
-            # Close all positions
-            self.close_all_positions()
-            
-            # Stop session
-            if self.current_session:
-                self.stop_trading_session("EMERGENCY")
-            
-            logger.info("✅ Emergency stop completed")
-            return True
+            await self.monitor.send_alert("EMERGENCY STOP", "Trading bot stopped due to risk limits")
             
         except Exception as e:
-            logger.error(f"❌ Emergency stop error: {e}")
-            return False
+            self.logger.error(f"Emergency stop error: {e}")
     
-    def toggle_auto_mode(self) -> bool:
-        """Toggle automatic mode on/off"""
-        try:
-            self.auto_mode = not self.auto_mode
-            self.save_state()
-            
-            mode = "enabled" if self.auto_mode else "disabled"
-            logger.info(f"🔄 Auto mode {mode}")
-            return self.auto_mode
-            
-        except Exception as e:
-            logger.error(f"❌ Auto mode toggle error: {e}")
-            return self.auto_mode
-    
-    def update_config(self, new_config: Dict) -> bool:
-        """Update bot configuration"""
-        try:
-            self.config.update(new_config)
-            self.save_configuration()
-            
-            # Reload components if needed
-            if 'strategies' in new_config:
-                self.strategy_engine.config = self.config.get('strategies', {})
-                self.strategy_engine.load_strategies()
-            
-            if 'risk_management' in new_config:
-                self.risk_manager.config = self.config.get('risk_management', {})
-            
-            logger.info("✅ Configuration updated")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Config update error: {e}")
-            return False
-    
-    def get_performance_report(self) -> Dict:
-        """Get detailed performance report"""
-        try:
-            if self.paper_mode and self.paper_engine:
-                return self.paper_engine.get_trade_analytics()
-            else:
-                # Basic performance for live trading
-                today_sessions = [s for s in self.session_history 
-                                if s.start_time.date() == datetime.now().date()]
-                
-                return {
-                    'total_sessions': len(today_sessions),
-                    'total_trades': sum(s.total_trades for s in today_sessions),
-                    'total_pnl': sum(s.total_pnl for s in today_sessions),
-                    'active_strategies': self.strategy_engine.active_strategies
-                }
-                
-        except Exception as e:
-            logger.error(f"❌ Performance report error: {e}")
-            return {'error': str(e)}
-    
-    def graceful_shutdown(self):
-        """Graceful shutdown procedure"""
-        try:
-            logger.info("🔄 Initiating graceful shutdown...")
-            
-            # Stop scheduler
-            self.scheduler_enabled = False
-            
-            # Stop trading session
-            if self.current_session:
-                self.stop_trading_session("SHUTDOWN")
-            
-            # Stop trading
-            self.is_running = False
-            
-            # Stop paper trading
-            if self.paper_engine:
-                self.paper_engine.stop_realtime_updates()
-            
-            # Save all states
-            self.save_state()
-            self.save_daily_performance()
-            self.save_configuration()
-            
-            logger.info("✅ Graceful shutdown completed")
-            
-        except Exception as e:
-            logger.error(f"❌ Graceful shutdown error: {e}")
-
-
-# Flask Integration
-def create_flask_app(bot: TradingBot):
-    """Create Flask application with bot integration"""
-    from flask import Flask, jsonify, request
-    from flask_cors import CORS
-    
-    app = Flask(__name__)
-    CORS(app)
-    
-    @app.route('/api/status')
-    def api_status():
-        """Get bot status"""
-        try:
-            return jsonify(bot.get_dashboard_data())
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    @app.route('/api/authenticate', methods=['POST'])
-    def api_authenticate():
-        """Authenticate with broker API"""
-        try:
-            credentials = request.get_json()
-            success = bot.authenticate_api(credentials)
-            
-            return jsonify({
-                'success': success,
-                'message': 'Authentication successful' if success else 'Authentication failed'
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/start-session', methods=['POST'])
-    def api_start_session():
-        """Start trading session"""
-        try:
-            success = bot.manual_start_session()
-            
-            return jsonify({
-                'success': success,
-                'message': 'Session started' if success else 'Failed to start session'
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/stop-session', methods=['POST'])
-    def api_stop_session():
-        """Stop trading session"""
-        try:
-            success = bot.manual_stop_session()
-            
-            return jsonify({
-                'success': success,
-                'message': 'Session stopped' if success else 'Failed to stop session'
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/emergency-stop', methods=['POST'])
-    def api_emergency_stop():
-        """Emergency stop"""
-        try:
-            success = bot.emergency_stop()
-            
-            return jsonify({
-                'success': success,
-                'message': 'Emergency stop executed' if success else 'Emergency stop failed'
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/toggle-auto', methods=['POST'])
-    def api_toggle_auto():
-        """Toggle auto mode"""
-        try:
-            auto_mode = bot.toggle_auto_mode()
-            
-            return jsonify({
-                'success': True,
-                'auto_mode': auto_mode,
-                'message': f'Auto mode {"enabled" if auto_mode else "disabled"}'
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/config', methods=['GET', 'POST'])
-    def api_config():
-        """Get or update configuration"""
-        try:
-            if request.method == 'GET':
-                return jsonify(bot.config)
-            
-            elif request.method == 'POST':
-                new_config = request.get_json()
-                success = bot.update_config(new_config)
-                
-                return jsonify({
-                    'success': success,
-                    'message': 'Configuration updated' if success else 'Configuration update failed',
-                    'config': bot.config
-                })
-                
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/performance')
-    def api_performance():
-        """Get performance report"""
-        try:
-            return jsonify(bot.get_performance_report())
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    @app.route('/api/positions')
-    def api_positions():
-        """Get current positions"""
-        try:
-            if bot.paper_mode and bot.paper_engine:
-                portfolio = bot.paper_engine.get_portfolio_summary()
-                return jsonify(portfolio.get('positions', []))
-            else:
-                positions = bot.api.get_positions()
-                return jsonify(positions)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    @app.route('/api/orders')
-    def api_orders():
-        """Get order history"""
-        try:
-            if bot.paper_mode and bot.paper_engine:
-                orders = bot.paper_engine.get_order_history()
-                return jsonify(orders)
-            else:
-                orders = bot.api.get_orders()
-                return jsonify(orders)
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    
-    @app.route('/api/close-position/<symbol>', methods=['POST'])
-    def api_close_position(symbol):
-        """Close specific position"""
-        try:
-            if bot.paper_mode and bot.paper_engine:
-                order_id = bot.paper_engine.close_position(symbol)
-                success = bool(order_id)
-            else:
-                # Live trading position close
-                success = False  # Implement live position closing
-            
-            return jsonify({
-                'success': success,
-                'message': f'Position {"closed" if success else "close failed"} for {symbol}'
-            })
-        except Exception as e:
-            return jsonify({'success': False, 'message': str(e)}), 500
-    
-    @app.route('/api/health')
-    def api_health():
-        """Health check endpoint"""
-        try:
-            return jsonify({
-                'status': 'healthy',
-                'timestamp': datetime.now().isoformat(),
-                'version': '1.0.0',
-                'uptime': time.time() - bot.last_health_check if hasattr(bot, 'last_health_check') else 0
-            })
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': str(e)}), 500
-    
-    # Paper trading specific routes
-    if bot.paper_mode:
-        @app.route('/api/paper/summary')
-        def api_paper_summary():
-            """Get paper trading summary"""
-            try:
-                if bot.paper_engine:
-                    return jsonify(bot.paper_engine.get_portfolio_summary())
-                else:
-                    return jsonify({'error': 'Paper trading not initialized'}), 400
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
+    async def _close_all_positions(self):
+        """Close all active positions"""
+        self.logger.info("Closing all active positions...")
         
-        @app.route('/api/paper/analytics')
-        def api_paper_analytics():
-            """Get paper trading analytics"""
-            try:
-                if bot.paper_engine:
-                    return jsonify(bot.paper_engine.get_trade_analytics())
-                else:
-                    return jsonify({'error': 'Paper trading not initialized'}), 400
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
-        
-        @app.route('/api/paper/reset', methods=['POST'])
-        def api_paper_reset():
-            """Reset paper trading portfolio"""
-            try:
-                if bot.paper_engine:
-                    data = request.get_json() or {}
-                    new_capital = data.get('capital', 100000)
-                    bot.paper_engine.reset_portfolio(new_capital)
+        try:
+            for symbol, position in self.active_positions.items():
+                if position.get('quantity', 0) > 0:
+                    if self.trading_mode == 'live':
+                        await self.goodwill_api.place_sell_order(
+                            symbol=symbol,
+                            quantity=position['quantity'],
+                            order_type='MARKET'
+                        )
+                    else:
+                        await self.paper_engine.close_position(symbol)
+            
+            self.logger.info("All positions closed")
+            
+        except Exception as e:
+            self.logger.error(f"Error closing positions: {e}")
+    
+    async def _log_trade(self, signal: TradingSignal, result: dict, mode: str):
+        """Log executed trade"""
+        try:
+            trade_data = {
+                'timestamp': signal.timestamp,
+                'symbol': signal.symbol,
+                'action': signal.action,
+                'strategy': signal.strategy,
+                'quantity': signal.quantity,
+                'price': signal.price,
+                'confidence': signal.confidence,
+                'mode': mode,
+                'result': result,
+                'stop_loss': signal.stop_loss,
+                'take_profit': signal.take_profit
+            }
+            
+            await self.db_manager.log_trade(trade_data)
+            
+            with self.lock:
+                self.performance_metrics['total_trades'] += 1
+            
+        except Exception as e:
+            self.logger.error(f"Trade logging error: {e}")
+    
+    async def _calculate_portfolio_value(self) -> float:
+        """Calculate current portfolio value"""
+        try:
+            if self.trading_mode == 'live':
+                account_info = await self.goodwill_api.get_account_info()
+                return account_info.get('total_value', 0.0)
+            else:
+                return await self.paper_engine.get_portfolio_value()
+        except Exception as e:
+            self.logger.error(f"Portfolio value calculation error: {e}")
+            return 0.0
+    
+    async def _calculate_daily_pnl(self) -> float:
+        """Calculate daily P&L"""
+        try:
+            today = datetime.now().date()
+            trades = await self.db_manager.get_trades_by_date(today)
+            
+            daily_pnl = 0.0
+            for trade in trades:
+                if trade.get('status') == 'FILLED':
+                    pnl = trade.get('realized_pnl', 0.0)
+                    daily_pnl += pnl
+            
+            return daily_pnl
+            
+        except Exception as e:
+            self.logger.error(f"Daily P&L calculation error: {e}")
+            return 0.0
+    
+    async def _calculate_performance_metrics(self) -> dict:
+        """Calculate comprehensive performance metrics"""
+        try:
+            trades = await self.db_manager.get_all_trades()
+            
+            winning_trades = [t for t in trades if t.get('realized_pnl', 0) > 0]
+            losing_trades = [t for t in trades if t.get('realized_pnl', 0) < 0]
+            
+            total_pnl = sum(t.get('realized_pnl', 0) for t in trades)
+            
+            win_rate = len(winning_trades) / len(trades) if trades else 0
+            avg_win = sum(t.get('realized_pnl', 0) for t in winning_trades) / len(winning_trades) if winning_trades else 0
+            avg_loss = sum(t.get('realized_pnl', 0) for t in losing_trades) / len(losing_trades) if losing_trades else 0
+            
+            return {
+                'total_trades': len(trades),
+                'winning_trades': len(winning_trades),
+                'losing_trades': len(losing_trades),
+                'win_rate': win_rate,
+                'avg_win': avg_win,
+                'avg_loss': avg_loss,
+                'total_pnl': total_pnl,
+                'profit_factor': abs(avg_win / avg_loss) if avg_loss != 0 else 0
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Performance metrics calculation error: {e}")
+            return {}
+    
+    async def _check_position_sizes(self):
+        """Check and validate position sizes"""
+        try:
+            max_position_value = self.config.get('max_position_value', 25000)
+            
+            for symbol, position in self.active_positions.items():
+                position_value = position.get('value', 0)
+                if position_value > max_position_value:
+                    self.logger.warning(f"Position {symbol} exceeds max size: {position_value}")
+                    # Optionally close or reduce position
                     
-                    return jsonify({
-                        'success': True,
-                        'message': f'Portfolio reset with ₹{new_capital:,.2f}'
-                    })
+        except Exception as e:
+            self.logger.error(f"Position size check error: {e}")
+    
+    async def _process_exit_conditions(self):
+        """Process stop-loss and take-profit conditions"""
+        try:
+            for symbol, position in self.active_positions.items():
+                current_price = await self.data_manager.get_current_price(symbol)
+                
+                if not current_price:
+                    continue
+                
+                entry_price = position.get('entry_price', 0)
+                quantity = position.get('quantity', 0)
+                stop_loss = position.get('stop_loss')
+                take_profit = position.get('take_profit')
+                
+                if quantity > 0:  # Long position
+                    if stop_loss and current_price <= stop_loss:
+                        await self._execute_exit_order(symbol, quantity, 'STOP_LOSS', current_price)
+                    elif take_profit and current_price >= take_profit:
+                        await self._execute_exit_order(symbol, quantity, 'TAKE_PROFIT', current_price)
+                
+                elif quantity < 0:  # Short position
+                    if stop_loss and current_price >= stop_loss:
+                        await self._execute_exit_order(symbol, abs(quantity), 'STOP_LOSS', current_price)
+                    elif take_profit and current_price <= take_profit:
+                        await self._execute_exit_order(symbol, abs(quantity), 'TAKE_PROFIT', current_price)
+                        
+        except Exception as e:
+            self.logger.error(f"Exit conditions processing error: {e}")
+    
+    async def _execute_exit_order(self, symbol: str, quantity: int, reason: str, price: float):
+        """Execute exit order (stop-loss or take-profit)"""
+        try:
+            if self.trading_mode == 'live':
+                result = await self.goodwill_api.place_sell_order(
+                    symbol=symbol,
+                    quantity=quantity,
+                    price=price,
+                    order_type='MARKET'
+                )
+            else:
+                result = await self.paper_engine.execute_trade(
+                    symbol=symbol,
+                    action='SELL',
+                    quantity=quantity,
+                    price=price,
+                    strategy=f'EXIT_{reason}'
+                )
+            
+            if result and result.get('success'):
+                self.logger.info(f"✅ {reason}: Sold {quantity} {symbol} @ {price}")
+                
+                # Log the exit trade
+                exit_signal = TradingSignal(
+                    symbol=symbol,
+                    action='SELL',
+                    strategy=f'EXIT_{reason}',
+                    confidence=1.0,
+                    price=price,
+                    quantity=quantity
+                )
+                await self._log_trade(exit_signal, result, self.trading_mode)
+            
+        except Exception as e:
+            self.logger.error(f"Exit order execution error: {e}")
+    
+    # Public API methods for dashboard control
+    async def get_status(self) -> dict:
+        """Get comprehensive bot status"""
+        next_scheduled_job = None
+        if self.scheduler.running and self.scheduler.get_jobs():
+            next_job = min(self.scheduler.get_jobs(), key=lambda x: x.next_run_time)
+            next_scheduled_job = {
+                'id': next_job.id,
+                'next_run': next_job.next_run_time.isoformat() if next_job.next_run_time else None
+            }
+        
+        return {
+            'is_running': self.is_running,
+            'trading_mode': self.trading_mode,
+            'market_open': self._is_market_open(),
+            'auto_schedule_enabled': self.auto_schedule_enabled,
+            'is_scheduled_session': self.is_scheduled_session,
+            'new_positions_allowed': self.new_positions_allowed,
+            'active_positions': len(self.active_positions),
+            'pending_orders': len(self.pending_orders),
+            'performance': self.performance_metrics.copy(),
+            'next_scheduled_event': next_scheduled_job,
+            'timestamp': datetime.now().isoformat()
+        }
+    
+    async def get_positions(self) -> dict:
+        """Get current positions with detailed info"""
+        with self.lock:
+            detailed_positions = {}
+            
+            for symbol, position in self.active_positions.items():
+                current_price = await self.data_manager.get_current_price(symbol)
+                entry_price = position.get('entry_price', 0)
+                quantity = position.get('quantity', 0)
+                
+                unrealized_pnl = 0
+                if current_price and entry_price and quantity:
+                    unrealized_pnl = (current_price - entry_price) * quantity
+                
+                detailed_positions[symbol] = {
+                    **position,
+                    'current_price': current_price,
+                    'unrealized_pnl': unrealized_pnl,
+                    'pnl_percentage': (unrealized_pnl / (entry_price * abs(quantity)) * 100) if entry_price and quantity else 0
+                }
+            
+            return detailed_positions
+    
+    async def get_performance_metrics(self) -> dict:
+        """Get detailed performance metrics"""
+        with self.lock:
+            metrics = self.performance_metrics.copy()
+        
+        # Add additional calculated metrics
+        portfolio_value = await self._calculate_portfolio_value()
+        initial_capital = self.config.get('initial_capital', 100000)
+        
+        metrics.update({
+            'portfolio_value': portfolio_value,
+            'initial_capital': initial_capital,
+            'total_return_pct': ((portfolio_value - initial_capital) / initial_capital * 100) if initial_capital else 0,
+            'daily_return_pct': (metrics['daily_pnl'] / portfolio_value * 100) if portfolio_value else 0
+        })
+        
+        return metrics
+    
+    async def get_today_trades(self) -> list:
+        """Get today's trades"""
+        try:
+            today = datetime.now().date()
+            trades = await self.db_manager.get_trades_by_date(today)
+            return trades
+        except Exception as e:
+            self.logger.error(f"Error fetching today's trades: {e}")
+            return []
+    
+    async def get_active_strategies(self) -> dict:
+        """Get active trading strategies status"""
+        try:
+            return await self.strategy_manager.get_strategy_status()
+        except Exception as e:
+            self.logger.error(f"Error fetching strategy status: {e}")
+            return {}
+    
+    async def toggle_strategy(self, strategy_name: str, enabled: bool):
+        """Enable/disable a specific strategy"""
+        try:
+            await self.strategy_manager.toggle_strategy(strategy_name, enabled)
+            self.logger.info(f"Strategy {strategy_name} {'enabled' if enabled else 'disabled'}")
+        except Exception as e:
+            self.logger.error(f"Error toggling strategy {strategy_name}: {e}")
+            raise
+    
+    async def update_risk_parameters(self, params: dict):
+        """Update risk management parameters"""
+        try:
+            # Update configuration
+            for key, value in params.items():
+                if key in ['max_daily_loss', 'max_position_size', 'max_portfolio_exposure', 'max_symbol_exposure']:
+                    self.config.set(key, value)
+            
+            await self.config.save()
+            self.logger.info(f"Risk parameters updated: {params}")
+            
+        except Exception as e:
+            self.logger.error(f"Error updating risk parameters: {e}")
+            raise
+    
+    async def manual_trade(self, symbol: str, action: str, quantity: int, price: float = None):
+        """Execute a manual trade"""
+        try:
+            if not self._is_market_open():
+                raise Exception("Market is closed")
+            
+            current_price = price or await self.data_manager.get_current_price(symbol)
+            if not current_price:
+                raise Exception(f"Could not get price for {symbol}")
+            
+            # Create manual signal
+            signal = TradingSignal(
+                symbol=symbol,
+                action=action,
+                strategy='MANUAL',
+                confidence=1.0,
+                price=current_price,
+                quantity=quantity
+            )
+            
+            # Validate and execute
+            if await self._validate_signal(signal):
+                if self.trading_mode == 'live':
+                    await self._execute_live_signal(signal)
                 else:
-                    return jsonify({'success': False, 'message': 'Paper trading not initialized'}), 400
-            except Exception as e:
-                return jsonify({'success': False, 'message': str(e)}), 500
+                    await self._execute_paper_signal(signal)
+                
+                return {'success': True, 'message': f'Manual trade executed: {action} {quantity} {symbol}'}
+            else:
+                return {'success': False, 'message': 'Trade validation failed'}
+                
+        except Exception as e:
+            self.logger.error(f"Manual trade error: {e}")
+            return {'success': False, 'message': str(e)}
     
-    return app
+    async def close_position(self, symbol: str):
+        """Manually close a specific position"""
+        try:
+            if symbol not in self.active_positions:
+                return {'success': False, 'message': f'No active position for {symbol}'}
+            
+            position = self.active_positions[symbol]
+            quantity = abs(position.get('quantity', 0))
+            
+            if quantity > 0:
+                current_price = await self.data_manager.get_current_price(symbol)
+                await self._execute_exit_order(symbol, quantity, 'MANUAL_CLOSE', current_price)
+                return {'success': True, 'message': f'Position {symbol} closed'}
+            else:
+                return {'success': False, 'message': f'No quantity to close for {symbol}'}
+                
+        except Exception as e:
+            self.logger.error(f"Error closing position {symbol}: {e}")
+            return {'success': False, 'message': str(e)}
+    
+    async def enable_auto_schedule(self, enabled: bool):
+        """Enable/disable auto-scheduling"""
+        try:
+            self.auto_schedule_enabled = enabled
+            self.config.set('auto_schedule', enabled)
+            await self.config.save()
+            
+            if enabled and not self.scheduler.running:
+                await self._setup_auto_schedule()
+                self.scheduler.start()
+                self.logger.info("Auto-scheduling enabled and started")
+            elif not enabled and self.scheduler.running:
+                self.scheduler.shutdown(wait=False)
+                self.logger.info("Auto-scheduling disabled")
+            
+            return {'success': True, 'message': f'Auto-schedule {"enabled" if enabled else "disabled"}'}
+            
+        except Exception as e:
+            self.logger.error(f"Error toggling auto-schedule: {e}")
+            return {'success': False, 'message': str(e)}
+    
+    async def force_market_close_procedures(self):
+        """Manually trigger market close procedures"""
+        try:
+            await self._scheduled_market_close_prep()
+            await self._scheduled_post_market_stop()
+            return {'success': True, 'message': 'Market close procedures executed'}
+        except Exception as e:
+            self.logger.error(f"Error in force market close: {e}")
+            return {'success': False, 'message': str(e)}
+    
+    async def get_system_health(self) -> dict:
+        """Get comprehensive system health status"""
+        try:
+            health_status = {
+                'timestamp': datetime.now().isoformat(),
+                'overall_status': 'HEALTHY',
+                'components': {
+                    'data_manager': {'status': 'CONNECTED' if hasattr(self.data_manager, 'is_connected') and self.data_manager.is_connected else 'DISCONNECTED'},
+                    'websocket_manager': {'status': 'CONNECTED' if hasattr(self.websocket_manager, 'is_connected') and self.websocket_manager.is_connected else 'DISCONNECTED'},
+                    'goodwill_api': {'status': 'AUTHENTICATED' if self.trading_mode == 'live' and await self.goodwill_api.is_authenticated() else 'N/A'},
+                    'paper_engine': {'status': 'ACTIVE' if self.trading_mode == 'paper' else 'N/A'},
+                    'database': {'status': 'CONNECTED' if hasattr(self.db_manager, 'is_connected') and self.db_manager.is_connected else 'UNKNOWN'},
+                    'scheduler': {'status': 'RUNNING' if self.scheduler.running else 'STOPPED'},
+                    'monitor': {'status': 'ACTIVE' if hasattr(self.monitor, 'is_running') and self.monitor.is_running else 'INACTIVE'}
+                },
+                'market_status': {
+                    'is_open': self._is_market_open(),
+                    'trading_allowed': self.new_positions_allowed,
+                    'current_time': datetime.now().strftime('%H:%M:%S'),
+                    'market_open_time': self.market_open_time,
+                    'market_close_time': self.market_close_time
+                },
+                'performance': {
+                    'active_positions': len(self.active_positions),
+                    'pending_orders': len(self.pending_orders),
+                    'daily_pnl': self.performance_metrics.get('daily_pnl', 0),
+                    'total_trades_today': len(await self.get_today_trades())
+                }
+            }
+            
+            # Determine overall health
+            component_issues = [comp for comp, status in health_status['components'].items() 
+                              if status['status'] in ['DISCONNECTED', 'INACTIVE'] and status['status'] != 'N/A']
+            
+            if component_issues:
+                health_status['overall_status'] = 'WARNING'
+                health_status['issues'] = component_issues
+            
+            return health_status
+            
+        except Exception as e:
+            self.logger.error(f"System health check error: {e}")
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'overall_status': 'ERROR',
+                'error': str(e)
+            }
 
-
-# Production Runner
-def run_production_bot():
-    """Main function to run the bot in production"""
-    try:
-        logger.info("🚀 Starting FlyingBuddha Trading Bot - Production Mode")
-        
-        # Initialize bot
-        bot = TradingBot()
-        
-        # Start bot
-        if not bot.start():
-            logger.error("❌ Failed to start trading bot")
-            return False
-        
-        # Create Flask app
-        app = create_flask_app(bot)
-        
-        # Run Flask app
-        logger.info("🌐 Starting web dashboard on port 5000")
-        app.run(host='0.0.0.0', port=5000, debug=False)
-        
-    except KeyboardInterrupt:
-        logger.info("🛑 Keyboard interrupt received")
-    except Exception as e:
-        logger.error(f"❌ Production runner error: {e}")
-        logger.error(traceback.format_exc())
-    finally:
-        if 'bot' in locals():
-            bot.graceful_shutdown()
-
-
-# Development Runner
-def run_development_bot():
-    """Run bot in development mode with debugging"""
-    try:
-        logger.info("🔧 Starting FlyingBuddha Trading Bot - Development Mode")
-        
-        # Set debug logging
-        logging.getLogger().setLevel(logging.DEBUG)
-        
-        # Initialize bot
-        bot = TradingBot()
-        
-        # Enable paper trading for development
-        bot.paper_mode = True
-        if not bot.paper_engine:
-            bot.init_paper_trading()
-        
-        # Start bot
-        if not bot.start():
-            logger.error("❌ Failed to start trading bot")
-            return False
-        
-        # Create Flask app
-        app = create_flask_app(bot)
-        
-        # Run Flask app in debug mode
-        logger.info("🌐 Starting development server on port 5000")
-        app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
-        
-    except KeyboardInterrupt:
-        logger.info("🛑 Development mode stopped")
-    except Exception as e:
-        logger.error(f"❌ Development runner error: {e}")
-        logger.error(traceback.format_exc())
-    finally:
-        if 'bot' in locals():
-            bot.graceful_shutdown()
-
-
+# Main execution
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "dev":
-        run_development_bot()
-    else:
-        run_production_bot()
+    async def main():
+        """Main execution function"""
+        bot = TradingBotCore()
+        
+        try:
+            self.logger.info("🚀 Starting Advanced Trading Bot with Auto-Scheduling...")
+            await bot.start()
+            
+        except KeyboardInterrupt:
+            bot.logger.info("👋 Shutdown requested by user")
+            await bot.stop()
+            
+        except Exception as e:
+            bot.logger.error(f"💥 Bot crashed: {e}")
+            await bot.stop()
+            raise
+
+    # Run the bot
+    asyncio.run(main())
