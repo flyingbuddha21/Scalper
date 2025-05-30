@@ -1,1332 +1,1214 @@
-#!/usr/bin/env python3
 """
-Enhanced Paper Trading Engine with Advanced Risk Management Integration
-Production-ready paper trading with realistic execution, slippage simulation, and risk controls
+Paper Trading Engine for Indian Market Trading Bot
+Simulates realistic trading with all services connected except real order execution
+Provides identical experience to live trading for testing and validation
 """
 
-import numpy as np
-import pandas as pd
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field
-from collections import deque
-import sqlite3
-import json
-import uuid
 import asyncio
 import random
+import time
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from enum import Enum
+import threading
+from collections import defaultdict, deque
+import json
+import os
 
-logger = logging.getLogger(__name__)
+from config_manager import get_config
+from utils import (
+    calculate_position_size, calculate_dynamic_stop_loss, calculate_portfolio_risk,
+    format_currency, format_percentage
+)
+from strategy_manager import ScalpingSignal, SignalType, get_strategy_manager
+from data_manager import get_data_manager
+from goodwill_api_handler import get_goodwill_handler
+
+class PaperOrderStatus(Enum):
+    """Paper trading order status"""
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    PARTIAL_FILLED = "PARTIAL_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
+class PaperOrderType(Enum):
+    """Paper trading order types"""
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+    STOP_LOSS = "STOP_LOSS"
+    STOP_LIMIT = "STOP_LIMIT"
+    BRACKET = "BRACKET"
+
+@dataclass
+class PaperOrder:
+    """Paper trading order structure"""
+    order_id: str
+    symbol: str
+    side: str  # BUY/SELL
+    order_type: PaperOrderType
+    quantity: int
+    price: float
+    stop_price: float
+    trigger_price: float
+    time_in_force: str
+    status: PaperOrderStatus
+    filled_qty: int
+    remaining_qty: int
+    avg_price: float
+    commission: float
+    slippage: float
+    timestamp: datetime
+    fill_timestamp: Optional[datetime]
+    parent_signal_id: Optional[str]
+    exchange: str
+    product: str
+    notes: str
 
 @dataclass
 class PaperPosition:
-    """Enhanced paper trading position"""
+    """Paper trading position structure"""
     symbol: str
-    side: str  # 'BUY' or 'SELL'
+    side: str  # LONG/SHORT/FLAT
     quantity: int
-    entry_price: float
-    entry_time: datetime
-    current_price: float = 0.0
-    
-    # Risk management integration
-    stop_loss: float = 0.0
-    profit_target: float = 0.0
-    trailing_stop: float = 0.0
-    position_size_method: str = "RISK_BASED"
-    risk_amount: float = 0.0
-    
-    # Performance tracking
-    unrealized_pnl: float = 0.0
-    realized_pnl: float = 0.0
-    max_drawdown: float = 0.0
-    max_profit: float = 0.0
-    
-    # Execution details
-    entry_slippage: float = 0.0
-    entry_commission: float = 0.0
-    order_id: str = ""
-    
-    # Market data tracking
-    highest_price: float = 0.0
-    lowest_price: float = 0.0
-    
-    def calculate_pnl(self, current_price: float) -> float:
-        """Calculate current unrealized P&L with realistic factors"""
-        self.current_price = current_price
-        
-        if self.side == 'BUY':
-            pnl_per_share = current_price - self.entry_price
-            
-            # Track highest price for trailing
-            if current_price > self.highest_price:
-                self.highest_price = current_price
-                
-        else:  # SELL
-            pnl_per_share = self.entry_price - current_price
-            
-            # Track lowest price for trailing
-            if current_price < self.lowest_price or self.lowest_price == 0:
-                self.lowest_price = current_price
-        
-        self.unrealized_pnl = pnl_per_share * self.quantity
-        
-        # Update max profit and drawdown
-        if self.unrealized_pnl > self.max_profit:
-            self.max_profit = self.unrealized_pnl
-        
-        drawdown = self.max_profit - self.unrealized_pnl
-        if drawdown > self.max_drawdown:
-            self.max_drawdown = drawdown
-            
-        return self.unrealized_pnl
-    
-    def to_dict(self) -> Dict:
-        return {
-            'symbol': self.symbol,
-            'side': self.side,
-            'quantity': self.quantity,
-            'entry_price': self.entry_price,
-            'entry_time': self.entry_time.isoformat(),
-            'current_price': self.current_price,
-            'stop_loss': self.stop_loss,
-            'profit_target': self.profit_target,
-            'trailing_stop': self.trailing_stop,
-            'unrealized_pnl': round(self.unrealized_pnl, 2),
-            'max_drawdown': round(self.max_drawdown, 2),
-            'max_profit': round(self.max_profit, 2),
-            'position_size_method': self.position_size_method,
-            'risk_amount': self.risk_amount,
-            'entry_slippage': self.entry_slippage,
-            'entry_commission': self.entry_commission,
-            'order_id': self.order_id
-        }
+    avg_price: float
+    current_price: float
+    unrealized_pnl: float
+    realized_pnl: float
+    total_pnl: float
+    market_value: float
+    cost_basis: float
+    day_pnl: float
+    timestamp: datetime
+    entry_orders: List[str]
+    exit_orders: List[str]
+    stop_loss_price: float
+    take_profit_prices: List[float]
+    max_profit: float
+    max_loss: float
+    hold_time_seconds: int
+    commission_paid: float
 
 @dataclass
 class PaperTrade:
     """Completed paper trade record"""
     trade_id: str
     symbol: str
+    strategy: str
+    entry_time: datetime
+    exit_time: datetime
     side: str
     quantity: int
     entry_price: float
     exit_price: float
-    entry_time: datetime
-    exit_time: datetime
-    pnl: float
-    commission: float = 0.0
-    slippage: float = 0.0
-    hold_time_minutes: float = 0.0
-    exit_reason: str = "MANUAL"
-    max_favorable_excursion: float = 0.0
-    max_adverse_excursion: float = 0.0
-    
-    def to_dict(self) -> Dict:
-        return {
-            'trade_id': self.trade_id,
-            'symbol': self.symbol,
-            'side': self.side,
-            'quantity': self.quantity,
-            'entry_price': self.entry_price,
-            'exit_price': self.exit_price,
-            'entry_time': self.entry_time.isoformat(),
-            'exit_time': self.exit_time.isoformat(),
-            'pnl': round(self.pnl, 2),
-            'commission': self.commission,
-            'slippage': self.slippage,
-            'hold_time_minutes': round(self.hold_time_minutes, 1),
-            'exit_reason': self.exit_reason,
-            'max_favorable_excursion': round(self.max_favorable_excursion, 2),
-            'max_adverse_excursion': round(self.max_adverse_excursion, 2)
-        }
+    gross_pnl: float
+    commission: float
+    slippage_cost: float
+    net_pnl: float
+    hold_time_seconds: int
+    max_profit: float
+    max_loss: float
+    exit_reason: str
+    success: bool
+    confidence: float
 
-class EnhancedPaperTradingEngine:
+class RealisticPaperTradingEngine:
     """
-    Enhanced Paper Trading Engine with Risk Management Integration
-    
-    Features:
-    - Realistic execution simulation with slippage
-    - Risk manager integration for position sizing
-    - Advanced performance analytics
-    - Kelly Criterion and volatility-based sizing
-    - Market impact simulation
-    - Commission and cost modeling
+    Advanced paper trading engine that simulates realistic market conditions
+    Connects with all bot services for authentic trading experience
     """
     
-    def __init__(self, initial_capital: float = 100000, 
-                 commission_per_trade: float = 20.0,
-                 max_positions: int = 10,
-                 risk_manager=None):
+    def __init__(self):
+        self.config = get_config()
+        self.data_manager = get_data_manager()
+        self.strategy_manager = get_strategy_manager()
+        self.goodwill_handler = get_goodwill_handler()
         
-        # Account settings
-        self.initial_capital = initial_capital
-        self.current_capital = initial_capital
-        self.available_capital = initial_capital
-        self.commission_per_trade = commission_per_trade
-        self.max_positions = max_positions
-        self.risk_manager = risk_manager
+        # Paper trading state
+        self.is_enabled = self.config.trading.paper_trading
+        self.starting_capital = 100000.0  # ₹1 Lakh starting capital
+        self.current_capital = self.starting_capital
+        self.available_cash = self.starting_capital
+        self.buying_power = self.starting_capital * 2.0  # 2x margin for intraday
         
-        # Position tracking
-        self.positions = {}  # symbol -> PaperPosition
-        self.trade_history = deque(maxlen=1000)
-        self.daily_pnl_history = deque(maxlen=365)
-        self.pending_orders = {}  # order_id -> order_details
+        # Order and position tracking
+        self.pending_orders: Dict[str, PaperOrder] = {}
+        self.filled_orders: Dict[str, PaperOrder] = {}
+        self.active_positions: Dict[str, PaperPosition] = {}
+        self.completed_trades: List[PaperTrade] = []
         
-        # Execution simulation parameters
-        self.base_slippage_bps = 2.0      # 2 basis points base slippage
-        self.volatility_slippage_factor = 0.5  # Additional slippage in volatile markets
-        self.market_impact_threshold = 50000   # Order value for market impact
-        self.max_slippage_bps = 20.0      # Maximum slippage cap
-        
-        # Performance metrics
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.losing_trades = 0
-        self.win_rate = 0.0
-        self.avg_win = 0.0
-        self.avg_loss = 0.0
-        self.profit_factor = 0.0
-        self.sharpe_ratio = 0.0
-        self.max_drawdown = 0.0
-        self.current_drawdown = 0.0
-        self.peak_capital = initial_capital
-        
-        # Kelly Criterion and position sizing
-        self.kelly_lookback_trades = 30
-        self.recent_trades = deque(maxlen=self.kelly_lookback_trades)
-        self.position_sizing_methods = ['FIXED', 'KELLY', 'VOLATILITY_ADJUSTED', 'RISK_BASED']
-        
-        # Market data for realistic simulation
-        self.market_data_cache = {}
-        self.volatility_cache = {}
-        
-        # Database for persistence
-        self.db_path = "paper_trading.db"
-        self._init_database()
-        
-        logger.info(f"💰 Enhanced Paper Trading Engine initialized with ₹{initial_capital:,.2f}")
-    
-    def _init_database(self):
-        """Initialize SQLite database for trade history"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Create enhanced trades table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS paper_trades (
-                    trade_id TEXT PRIMARY KEY,
-                    symbol TEXT,
-                    side TEXT,
-                    quantity INTEGER,
-                    entry_price REAL,
-                    exit_price REAL,
-                    entry_time TEXT,
-                    exit_time TEXT,
-                    pnl REAL,
-                    commission REAL,
-                    slippage REAL,
-                    hold_time_minutes REAL,
-                    exit_reason TEXT,
-                    max_favorable_excursion REAL,
-                    max_adverse_excursion REAL,
-                    position_size_method TEXT,
-                    risk_amount REAL
-                )
-            ''')
-            
-            # Create daily performance table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS daily_performance (
-                    date TEXT PRIMARY KEY,
-                    capital REAL,
-                    daily_pnl REAL,
-                    trades_count INTEGER,
-                    win_rate REAL,
-                    max_drawdown REAL,
-                    sharpe_ratio REAL
-                )
-            ''')
-            
-            # Create positions table for current positions
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS current_positions (
-                    symbol TEXT PRIMARY KEY,
-                    side TEXT,
-                    quantity INTEGER,
-                    entry_price REAL,
-                    entry_time TEXT,
-                    stop_loss REAL,
-                    profit_target REAL,
-                    position_size_method TEXT,
-                    risk_amount REAL
-                )
-            ''')
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Database initialization warning: {e}")
-    
-    def update_market_data(self, symbol: str, price: float, volume: int = 0, 
-                          bid: float = None, ask: float = None, volatility: float = None):
-        """Update market data for realistic execution simulation"""
-        try:
-            self.market_data_cache[symbol] = {
-                'price': price,
-                'volume': volume,
-                'bid': bid or price * 0.999,
-                'ask': ask or price * 1.001,
-                'timestamp': datetime.now(),
-                'spread': (ask - bid) if (ask and bid) else price * 0.002
-            }
-            
-            if volatility:
-                self.volatility_cache[symbol] = volatility
-            
-            # Update positions with current price
-            if symbol in self.positions:
-                self.positions[symbol].calculate_pnl(price)
-                
-        except Exception as e:
-            logger.error(f"❌ Market data update error for {symbol}: {e}")
-    
-    def calculate_optimal_position_size(self, symbol: str, entry_price: float, 
-                                      stop_loss_price: float, confidence: float = 50.0,
-                                      method: str = "RISK_BASED") -> Dict:
-        """Calculate optimal position size using various methods with risk manager integration"""
-        try:
-            # Use risk manager if available
-            if self.risk_manager:
-                risk_decision = self.risk_manager.should_enter_trade(
-                    symbol=symbol,
-                    side="BUY",  # Default side for position sizing
-                    confidence=confidence,
-                    entry_price=entry_price
-                )
-                
-                if risk_decision['allow_trade']:
-                    return {
-                        'quantity': risk_decision['position_size'],
-                        'position_value': risk_decision['position_size'] * entry_price,
-                        'risk_amount': risk_decision['position_size'] * entry_price * (risk_decision['stop_loss_pct'] / 100),
-                        'risk_percentage': risk_decision['stop_loss_pct'],
-                        'method_used': 'RISK_MANAGER',
-                        'confidence_applied': confidence,
-                        'max_risk_per_trade': risk_decision.get('stop_loss_pct', 2.0)
-                    }
-                else:
-                    return {
-                        'quantity': 0,
-                        'position_value': 0,
-                        'risk_amount': 0,
-                        'risk_percentage': 0,
-                        'method_used': 'REJECTED',
-                        'rejection_reason': risk_decision['reason']
-                    }
-            
-            # Fallback to internal position sizing if no risk manager
-            return self._internal_position_sizing(symbol, entry_price, stop_loss_price, confidence, method)
-            
-        except Exception as e:
-            logger.error(f"❌ Position size calculation error: {e}")
-            return self._safe_default_sizing(entry_price)
-    
-    def _internal_position_sizing(self, symbol: str, entry_price: float, 
-                                stop_loss_price: float, confidence: float, method: str) -> Dict:
-        """Internal position sizing methods"""
-        try:
-            base_risk_amount = self.available_capital * 0.02  # 2% base risk
-            
-            if method == "FIXED":
-                position_value = self.available_capital * 0.1
-                quantity = int(position_value / entry_price)
-                
-            elif method == "KELLY":
-                kelly_fraction = self._calculate_kelly_fraction()
-                if kelly_fraction > 0:
-                    position_value = self.available_capital * kelly_fraction * 0.25  # Conservative Kelly
-                    quantity = int(position_value / entry_price)
-                else:
-                    position_value = self.available_capital * 0.05
-                    quantity = int(position_value / entry_price)
-                    
-            elif method == "VOLATILITY_ADJUSTED":
-                volatility = self.volatility_cache.get(symbol, 20.0)  # Default 20% volatility
-                volatility_factor = max(0.5, min(2.0, 20.0 / volatility))  # Inverse relationship
-                base_position_value = self.available_capital * 0.1
-                adjusted_position_value = base_position_value * volatility_factor
-                quantity = int(adjusted_position_value / entry_price)
-                
-            else:  # RISK_BASED (default)
-                if stop_loss_price > 0:
-                    risk_per_share = abs(entry_price - stop_loss_price)
-                    quantity = int(base_risk_amount / risk_per_share) if risk_per_share > 0 else 1
-                else:
-                    quantity = int(base_risk_amount / (entry_price * 0.02))
-            
-            # Apply confidence adjustment
-            confidence_multiplier = confidence / 100.0
-            quantity = int(quantity * confidence_multiplier)
-            
-            # Apply position limits
-            max_position_value = self.available_capital * 0.2  # 20% max
-            max_quantity = int(max_position_value / entry_price)
-            quantity = max(1, min(quantity, max_quantity))
-            
-            # Calculate final metrics
-            position_value = quantity * entry_price
-            risk_amount = quantity * abs(entry_price - stop_loss_price) if stop_loss_price > 0 else position_value * 0.02
-            
-            return {
-                'quantity': quantity,
-                'position_value': position_value,
-                'risk_amount': risk_amount,
-                'risk_percentage': (risk_amount / self.available_capital) * 100,
-                'method_used': method,
-                'confidence_applied': confidence,
-                'kelly_fraction': self._calculate_kelly_fraction() if method == "KELLY" else 0.0
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Internal position sizing error: {e}")
-            return self._safe_default_sizing(entry_price)
-    
-    def _safe_default_sizing(self, entry_price: float) -> Dict:
-        """Safe default position sizing"""
-        quantity = max(1, int(self.available_capital * 0.05 / entry_price))  # 5% of capital
-        return {
-            'quantity': quantity,
-            'position_value': quantity * entry_price,
-            'risk_amount': quantity * entry_price * 0.02,
-            'risk_percentage': 2.0,
-            'method_used': 'SAFE_DEFAULT',
-            'confidence_applied': 50.0
+        # Realistic simulation parameters
+        self.simulation_config = {
+            'market_slippage': 0.001,      # 0.1% market order slippage
+            'limit_slippage': 0.0002,      # 0.02% limit order slippage
+            'fill_probability': 0.95,      # 95% fill rate for market orders
+            'partial_fill_probability': 0.1,  # 10% chance of partial fills
+            'rejection_probability': 0.02,   # 2% order rejection rate
+            'latency_simulation': True,     # Simulate order latency
+            'min_latency_ms': 50,          # Minimum order latency
+            'max_latency_ms': 300,         # Maximum order latency
+            'weekend_trading': False,       # No weekend trading
+            'after_hours_spreads': 2.0     # 2x spreads in after hours
         }
+        
+        # Performance tracking
+        self.performance_metrics = {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'total_pnl': 0.0,
+            'total_commission': 0.0,
+            'total_slippage': 0.0,
+            'max_drawdown': 0.0,
+            'max_portfolio_value': self.starting_capital,
+            'sharpe_ratio': 0.0,
+            'win_rate': 0.0,
+            'avg_trade_duration': 0.0,
+            'largest_win': 0.0,
+            'largest_loss': 0.0
+        }
+        
+        # Order ID counter
+        self.order_counter = 0
+        self.trade_counter = 0
+        
+        # Background processing
+        self.processing_enabled = True
+        self.processing_task: Optional[asyncio.Task] = None
+        
+        logging.info("Paper Trading Engine initialized with realistic simulation")
     
-    def _calculate_kelly_fraction(self) -> float:
-        """Calculate Kelly Criterion fraction based on recent trades"""
+    async def start_engine(self):
+        """Start the paper trading engine"""
         try:
-            if len(self.recent_trades) < 10:
-                return 0.0
+            if not self.is_enabled:
+                logging.warning("Paper trading is disabled in config")
+                return
             
-            wins = [trade for trade in self.recent_trades if trade.pnl > 0]
-            losses = [trade for trade in self.recent_trades if trade.pnl < 0]
+            # Load existing paper trading state if available
+            await self._load_state()
             
-            if len(wins) == 0 or len(losses) == 0:
-                return 0.0
+            # Start background processing
+            self.processing_task = asyncio.create_task(self._background_processing())
             
-            win_probability = len(wins) / len(self.recent_trades)
-            avg_win_pct = np.mean([trade.pnl / (trade.quantity * trade.entry_price) for trade in wins])
-            avg_loss_pct = abs(np.mean([trade.pnl / (trade.quantity * trade.entry_price) for trade in losses]))
+            # Connect to all services (same as live trading)
+            await self._connect_to_services()
             
-            if avg_loss_pct > 0:
-                b = avg_win_pct / avg_loss_pct
-                p = win_probability
-                q = 1 - p
-                kelly_fraction = (b * p - q) / b
-                return max(0.0, min(0.25, kelly_fraction))  # Cap at 25%
-            
-            return 0.0
-            
-        except Exception:
-            return 0.0
-    
-    def _simulate_execution_slippage(self, symbol: str, side: str, quantity: int, 
-                                   price: float, order_type: str = "MARKET") -> Dict:
-        """Simulate realistic execution slippage and market impact"""
-        try:
-            market_data = self.market_data_cache.get(symbol, {})
-            
-            # Base slippage
-            base_slippage = self.base_slippage_bps / 10000  # Convert bps to decimal
-            
-            # Volatility-based slippage
-            volatility = self.volatility_cache.get(symbol, 20.0)
-            volatility_slippage = (volatility / 20.0) * self.volatility_slippage_factor / 10000
-            
-            # Market impact based on order size
-            order_value = quantity * price
-            if order_value > self.market_impact_threshold:
-                impact_factor = min(2.0, order_value / self.market_impact_threshold)
-                market_impact = (impact_factor - 1.0) * 0.001  # Additional impact
-            else:
-                market_impact = 0.0
-            
-            # Order type impact
-            if order_type == "MARKET":
-                # Market orders get bid-ask spread impact
-                spread = market_data.get('spread', price * 0.002)
-                spread_impact = (spread / price) / 2  # Half spread
-            else:
-                spread_impact = 0.0  # Limit orders avoid spread
-            
-            # Random execution variation
-            random_slippage = random.uniform(-0.0001, 0.0001)  # ±1 bps random
-            
-            # Total slippage
-            total_slippage_pct = base_slippage + volatility_slippage + market_impact + spread_impact + random_slippage
-            total_slippage_pct = min(total_slippage_pct, self.max_slippage_bps / 10000)  # Cap slippage
-            
-            # Apply slippage direction
-            if side == 'BUY':
-                execution_price = price * (1 + total_slippage_pct)
-            else:  # SELL
-                execution_price = price * (1 - total_slippage_pct)
-            
-            return {
-                'execution_price': execution_price,
-                'slippage_pct': total_slippage_pct * 100,
-                'slippage_amount': abs(execution_price - price) * quantity,
-                'components': {
-                    'base_slippage': base_slippage * 100,
-                    'volatility_slippage': volatility_slippage * 100,
-                    'market_impact': market_impact * 100,
-                    'spread_impact': spread_impact * 100
-                }
-            }
+            logging.info("✅ Paper Trading Engine started successfully")
+            logging.info(f"💰 Starting Capital: ₹{self.starting_capital:,.2f}")
+            logging.info(f"💵 Available Cash: ₹{self.available_cash:,.2f}")
+            logging.info(f"⚡ Buying Power: ₹{self.buying_power:,.2f}")
             
         except Exception as e:
-            logger.error(f"❌ Execution simulation error: {e}")
-            return {
-                'execution_price': price,
-                'slippage_pct': 0.0,
-                'slippage_amount': 0.0,
-                'components': {}
-            }
+            logging.error(f"Error starting paper trading engine: {e}")
+            raise
     
-    async def execute_trade(self, symbol: str, side: str, quantity: int, 
-                           price: float, order_type: str = "MARKET") -> Dict:
-        """Execute paper trade with realistic simulation"""
+    async def _connect_to_services(self):
+        """Connect to all bot services (same as live trading)"""
         try:
-            # Validate trade parameters
-            if side.upper() == 'BUY':
-                return await self._execute_entry_trade(symbol, side, quantity, price, order_type)
-            else:  # SELL - exit existing position
-                return await self._execute_exit_trade(symbol, quantity, price, order_type)
-                
+            # Initialize data manager for real market data
+            if not self.data_manager.session:
+                await self.data_manager.initialize()
+            
+            # Connect to Goodwill API for market data (not for orders)
+            if not self.goodwill_handler.is_authenticated:
+                logging.info("📡 Paper trading will use simulated API responses")
+                # We can still get real market data even in paper trading mode
+            
+            logging.info("🔗 All services connected for paper trading")
+            
         except Exception as e:
-            logger.error(f"❌ Trade execution error: {e}")
-            return {'success': False, 'error': str(e)}
+            logging.error(f"Error connecting to services: {e}")
     
-    async def _execute_entry_trade(self, symbol: str, side: str, quantity: int, 
-                                  price: float, order_type: str) -> Dict:
-        """Execute entry trade (open position)"""
+    async def place_paper_order(self, signal: ScalpingSignal) -> Optional[str]:
+        """
+        Place a paper order based on trading signal
+        Simulates the complete order lifecycle with realistic behavior
+        """
         try:
-            # Check if position already exists
-            if symbol in self.positions:
-                return {
-                    'success': False,
-                    'error': f'Position already exists for {symbol}'
-                }
+            # Generate unique order ID
+            self.order_counter += 1
+            order_id = f"PAPER_{signal.symbol}_{int(time.time())}_{self.order_counter}"
             
-            # Check available capital
-            estimated_cost = quantity * price + self.commission_per_trade
-            if estimated_cost > self.available_capital:
-                return {
-                    'success': False,
-                    'error': 'Insufficient capital',
-                    'required': estimated_cost,
-                    'available': self.available_capital
-                }
+            # Determine order side
+            side = "BUY" if signal.signal_type == SignalType.BUY else "SELL"
             
-            # Simulate execution
-            execution_result = self._simulate_execution_slippage(symbol, side, quantity, price, order_type)
-            execution_price = execution_result['execution_price']
-            slippage_amount = execution_result['slippage_amount']
+            # Get current market data for realistic pricing
+            latest_tick = self.data_manager.get_latest_tick(signal.symbol)
+            if not latest_tick:
+                logging.warning(f"No market data available for {signal.symbol}, rejecting order")
+                return None
             
-            # Calculate total cost
-            position_cost = quantity * execution_price
-            total_cost = position_cost + self.commission_per_trade + slippage_amount
+            # Simulate pre-order validations (same as live trading)
+            if not await self._validate_paper_order(signal, latest_tick):
+                return None
             
-            # Create position
-            order_id = str(uuid.uuid4())
-            position = PaperPosition(
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                entry_price=execution_price,
-                entry_time=datetime.now(),
-                entry_slippage=execution_result['slippage_pct'],
-                entry_commission=self.commission_per_trade,
+            # Create paper order
+            paper_order = PaperOrder(
                 order_id=order_id,
-                highest_price=execution_price,
-                lowest_price=execution_price
-            )
-            
-            # Update capital
-            self.available_capital -= total_cost
-            
-            # Store position
-            self.positions[symbol] = position
-            
-            # Save to database
-            self._save_position_to_db(position)
-            
-            logger.info(f"📈 Paper trade executed: {symbol} {side} {quantity}@{execution_price:.2f} "
-                       f"(Slippage: {execution_result['slippage_pct']:.3f}%)")
-            
-            return {
-                'success': True,
-                'order_id': order_id,
-                'execution_price': execution_price,
-                'quantity': quantity,
-                'total_cost': total_cost,
-                'slippage': execution_result['slippage_pct'],
-                'commission': self.commission_per_trade,
-                'available_capital': self.available_capital
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Entry trade execution error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    async def _execute_exit_trade(self, symbol: str, quantity: int, 
-                                 price: float, order_type: str, exit_reason: str = "MANUAL") -> Dict:
-        """Execute exit trade (close position)"""
-        try:
-            if symbol not in self.positions:
-                return {
-                    'success': False,
-                    'error': f'No position found for {symbol}'
-                }
-            
-            position = self.positions[symbol]
-            
-            # Validate quantity
-            if quantity > position.quantity:
-                quantity = position.quantity  # Close partial or full position
-            
-            # Simulate execution
-            execution_result = self._simulate_execution_slippage(symbol, "SELL", quantity, price, order_type)
-            execution_price = execution_result['execution_price']
-            
-            # Calculate P&L
-            if position.side == 'BUY':
-                pnl_per_share = execution_price - position.entry_price
-            else:  # SELL position (short)
-                pnl_per_share = position.entry_price - execution_price
-            
-            gross_pnl = pnl_per_share * quantity
-            commission = self.commission_per_trade
-            slippage_cost = execution_result['slippage_amount']
-            net_pnl = gross_pnl - commission - slippage_cost
-            
-            # Calculate hold time
-            hold_time = (datetime.now() - position.entry_time).total_seconds() / 60
-            
-            # Create trade record
-            trade_id = str(uuid.uuid4())
-            trade = PaperTrade(
-                trade_id=trade_id,
-                symbol=symbol,
-                side=position.side,
-                quantity=quantity,
-                entry_price=position.entry_price,
-                exit_price=execution_price,
-                entry_time=position.entry_time,
-                exit_time=datetime.now(),
-                pnl=net_pnl,
-                commission=commission,
-                slippage=execution_result['slippage_pct'],
-                hold_time_minutes=hold_time,
-                exit_reason=exit_reason,
-                max_favorable_excursion=position.max_profit / quantity if quantity > 0 else 0,
-                max_adverse_excursion=position.max_drawdown / quantity if quantity > 0 else 0
-            )
-            
-            # Update capital
-            proceeds = quantity * execution_price - commission - slippage_cost
-            self.available_capital += proceeds
-            self.current_capital += net_pnl
-            
-            # Update position or remove if fully closed
-            if quantity == position.quantity:
-                # Full exit
-                del self.positions[symbol]
-                self._remove_position_from_db(symbol)
-            else:
-                # Partial exit
-                position.quantity -= quantity
-                position.realized_pnl += net_pnl
-                self._save_position_to_db(position)
-            
-            # Add to trade history
-            self.trade_history.append(trade)
-            self.recent_trades.append(trade)
-            
-            # Update performance metrics
-            self._update_performance_metrics(trade)
-            
-            # Save trade to database
-            self._save_trade_to_db(trade)
-            
-            # Update risk manager if available
-            if self.risk_manager:
-                self.risk_manager.update_performance(
-                    symbol=symbol,
-                    entry_price=position.entry_price,
-                    exit_price=execution_price,
-                    quantity=quantity,
-                    side=position.side,
-                    exit_reason=exit_reason
-                )
-            
-            logger.info(f"📉 Paper trade closed: {symbol} - P&L: ₹{net_pnl:.2f} ({exit_reason})")
-            
-            return {
-                'success': True,
-                'trade_id': trade_id,
-                'execution_price': execution_price,
-                'pnl': net_pnl,
-                'commission': commission,
-                'slippage': execution_result['slippage_pct'],
-                'hold_time_minutes': hold_time,
-                'current_capital': self.current_capital,
-                'available_capital': self.available_capital
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Exit trade execution error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def enter_position(self, symbol: str, side: str, entry_price: float, 
-                      stop_loss_pct: float = 2.0, profit_target_pct: float = 4.0,
-                      confidence: float = 50.0, position_size_method: str = "RISK_BASED") -> Dict:
-        """Enter position with risk management integration"""
-        try:
-            # Calculate optimal position size
-            stop_loss_price = entry_price * (1 - stop_loss_pct/100) if side == 'BUY' else entry_price * (1 + stop_loss_pct/100)
-            
-            sizing_result = self.calculate_optimal_position_size(
-                symbol=symbol,
-                entry_price=entry_price,
-                stop_loss_price=stop_loss_price,
-                confidence=confidence,
-                method=position_size_method
-            )
-            
-            if sizing_result['quantity'] == 0:
-                return {
-                    'success': False,
-                    'error': sizing_result.get('rejection_reason', 'Position size calculation failed'),
-                    'sizing_result': sizing_result
-                }
-            
-            # Execute the trade
-            result = asyncio.run(self.execute_trade(
-                symbol=symbol,
+                symbol=signal.symbol,
                 side=side,
-                quantity=sizing_result['quantity'],
-                price=entry_price,
-                order_type="LIMIT"
-            ))
+                order_type=PaperOrderType.MARKET,  # Start with market orders
+                quantity=signal.position_size,
+                price=signal.entry_price,
+                stop_price=0.0,
+                trigger_price=0.0,
+                time_in_force="IOC",
+                status=PaperOrderStatus.PENDING,
+                filled_qty=0,
+                remaining_qty=signal.position_size,
+                avg_price=0.0,
+                commission=0.0,
+                slippage=0.0,
+                timestamp=datetime.now(),
+                fill_timestamp=None,
+                parent_signal_id=id(signal),
+                exchange="NSE",  # Default to NSE
+                product="MIS",   # Intraday for scalping
+                notes=f"Strategy: {signal.strategy.value}, Confidence: {signal.confidence:.2f}"
+            )
             
-            if result['success']:
-                # Set stop loss and profit target
-                position = self.positions[symbol]
-                
-                if side == 'BUY':
-                    position.stop_loss = entry_price * (1 - stop_loss_pct/100)
-                    position.profit_target = entry_price * (1 + profit_target_pct/100)
-                else:
-                    position.stop_loss = entry_price * (1 + stop_loss_pct/100)
-                    position.profit_target = entry_price * (1 - profit_target_pct/100)
-                
-                position.position_size_method = position_size_method
-                position.risk_amount = sizing_result['risk_amount']
-                
-                # Update database
-                self._save_position_to_db(position)
-                
-                result['position_sizing'] = sizing_result
-                result['stop_loss'] = position.stop_loss
-                result['profit_target'] = position.profit_target
+            # Add to pending orders
+            self.pending_orders[order_id] = paper_order
             
-            return result
+            # Simulate order submission latency
+            if self.simulation_config['latency_simulation']:
+                latency = random.uniform(
+                    self.simulation_config['min_latency_ms'],
+                    self.simulation_config['max_latency_ms']
+                ) / 1000  # Convert to seconds
+                await asyncio.sleep(latency)
             
-        except Exception as e:
-            logger.error(f"❌ Enter position error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def exit_position(self, symbol: str, exit_reason: str = "MANUAL") -> Dict:
-        """Exit position using current market price"""
-        try:
-            if symbol not in self.positions:
-                return {'success': False, 'error': f'No position found for {symbol}'}
+            # Change status to submitted
+            paper_order.status = PaperOrderStatus.SUBMITTED
             
-            position = self.positions[symbol]
-            current_price = position.current_price or position.entry_price
+            # Schedule order processing
+            asyncio.create_task(self._process_order(order_id))
             
-            return asyncio.run(self._execute_exit_trade(
-                symbol=symbol,
-                quantity=position.quantity,
-                price=current_price,
-                order_type="MARKET",
-                exit_reason=exit_reason
-            ))
+            logging.info(f"📝 Paper order placed: {order_id} for {signal.symbol}")
+            logging.info(f"   {side} {signal.position_size} shares at market price")
+            logging.info(f"   Strategy: {signal.strategy.value} (Confidence: {signal.confidence:.2f})")
+            
+            return order_id
             
         except Exception as e:
-            logger.error(f"❌ Exit position error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def check_exit_conditions(self, symbol: str) -> Optional[Dict]:
-        """Check if position should be exited based on stop loss/profit target"""
-        try:
-            if symbol not in self.positions:
-                return None
-            
-            position = self.positions[symbol]
-            current_price = position.current_price
-            
-            if current_price <= 0:
-                return None
-            
-            # Check stop loss
-            if position.stop_loss > 0:
-                if position.side == 'BUY' and current_price <= position.stop_loss:
-                    return {
-                        'should_exit': True,
-                        'reason': 'STOP_LOSS',
-                        'trigger_price': position.stop_loss,
-                        'current_price': current_price
-                    }
-                elif position.side == 'SELL' and current_price >= position.stop_loss:
-                    return {
-                        'should_exit': True,
-                        'reason': 'STOP_LOSS',
-                        'trigger_price': position.stop_loss,
-                        'current_price': current_price
-                    }
-            
-            # Check profit target
-            if position.profit_target > 0:
-                if position.side == 'BUY' and current_price >= position.profit_target:
-                    return {
-                        'should_exit': True,
-                        'reason': 'PROFIT_TARGET',
-                        'trigger_price': position.profit_target,
-                        'current_price': current_price
-                    }
-                elif position.side == 'SELL' and current_price <= position.profit_target:
-                    return {
-                        'should_exit': True,
-                        'reason': 'PROFIT_TARGET',
-                        'trigger_price': position.profit_target,
-                        'current_price': current_price
-                    }
-            
-            # Check trailing stop if available
-            if position.trailing_stop > 0:
-                if position.side == 'BUY' and current_price <= position.trailing_stop:
-                    return {
-                        'should_exit': True,
-                        'reason': 'TRAILING_STOP',
-                        'trigger_price': position.trailing_stop,
-                        'current_price': current_price
-                    }
-                elif position.side == 'SELL' and current_price >= position.trailing_stop:
-                    return {
-                        'should_exit': True,
-                        'reason': 'TRAILING_STOP',
-                        'trigger_price': position.trailing_stop,
-                        'current_price': current_price
-                    }
-            
-            return {'should_exit': False, 'reason': 'NO_EXIT_CONDITION'}
-            
-        except Exception as e:
-            logger.error(f"❌ Exit condition check error: {e}")
+            logging.error(f"Error placing paper order: {e}")
             return None
     
-    def update_trailing_stop(self, symbol: str, trailing_distance_pct: float = 2.0) -> bool:
-        """Update trailing stop for position"""
+    async def _validate_paper_order(self, signal: ScalpingSignal, latest_tick) -> bool:
+        """Validate paper order (same validations as live trading)"""
         try:
-            if symbol not in self.positions:
+            # Check market hours
+            if not self.config.is_trading_hours():
+                logging.warning(f"Market is closed, rejecting order for {signal.symbol}")
                 return False
             
-            position = self.positions[symbol]
-            current_price = position.current_price
-            
-            if current_price <= 0:
+            # Check available cash
+            order_value = signal.entry_price * signal.position_size
+            if order_value > self.available_cash:
+                logging.warning(f"Insufficient cash for {signal.symbol}: need ₹{order_value:.2f}, have ₹{self.available_cash:.2f}")
                 return False
             
-            if position.side == 'BUY':
-                # Trail below current price
-                new_trailing_stop = current_price * (1 - trailing_distance_pct / 100)
-                # Only move trailing stop up
-                if new_trailing_stop > position.trailing_stop:
-                    position.trailing_stop = new_trailing_stop
-                    logger.info(f"📈 Updated trailing stop for {symbol}: {new_trailing_stop:.2f}")
-                    return True
-            else:  # SELL
-                # Trail above current price
-                new_trailing_stop = current_price * (1 + trailing_distance_pct / 100)
-                # Only move trailing stop down
-                if position.trailing_stop == 0 or new_trailing_stop < position.trailing_stop:
-                    position.trailing_stop = new_trailing_stop
-                    logger.info(f"📉 Updated trailing stop for {symbol}: {new_trailing_stop:.2f}")
-                    return True
+            # Check position limits
+            if len(self.active_positions) >= self.config.risk.max_positions:
+                logging.warning(f"Maximum positions limit reached: {len(self.active_positions)}")
+                return False
             
+            # Check if symbol already has position
+            if signal.symbol in self.active_positions:
+                logging.warning(f"Already have position in {signal.symbol}")
+                return False
+            
+            # Check portfolio risk
+            portfolio_risk = calculate_portfolio_risk(self.active_positions, self.current_capital)
+            if portfolio_risk['risk_percentage'] > self.config.risk.max_portfolio_risk * 100:
+                logging.warning(f"Portfolio risk too high: {portfolio_risk['risk_percentage']:.1f}%")
+                return False
+            
+            # Simulate random rejections (market conditions, etc.)
+            if random.random() < self.simulation_config['rejection_probability']:
+                rejection_reasons = [
+                    "Insufficient liquidity",
+                    "Price band hit",
+                    "Circuit breaker triggered",
+                    "Exchange connectivity issue"
+                ]
+                reason = random.choice(rejection_reasons)
+                logging.warning(f"Order rejected: {reason}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error validating paper order: {e}")
             return False
+    
+    async def _process_order(self, order_id: str):
+        """Process paper order with realistic market simulation"""
+        try:
+            order = self.pending_orders.get(order_id)
+            if not order:
+                return
+            
+            # Simulate processing delay
+            processing_delay = random.uniform(0.1, 0.5)  # 100-500ms
+            await asyncio.sleep(processing_delay)
+            
+            # Get current market data
+            latest_tick = self.data_manager.get_latest_tick(order.symbol)
+            if not latest_tick:
+                # Reject order if no market data
+                order.status = PaperOrderStatus.REJECTED
+                order.notes += " | Rejected: No market data"
+                del self.pending_orders[order_id]
+                return
+            
+            # Determine fill probability
+            fill_prob = self.simulation_config['fill_probability']
+            
+            # Reduce fill probability during high volatility
+            latest_l1 = self.data_manager.get_latest_l1(order.symbol)
+            if latest_l1 and latest_l1.spread_percent > 0.5:  # High spread
+                fill_prob *= 0.8
+            
+            # Check if order gets filled
+            if random.random() > fill_prob:
+                # Order rejected
+                order.status = PaperOrderStatus.REJECTED
+                rejection_reasons = [
+                    "Connectivity issue",
+                    "Exchange rejection",
+                    "Risk management rejection"
+                ]
+                order.notes += f" | Rejected: {random.choice(rejection_reasons)}"
+                del self.pending_orders[order_id]
+                logging.warning(f"Paper order rejected: {order_id}")
+                return
+            
+            # Simulate order fill
+            await self._fill_paper_order(order_id, latest_tick)
             
         except Exception as e:
-            logger.error(f"❌ Trailing stop update error: {e}")
-            return False
+            logging.error(f"Error processing paper order {order_id}: {e}")
     
-    def _update_performance_metrics(self, trade: PaperTrade):
-        """Update trading performance metrics"""
+    async def _fill_paper_order(self, order_id: str, latest_tick):
+        """Fill paper order with realistic slippage and pricing"""
         try:
-            self.total_trades += 1
+            order = self.pending_orders[order_id]
             
-            if trade.pnl > 0:
-                self.winning_trades += 1
-            else:
-                self.losing_trades += 1
+            # Calculate realistic fill price with slippage
+            fill_price = latest_tick.last_price
             
-            # Calculate win rate
-            self.win_rate = (self.winning_trades / self.total_trades) * 100
-            
-            # Calculate average win/loss
-            recent_trades = list(self.recent_trades)
-            wins = [t.pnl for t in recent_trades if t.pnl > 0]
-            losses = [t.pnl for t in recent_trades if t.pnl < 0]
-            
-            self.avg_win = np.mean(wins) if wins else 0.0
-            self.avg_loss = abs(np.mean(losses)) if losses else 0.0
-            
-            # Calculate profit factor
-            total_wins = sum(wins) if wins else 0
-            total_losses = abs(sum(losses)) if losses else 1
-            self.profit_factor = total_wins / total_losses if total_losses > 0 else 0.0
-            
-            # Update drawdown
-            if self.current_capital > self.peak_capital:
-                self.peak_capital = self.current_capital
-                self.current_drawdown = 0.0
-            else:
-                self.current_drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
-                if self.current_drawdown > self.max_drawdown:
-                    self.max_drawdown = self.current_drawdown
-            
-            # Calculate Sharpe ratio (simplified)
-            if len(recent_trades) >= 10:
-                daily_returns = [t.pnl / self.initial_capital for t in recent_trades]
-                avg_return = np.mean(daily_returns)
-                std_return = np.std(daily_returns)
-                self.sharpe_ratio = (avg_return / std_return) * np.sqrt(252) if std_return > 0 else 0.0
-            
-        except Exception as e:
-            logger.error(f"❌ Performance metrics update error: {e}")
-    
-    def _save_trade_to_db(self, trade: PaperTrade):
-        """Save trade to database"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO paper_trades VALUES 
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                trade.trade_id, trade.symbol, trade.side, trade.quantity,
-                trade.entry_price, trade.exit_price, trade.entry_time.isoformat(),
-                trade.exit_time.isoformat(), trade.pnl, trade.commission,
-                trade.slippage, trade.hold_time_minutes, trade.exit_reason,
-                trade.max_favorable_excursion, trade.max_adverse_excursion,
-                "", 0.0  # position_size_method, risk_amount (optional)
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Database save warning: {e}")
-    
-    def _save_position_to_db(self, position: PaperPosition):
-        """Save current position to database"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO current_positions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                position.symbol, position.side, position.quantity, position.entry_price,
-                position.entry_time.isoformat(), position.stop_loss, position.profit_target,
-                position.position_size_method, position.risk_amount
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Position save warning: {e}")
-    
-    def _remove_position_from_db(self, symbol: str):
-        """Remove position from database"""
-        try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('DELETE FROM current_positions WHERE symbol = ?', (symbol,))
-            
-            conn.commit()
-            conn.close()
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Position removal warning: {e}")
-    
-    def get_portfolio_summary(self) -> Dict:
-        """Get comprehensive portfolio summary"""
-        try:
-            # Calculate current portfolio value
-            portfolio_value = self.available_capital
-            total_unrealized_pnl = 0.0
-            
-            for position in self.positions.values():
-                if position.current_price > 0:
-                    portfolio_value += position.quantity * position.current_price
-                    total_unrealized_pnl += position.unrealized_pnl
+            # Apply slippage based on order type and market conditions
+            if order.order_type == PaperOrderType.MARKET:
+                slippage_pct = self.simulation_config['market_slippage']
+                
+                # Increase slippage during high volatility or low liquidity
+                latest_l1 = self.data_manager.get_latest_l1(order.symbol)
+                if latest_l1:
+                    if latest_l1.spread_percent > 0.3:
+                        slippage_pct *= 2  # Double slippage for wide spreads
+                
+                # Apply slippage
+                if order.side == "BUY":
+                    fill_price *= (1 + slippage_pct)
                 else:
-                    portfolio_value += position.quantity * position.entry_price
+                    fill_price *= (1 - slippage_pct)
+                
+                order.slippage = abs(fill_price - latest_tick.last_price)
             
-            # Calculate returns
-            total_return = ((portfolio_value - self.initial_capital) / self.initial_capital) * 100
+            # Calculate commission (realistic Indian brokerage)
+            order.commission = self._calculate_realistic_commission(order.quantity, fill_price)
             
-            return {
-                'account_summary': {
-                    'initial_capital': self.initial_capital,
-                    'current_capital': self.current_capital,
-                    'available_capital': self.available_capital,
-                    'portfolio_value': round(portfolio_value, 2),
-                    'total_return_pct': round(total_return, 2),
-                    'total_unrealized_pnl': round(total_unrealized_pnl, 2)
-                },
-                'positions': {
-                    'count': len(self.positions),
-                    'total_value': round(sum(pos.quantity * pos.current_price for pos in self.positions.values()), 2),
-                    'unrealized_pnl': round(total_unrealized_pnl, 2),
-                    'details': [pos.to_dict() for pos in self.positions.values()]
-                },
-                'performance': {
-                    'total_trades': self.total_trades,
-                    'winning_trades': self.winning_trades,
-                    'losing_trades': self.losing_trades,
-                    'win_rate': round(self.win_rate, 1),
-                    'avg_win': round(self.avg_win, 2),
-                    'avg_loss': round(self.avg_loss, 2),
-                    'profit_factor': round(self.profit_factor, 2),
-                    'sharpe_ratio': round(self.sharpe_ratio, 2),
-                    'max_drawdown': round(self.max_drawdown * 100, 2),
-                    'current_drawdown': round(self.current_drawdown * 100, 2)
-                },
-                'risk_metrics': {
-                    'position_count': len(self.positions),
-                    'max_positions': self.max_positions,
-                    'capital_utilization': round((1 - self.available_capital / portfolio_value) * 100, 1) if portfolio_value > 0 else 0,
-                    'avg_position_size': round(portfolio_value / max(1, len(self.positions)), 2),
-                    'total_risk_amount': round(sum(pos.risk_amount for pos in self.positions.values()), 2)
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Portfolio summary error: {e}")
-            return {'error': str(e)}
-    
-    def get_trade_history(self, limit: int = 50) -> List[Dict]:
-        """Get recent trade history"""
-        try:
-            recent_trades = list(self.trade_history)[-limit:]
-            return [trade.to_dict() for trade in recent_trades]
-        except Exception as e:
-            logger.error(f"❌ Trade history error: {e}")
-            return []
-    
-    def get_position_details(self, symbol: str) -> Optional[Dict]:
-        """Get detailed position information"""
-        if symbol in self.positions:
-            position = self.positions[symbol]
-            
-            # Add exit condition check
-            exit_check = self.check_exit_conditions(symbol)
-            
-            details = position.to_dict()
-            details['exit_conditions'] = exit_check
-            details['days_held'] = (datetime.now() - position.entry_time).days
-            details['hours_held'] = (datetime.now() - position.entry_time).total_seconds() / 3600
-            
-            return details
-        return None
-    
-    def get_performance_analytics(self) -> Dict:
-        """Get detailed performance analytics"""
-        try:
-            if not self.trade_history:
-                return {'message': 'No trade history available'}
-            
-            trades = list(self.trade_history)
-            
-            # Monthly performance
-            monthly_pnl = {}
-            for trade in trades:
-                month_key = trade.exit_time.strftime('%Y-%m')
-                if month_key not in monthly_pnl:
-                    monthly_pnl[month_key] = 0.0
-                monthly_pnl[month_key] += trade.pnl
-            
-            # Best and worst trades
-            best_trade = max(trades, key=lambda x: x.pnl)
-            worst_trade = min(trades, key=lambda x: x.pnl)
-            
-            # Average hold time
-            avg_hold_time = np.mean([trade.hold_time_minutes for trade in trades])
-            
-            # Win/loss streaks
-            current_streak = 0
-            max_win_streak = 0
-            max_loss_streak = 0
-            temp_win_streak = 0
-            temp_loss_streak = 0
-            
-            for trade in trades:
-                if trade.pnl > 0:
-                    temp_win_streak += 1
-                    temp_loss_streak = 0
-                    max_win_streak = max(max_win_streak, temp_win_streak)
-                else:
-                    temp_loss_streak += 1
-                    temp_win_streak = 0
-                    max_loss_streak = max(max_loss_streak, temp_loss_streak)
-            
-            # Position sizing method performance
-            method_performance = {}
-            for trade in trades:
-                method = getattr(trade, 'position_size_method', 'UNKNOWN')
-                if method not in method_performance:
-                    method_performance[method] = {'trades': 0, 'total_pnl': 0.0}
-                method_performance[method]['trades'] += 1
-                method_performance[method]['total_pnl'] += trade.pnl
-            
-            return {
-                'summary': {
-                    'total_trades': len(trades),
-                    'avg_hold_time_minutes': round(avg_hold_time, 1),
-                    'avg_hold_time_hours': round(avg_hold_time / 60, 1),
-                    'best_trade_pnl': round(best_trade.pnl, 2),
-                    'worst_trade_pnl': round(worst_trade.pnl, 2),
-                    'max_win_streak': max_win_streak,
-                    'max_loss_streak': max_loss_streak
-                },
-                'monthly_performance': {month: round(pnl, 2) for month, pnl in monthly_pnl.items()},
-                'method_performance': {
-                    method: {
-                        'trades': data['trades'],
-                        'total_pnl': round(data['total_pnl'], 2),
-                        'avg_pnl': round(data['total_pnl'] / data['trades'], 2)
-                    }
-                    for method, data in method_performance.items()
-                },
-                'recent_trades': [trade.to_dict() for trade in trades[-10:]]
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Performance analytics error: {e}")
-            return {'error': str(e)}
-    
-    def close_all_positions(self, reason: str = "CLOSE_ALL") -> Dict:
-        """Close all open positions"""
-        try:
-            closed_positions = []
-            failed_positions = []
-            
-            for symbol in list(self.positions.keys()):
-                result = self.exit_position(symbol, reason)
-                if result['success']:
-                    closed_positions.append(symbol)
-                else:
-                    failed_positions.append(symbol)
-            
-            return {
-                'success': True,
-                'closed_positions': closed_positions,
-                'failed_positions': failed_positions,
-                'total_attempted': len(self.positions)
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Close all positions error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def reset_account(self, new_capital: float = None):
-        """Reset paper trading account"""
-        try:
-            if new_capital:
-                self.initial_capital = new_capital
+            # Check for partial fills
+            if random.random() < self.simulation_config['partial_fill_probability']:
+                # Partial fill (70-90% of quantity)
+                fill_percentage = random.uniform(0.7, 0.9)
+                filled_qty = int(order.quantity * fill_percentage)
+                order.filled_qty = filled_qty
+                order.remaining_qty = order.quantity - filled_qty
+                order.status = PaperOrderStatus.PARTIAL_FILLED
             else:
-                new_capital = self.initial_capital
+                # Complete fill
+                order.filled_qty = order.quantity
+                order.remaining_qty = 0
+                order.status = PaperOrderStatus.FILLED
             
-            self.current_capital = new_capital
-            self.available_capital = new_capital
-            self.positions.clear()
-            self.trade_history.clear()
-            self.recent_trades.clear()
+            order.avg_price = fill_price
+            order.fill_timestamp = datetime.now()
             
-            # Reset metrics
-            self.total_trades = 0
-            self.winning_trades = 0
-            self.losing_trades = 0
-            self.win_rate = 0.0
-            self.max_drawdown = 0.0
-            self.current_drawdown = 0.0
-            self.peak_capital = new_capital
+            # Move to filled orders
+            self.filled_orders[order_id] = order
+            if order.status == PaperOrderStatus.FILLED:
+                del self.pending_orders[order_id]
             
-            # Clear database
-            try:
-                conn = sqlite3.connect(self.db_path)
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM paper_trades')
-                cursor.execute('DELETE FROM current_positions')
-                cursor.execute('DELETE FROM daily_performance')
-                conn.commit()
-                conn.close()
-            except:
-                pass
+            # Update position
+            await self._update_paper_position(order)
             
-            logger.info(f"🔄 Paper trading account reset with ₹{new_capital:,.2f}")
+            # Update available cash
+            if order.side == "BUY":
+                cost = (order.avg_price * order.filled_qty) + order.commission
+                self.available_cash -= cost
+            else:
+                proceeds = (order.avg_price * order.filled_qty) - order.commission
+                self.available_cash += proceeds
             
-        except Exception as e:
-            logger.error(f"❌ Account reset error: {e}")
-    
-    def save_daily_performance(self):
-        """Save daily performance metrics"""
-        try:
-            today = datetime.now().date()
-            portfolio_summary = self.get_portfolio_summary()
+            # Update buying power
+            self.buying_power = self.available_cash + (
+                sum(pos.market_value for pos in self.active_positions.values()) * 0.5
+            )
             
-            daily_pnl = portfolio_summary['account_summary']['total_unrealized_pnl']
-            self.daily_pnl_history.append({
-                'date': today,
-                'pnl': daily_pnl,
-                'capital': self.current_capital
-            })
-            
-            # Save to database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT OR REPLACE INTO daily_performance VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                today.isoformat(),
-                self.current_capital,
-                daily_pnl,
-                self.total_trades,
-                self.win_rate,
-                self.max_drawdown
-            ))
-            
-            conn.commit()
-            conn.close()
+            logging.info(f"✅ Paper order filled: {order_id}")
+            logging.info(f"   {order.side} {order.filled_qty}/{order.quantity} shares of {order.symbol}")
+            logging.info(f"   Fill Price: ₹{order.avg_price:.2f} (Slippage: ₹{order.slippage:.3f})")
+            logging.info(f"   Commission: ₹{order.commission:.2f}")
+            logging.info(f"   Available Cash: ₹{self.available_cash:.2f}")
             
         except Exception as e:
-            logger.warning(f"⚠️ Daily performance save warning: {e}")
+            logging.error(f"Error filling paper order {order_id}: {e}")
     
-    def load_positions_from_db(self):
-        """Load positions from database on startup"""
+    def _calculate_realistic_commission(self, quantity: int, price: float) -> float:
+        """Calculate realistic commission based on Indian brokerage structure"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            order_value = quantity * price
             
-            cursor.execute('SELECT * FROM current_positions')
-            rows = cursor.fetchall()
+            # Discount broker structure (like Zerodha, Upstox)
+            brokerage = min(20.0, order_value * 0.0003)  # ₹20 or 0.03% whichever is lower
             
-            for row in rows:
-                symbol, side, quantity, entry_price, entry_time_str, stop_loss, profit_target, method, risk_amount = row
+            # STT (Securities Transaction Tax)
+            stt = order_value * 0.001  # 0.1% for delivery, 0.025% for intraday
+            
+            # Exchange charges
+            exchange_charges = order_value * 0.0000345  # NSE charges
+            
+            # SEBI charges
+            sebi_charges = order_value * 0.000001  # ₹1 per crore
+            
+            # GST on brokerage
+            gst = brokerage * 0.18
+            
+            # Stamp duty
+            stamp_duty = order_value * 0.00003  # 0.003%
+            
+            total_commission = brokerage + stt + exchange_charges + sebi_charges + gst + stamp_duty
+            
+            return round(total_commission, 2)
+            
+        except Exception as e:
+            logging.error(f"Error calculating commission: {e}")
+            return 20.0  # Default flat brokerage
+    
+    async def _update_paper_position(self, filled_order: PaperOrder):
+        """Update paper position after order fill"""
+        try:
+            symbol = filled_order.symbol
+            
+            if symbol not in self.active_positions:
+                # Create new position
+                side = "LONG" if filled_order.side == "BUY" else "SHORT"
+                qty = filled_order.filled_qty if side == "LONG" else -filled_order.filled_qty
                 
                 position = PaperPosition(
                     symbol=symbol,
                     side=side,
-                    quantity=quantity,
-                    entry_price=entry_price,
-                    entry_time=datetime.fromisoformat(entry_time_str),
-                    stop_loss=stop_loss,
-                    profit_target=profit_target,
-                    position_size_method=method,
-                    risk_amount=risk_amount
+                    quantity=qty,
+                    avg_price=filled_order.avg_price,
+                    current_price=filled_order.avg_price,
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                    total_pnl=0.0,
+                    market_value=filled_order.avg_price * abs(qty),
+                    cost_basis=filled_order.avg_price * abs(qty),
+                    day_pnl=0.0,
+                    timestamp=datetime.now(),
+                    entry_orders=[filled_order.order_id],
+                    exit_orders=[],
+                    stop_loss_price=0.0,
+                    take_profit_prices=[],
+                    max_profit=0.0,
+                    max_loss=0.0,
+                    hold_time_seconds=0,
+                    commission_paid=filled_order.commission
                 )
                 
-                self.positions[symbol] = position
-            
-            conn.close()
-            
-            if self.positions:
-                logger.info(f"📂 Loaded {len(self.positions)} positions from database")
+                self.active_positions[symbol] = position
+                
+                logging.info(f"📈 New paper position: {symbol} {side} {abs(qty)} shares @ ₹{filled_order.avg_price:.2f}")
+                
+            else:
+                # Update existing position (averaging, partial exits, etc.)
+                position = self.active_positions[symbol]
+                
+                if filled_order.side == "BUY":
+                    if position.side == "LONG" or position.side == "FLAT":
+                        # Adding to long position
+                        total_cost = (abs(position.quantity) * position.avg_price) + (filled_order.filled_qty * filled_order.avg_price)
+                        total_qty = abs(position.quantity) + filled_order.filled_qty
+                        position.avg_price = total_cost / total_qty
+                        position.quantity = total_qty
+                        position.side = "LONG"
+                    else:  # SHORT position, covering
+                        position.quantity += filled_order.filled_qty
+                        if position.quantity >= 0:
+                            position.side = "LONG" if position.quantity > 0 else "FLAT"
+                else:  # SELL
+                    if position.side == "SHORT" or position.side == "FLAT":
+                        # Adding to short position
+                        total_cost = (abs(position.quantity) * position.avg_price) + (filled_order.filled_qty * filled_order.avg_price)
+                        total_qty = abs(position.quantity) + filled_order.filled_qty
+                        position.avg_price = total_cost / total_qty
+                        position.quantity = -total_qty
+                        position.side = "SHORT"
+                    else:  # LONG position, selling
+                        position.quantity -= filled_order.filled_qty
+                        if position.quantity <= 0:
+                            position.side = "SHORT" if position.quantity < 0 else "FLAT"
+                
+                position.market_value = abs(position.quantity) * position.current_price
+                position.commission_paid += filled_order.commission
+                position.entry_orders.append(filled_order.order_id)
+                
+                # Remove flat positions
+                if position.side == "FLAT" or position.quantity == 0:
+                    del self.active_positions[symbol]
+                    logging.info(f"📉 Position closed: {symbol}")
             
         except Exception as e:
-            logger.warning(f"⚠️ Position loading warning: {e}")
+            logging.error(f"Error updating paper position: {e}")
     
-    def get_risk_metrics(self) -> Dict:
-        """Get risk metrics for integration with risk manager"""
+    async def _background_processing(self):
+        """Background processing for paper trading engine"""
+        while self.processing_enabled:
+            try:
+                # Update positions with real-time prices
+                await self._update_positions_realtime()
+                
+                # Check exit conditions
+                await self._check_paper_exit_conditions()
+                
+                # Process pending limit orders
+                await self._process_pending_limit_orders()
+                
+                # Update performance metrics
+                await self._update_performance_metrics()
+                
+                # Save state periodically
+                await self._save_state()
+                
+                await asyncio.sleep(1)  # Process every second
+                
+            except Exception as e:
+                logging.error(f"Error in paper trading background processing: {e}")
+                await asyncio.sleep(5)
+    
+    async def _update_positions_realtime(self):
+        """Update all positions with real-time market prices"""
         try:
-            total_risk = sum(pos.risk_amount for pos in self.positions.values())
-            portfolio_risk = (total_risk / self.current_capital) * 100 if self.current_capital > 0 else 0
+            for symbol, position in self.active_positions.items():
+                latest_tick = self.data_manager.get_latest_tick(symbol)
+                if latest_tick:
+                    position.current_price = latest_tick.last_price
+                    
+                    # Calculate unrealized P&L
+                    if position.side == "LONG":
+                        position.unrealized_pnl = (position.current_price - position.avg_price) * position.quantity
+                    elif position.side == "SHORT":
+                        position.unrealized_pnl = (position.avg_price - position.current_price) * abs(position.quantity)
+                    else:
+                        position.unrealized_pnl = 0.0
+                    
+                    position.total_pnl = position.realized_pnl + position.unrealized_pnl - position.commission_paid
+                    position.market_value = abs(position.quantity) * position.current_price
+                    
+                    # Track max profit/loss
+                    if position.unrealized_pnl > position.max_profit:
+                        position.max_profit = position.unrealized_pnl
+                    if position.unrealized_pnl < position.max_loss:
+                        position.max_loss = position.unrealized_pnl
+                    
+                    # Update hold time
+                    position.hold_time_seconds = int((datetime.now() - position.timestamp).total_seconds())
+            
+            # Update portfolio value
+            total_unrealized_pnl = sum(pos.unrealized_pnl for pos in self.active_positions.values())
+            total_realized_pnl = sum(pos.realized_pnl for pos in self.active_positions.values())
+            total_commission = sum(pos.commission_paid for pos in self.active_positions.values())
+            
+            self.current_capital = self.available_cash + sum(pos.market_value for pos in self.active_positions.values())
+            
+            # Track maximum portfolio value for drawdown calculation
+            if self.current_capital > self.performance_metrics['max_portfolio_value']:
+                self.performance_metrics['max_portfolio_value'] = self.current_capital
+            
+        except Exception as e:
+            logging.error(f"Error updating positions real-time: {e}")
+    
+    async def _check_paper_exit_conditions(self):
+        """Check exit conditions for paper positions (same logic as live trading)"""
+        try:
+            for symbol, position in list(self.active_positions.items()):
+                latest_tick = self.data_manager.get_latest_tick(symbol)
+                if not latest_tick:
+                    continue
+                
+                should_exit = False
+                exit_reason = ""
+                
+                # Time-based exit (max 10 minutes for scalping)
+                if position.hold_time_seconds > 600:
+                    should_exit = True
+                    exit_reason = "TIME_STOP"
+                
+                # Stop-loss exit
+                elif position.stop_loss_price > 0:
+                    if ((position.side == "LONG" and latest_tick.last_price <= position.stop_loss_price) or
+                        (position.side == "SHORT" and latest_tick.last_price >= position.stop_loss_price)):
+                        should_exit = True
+                        exit_reason = "STOP_LOSS"
+                
+                # Take-profit exit
+                elif position.take_profit_prices:
+                    if ((position.side == "LONG" and latest_tick.last_price >= position.take_profit_prices[0]) or
+                        (position.side == "SHORT" and latest_tick.last_price <= position.take_profit_prices[0])):
+                        should_exit = True
+                        exit_reason = "TAKE_PROFIT"
+                
+                # Trailing stop (if profit > 2%)
+                elif position.max_profit > position.cost_basis * 0.02:
+                    trailing_stop_pct = 0.015  # 1.5% trailing stop
+                    if position.side == "LONG":
+                        trailing_stop_price = position.current_price * (1 - trailing_stop_pct)
+                        if latest_tick.last_price <= trailing_stop_price:
+                            should_exit = True
+                            exit_reason = "TRAILING_STOP"
+                    else:  # SHORT
+                        trailing_stop_price = position.current_price * (1 + trailing_stop_pct)
+                        if latest_tick.last_price >= trailing_stop_price:
+                            should_exit = True
+                            exit_reason = "TRAILING_STOP"
+                
+                if should_exit:
+                    await self._create_paper_exit_order(symbol, exit_reason)
+                    
+        except Exception as e:
+            logging.error(f"Error checking paper exit conditions: {e}")
+    
+    async def _create_paper_exit_order(self, symbol: str, exit_reason: str):
+        """Create paper exit order"""
+        try:
+            position = self.active_positions.get(symbol)
+            if not position:
+                return
+            
+            # Create exit order
+            self.order_counter += 1
+            order_id = f"PAPER_EXIT_{symbol}_{int(time.time())}_{self.order_counter}"
+            
+            side = "SELL" if position.side == "LONG" else "BUY"
+            
+            latest_tick = self.data_manager.get_latest_tick(symbol)
+            exit_price = latest_tick.last_price if latest_tick else position.current_price
+            
+            # Create and immediately fill exit order (market order simulation)
+            exit_order = PaperOrder(
+                order_id=order_id,
+                symbol=symbol,
+                side=side,
+                order_type=PaperOrderType.MARKET,
+                quantity=abs(position.quantity),
+                price=exit_price,
+                stop_price=0.0,
+                trigger_price=0.0,
+                time_in_force="IOC",
+                status=PaperOrderStatus.FILLED,
+                filled_qty=abs(position.quantity),
+                remaining_qty=0,
+                avg_price=exit_price,
+                commission=self._calculate_realistic_commission(abs(position.quantity), exit_price),
+                slippage=exit_price * self.simulation_config['market_slippage'],
+                timestamp=datetime.now(),
+                fill_timestamp=datetime.now(),
+                parent_signal_id=None,
+                exchange="NSE",
+                product="MIS",
+                notes=f"Exit: {exit_reason}"
+            )
+            
+            self.filled_orders[order_id] = exit_order
+            
+            # Calculate final P&L
+            if position.side == "LONG":
+                gross_pnl = (exit_price - position.avg_price) * position.quantity
+            else:  # SHORT
+                gross_pnl = (position.avg_price - exit_price) * abs(position.quantity)
+            
+            net_pnl = gross_pnl - position.commission_paid - exit_order.commission
+            
+            # Create completed trade record
+            self.trade_counter += 1
+            trade_record = PaperTrade(
+                trade_id=f"TRADE_{self.trade_counter:06d}",
+                symbol=symbol,
+                strategy="Unknown",  # Would need to track from original signal
+                entry_time=position.timestamp,
+                exit_time=datetime.now(),
+                side=position.side,
+                quantity=abs(position.quantity),
+                entry_price=position.avg_price,
+                exit_price=exit_price,
+                gross_pnl=gross_pnl,
+                commission=position.commission_paid + exit_order.commission,
+                slippage_cost=exit_order.slippage,
+                net_pnl=net_pnl,
+                hold_time_seconds=position.hold_time_seconds,
+                max_profit=position.max_profit,
+                max_loss=position.max_loss,
+                exit_reason=exit_reason,
+                success=net_pnl > 0,
+                confidence=0.0  # Would need to track from original signal
+            )
+            
+            self.completed_trades.append(trade_record)
+            
+            # Update available cash
+            if exit_order.side == "SELL":
+                proceeds = (exit_price * abs(position.quantity)) - exit_order.commission
+                self.available_cash += proceeds
+            else:  # Covering short
+                cost = (exit_price * abs(position.quantity)) + exit_order.commission
+                self.available_cash -= cost
+            
+            # Remove position
+            del self.active_positions[symbol]
+            
+            logging.info(f"🔚 Paper position closed: {symbol}")
+            logging.info(f"   Exit Reason: {exit_reason}")
+            logging.info(f"   Entry: ₹{position.avg_price:.2f} | Exit: ₹{exit_price:.2f}")
+            logging.info(f"   P&L: ₹{net_pnl:.2f} | Hold Time: {position.hold_time_seconds//60}m {position.hold_time_seconds%60}s")
+            
+        except Exception as e:
+            logging.error(f"Error creating paper exit order for {symbol}: {e}")
+    
+    async def _process_pending_limit_orders(self):
+        """Process pending limit orders to check if they should be filled"""
+        try:
+            for order_id, order in list(self.pending_orders.items()):
+                if order.order_type != PaperOrderType.LIMIT:
+                    continue
+                
+                latest_tick = self.data_manager.get_latest_tick(order.symbol)
+                if not latest_tick:
+                    continue
+                
+                should_fill = False
+                
+                # Check if limit order should be filled
+                if order.side == "BUY" and latest_tick.last_price <= order.price:
+                    should_fill = True
+                elif order.side == "SELL" and latest_tick.last_price >= order.price:
+                    should_fill = True
+                
+                if should_fill:
+                    await self._fill_paper_order(order_id, latest_tick)
+                    
+        except Exception as e:
+            logging.error(f"Error processing pending limit orders: {e}")
+    
+    async def _update_performance_metrics(self):
+        """Update comprehensive performance metrics"""
+        try:
+            if not self.completed_trades:
+                return
+            
+            # Basic trade statistics
+            total_trades = len(self.completed_trades)
+            winning_trades = len([t for t in self.completed_trades if t.success])
+            losing_trades = total_trades - winning_trades
+            
+            total_pnl = sum(t.net_pnl for t in self.completed_trades)
+            total_commission = sum(t.commission for t in self.completed_trades)
+            total_slippage = sum(t.slippage_cost for t in self.completed_trades)
+            
+            win_rate = (winning_trades / total_trades) * 100 if total_trades > 0 else 0
+            
+            # Profit/Loss analysis
+            winning_pnls = [t.net_pnl for t in self.completed_trades if t.success]
+            losing_pnls = [t.net_pnl for t in self.completed_trades if not t.success]
+            
+            largest_win = max(winning_pnls) if winning_pnls else 0
+            largest_loss = min(losing_pnls) if losing_pnls else 0
+            
+            # Trade duration analysis
+            avg_duration = sum(t.hold_time_seconds for t in self.completed_trades) / total_trades if total_trades > 0 else 0
+            
+            # Drawdown calculation
+            portfolio_values = [self.starting_capital]
+            running_pnl = 0
+            for trade in self.completed_trades:
+                running_pnl += trade.net_pnl
+                portfolio_values.append(self.starting_capital + running_pnl)
+            
+            max_portfolio = max(portfolio_values)
+            current_portfolio = portfolio_values[-1]
+            max_drawdown = ((max_portfolio - min(portfolio_values[portfolio_values.index(max_portfolio):])) / max_portfolio) * 100 if max_portfolio > 0 else 0
+            
+            # Sharpe ratio calculation (simplified)
+            if len(self.completed_trades) > 1:
+                returns = [t.net_pnl / self.starting_capital for t in self.completed_trades]
+                import numpy as np
+                avg_return = np.mean(returns)
+                std_return = np.std(returns)
+                sharpe_ratio = (avg_return * 252) / (std_return * np.sqrt(252)) if std_return > 0 else 0
+            else:
+                sharpe_ratio = 0
+            
+            # Update metrics
+            self.performance_metrics.update({
+                'total_trades': total_trades,
+                'winning_trades': winning_trades,
+                'losing_trades': losing_trades,
+                'total_pnl': total_pnl,
+                'total_commission': total_commission,
+                'total_slippage': total_slippage,
+                'max_drawdown': max_drawdown,
+                'win_rate': win_rate,
+                'avg_trade_duration': avg_duration,
+                'largest_win': largest_win,
+                'largest_loss': largest_loss,
+                'sharpe_ratio': sharpe_ratio,
+                'current_portfolio_value': self.current_capital,
+                'total_return_pct': ((self.current_capital - self.starting_capital) / self.starting_capital) * 100
+            })
+            
+        except Exception as e:
+            logging.error(f"Error updating performance metrics: {e}")
+    
+    async def _save_state(self):
+        """Save paper trading state to JSON file"""
+        try:
+            state_data = {
+                'starting_capital': self.starting_capital,
+                'current_capital': self.current_capital,
+                'available_cash': self.available_cash,
+                'buying_power': self.buying_power,
+                'pending_orders': {oid: asdict(order) for oid, order in self.pending_orders.items()},
+                'filled_orders': {oid: asdict(order) for oid, order in self.filled_orders.items()},
+                'active_positions': {symbol: asdict(pos) for symbol, pos in self.active_positions.items()},
+                'completed_trades': [asdict(trade) for trade in self.completed_trades],
+                'performance_metrics': self.performance_metrics,
+                'order_counter': self.order_counter,
+                'trade_counter': self.trade_counter,
+                'last_saved': datetime.now().isoformat()
+            }
+            
+            # Create state directory
+            os.makedirs("paper_trading", exist_ok=True)
+            
+            # Save to JSON file
+            state_file = os.path.join("paper_trading", "paper_trading_state.json")
+            with open(state_file, 'w') as f:
+                json.dump(state_data, f, indent=2, default=str)
+                
+        except Exception as e:
+            logging.error(f"Error saving paper trading state: {e}")
+    
+    async def _load_state(self):
+        """Load paper trading state from JSON file"""
+        try:
+            state_file = os.path.join("paper_trading", "paper_trading_state.json")
+            
+            if not os.path.exists(state_file):
+                logging.info("No existing paper trading state found, starting fresh")
+                return
+            
+            with open(state_file, 'r') as f:
+                state_data = json.load(f)
+            
+            # Restore basic state
+            self.starting_capital = state_data.get('starting_capital', 100000.0)
+            self.current_capital = state_data.get('current_capital', self.starting_capital)
+            self.available_cash = state_data.get('available_cash', self.starting_capital)
+            self.buying_power = state_data.get('buying_power', self.starting_capital * 2)
+            self.order_counter = state_data.get('order_counter', 0)
+            self.trade_counter = state_data.get('trade_counter', 0)
+            
+            # Restore performance metrics
+            self.performance_metrics.update(state_data.get('performance_metrics', {}))
+            
+            # Restore completed trades
+            trades_data = state_data.get('completed_trades', [])
+            self.completed_trades = []
+            for trade_dict in trades_data:
+                trade_dict['entry_time'] = datetime.fromisoformat(trade_dict['entry_time'])
+                trade_dict['exit_time'] = datetime.fromisoformat(trade_dict['exit_time'])
+                self.completed_trades.append(PaperTrade(**trade_dict))
+            
+            # Note: We don't restore pending orders and active positions as they may be stale
+            # The engine will start fresh for new trading session
+            
+            logging.info(f"📂 Paper trading state loaded from {state_file}")
+            logging.info(f"💰 Portfolio Value: ₹{self.current_capital:,.2f}")
+            logging.info(f"📊 Total Trades: {len(self.completed_trades)}")
+            
+        except Exception as e:
+            logging.error(f"Error loading paper trading state: {e}")
+    
+    # Public API methods
+    
+    def get_portfolio_summary(self) -> Dict[str, Any]:
+        """Get comprehensive portfolio summary"""
+        try:
+            total_unrealized_pnl = sum(pos.unrealized_pnl for pos in self.active_positions.values())
+            total_market_value = sum(pos.market_value for pos in self.active_positions.values())
             
             return {
-                'total_risk_amount': total_risk,
-                'portfolio_risk_pct': portfolio_risk,
-                'position_count': len(self.positions),
-                'available_capital': self.available_capital,
-                'capital_utilization_pct': ((self.current_capital - self.available_capital) / self.current_capital) * 100,
-                'max_drawdown_pct': self.max_drawdown * 100,
-                'current_drawdown_pct': self.current_drawdown * 100,
-                'win_rate': self.win_rate,
-                'profit_factor': self.profit_factor
+                'timestamp': datetime.now().isoformat(),
+                'starting_capital': self.starting_capital,
+                'current_capital': self.current_capital,
+                'available_cash': self.available_cash,
+                'buying_power': self.buying_power,
+                'total_market_value': total_market_value,
+                'total_unrealized_pnl': total_unrealized_pnl,
+                'total_return': self.current_capital - self.starting_capital,
+                'total_return_pct': ((self.current_capital - self.starting_capital) / self.starting_capital) * 100,
+                'active_positions': len(self.active_positions),
+                'pending_orders': len(self.pending_orders),
+                'total_trades': len(self.completed_trades),
+                'performance_metrics': self.performance_metrics.copy(),
+                'is_paper_trading': True
             }
             
         except Exception as e:
-            logger.error(f"❌ Risk metrics error: {e}")
-            return {'error': str(e)}
+            logging.error(f"Error getting portfolio summary: {e}")
+            return {}
+    
+    def get_active_positions(self) -> List[Dict[str, Any]]:
+        """Get all active positions"""
+        try:
+            positions = []
+            for symbol, position in self.active_positions.items():
+                latest_tick = self.data_manager.get_latest_tick(symbol)
+                
+                pos_dict = asdict(position)
+                pos_dict.update({
+                    'timestamp': position.timestamp.isoformat(),
+                    'unrealized_pnl_pct': (position.unrealized_pnl / position.cost_basis) * 100 if position.cost_basis > 0 else 0,
+                    'current_bid': latest_tick.bid_price if latest_tick else 0,
+                    'current_ask': latest_tick.ask_price if latest_tick else 0,
+                    'last_trade_time': latest_tick.timestamp.isoformat() if latest_tick else None
+                })
+                positions.append(pos_dict)
+            
+            return positions
+            
+        except Exception as e:
+            logging.error(f"Error getting active positions: {e}")
+            return []
+    
+    def get_trade_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get trade history"""
+        try:
+            trades = sorted(self.completed_trades, key=lambda x: x.exit_time, reverse=True)
+            limited_trades = trades[:limit]
+            
+            trade_history = []
+            for trade in limited_trades:
+                trade_dict = asdict(trade)
+                trade_dict['entry_time'] = trade.entry_time.isoformat()
+                trade_dict['exit_time'] = trade.exit_time.isoformat()
+                trade_dict['return_pct'] = (trade.net_pnl / (trade.entry_price * trade.quantity)) * 100
+                trade_history.append(trade_dict)
+            
+            return trade_history
+            
+        except Exception as e:
+            logging.error(f"Error getting trade history: {e}")
+            return []
+    
+    def get_order_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get order history"""
+        try:
+            all_orders = list(self.filled_orders.values()) + list(self.pending_orders.values())
+            sorted_orders = sorted(all_orders, key=lambda x: x.timestamp, reverse=True)
+            limited_orders = sorted_orders[:limit]
+            
+            order_history = []
+            for order in limited_orders:
+                order_dict = asdict(order)
+                order_dict['timestamp'] = order.timestamp.isoformat()
+                order_dict['fill_timestamp'] = order.fill_timestamp.isoformat() if order.fill_timestamp else None
+                order_history.append(order_dict)
+            
+            return order_history
+            
+        except Exception as e:
+            logging.error(f"Error getting order history: {e}")
+            return []
+    
+    def get_performance_report(self) -> Dict[str, Any]:
+        """Get comprehensive performance report"""
+        try:
+            # Calculate additional metrics
+            if self.completed_trades:
+                profit_factor = (
+                    sum(t.net_pnl for t in self.completed_trades if t.success) /
+                    abs(sum(t.net_pnl for t in self.completed_trades if not t.success))
+                    if any(not t.success for t in self.completed_trades) else float('inf')
+                )
+                
+                avg_win = (
+                    sum(t.net_pnl for t in self.completed_trades if t.success) /
+                    len([t for t in self.completed_trades if t.success])
+                    if any(t.success for t in self.completed_trades) else 0
+                )
+                
+                avg_loss = (
+                    sum(t.net_pnl for t in self.completed_trades if not t.success) /
+                    len([t for t in self.completed_trades if not t.success])
+                    if any(not t.success for t in self.completed_trades) else 0
+                )
+                
+                # Strategy performance breakdown
+                strategy_performance = {}
+                for trade in self.completed_trades:
+                    strategy = trade.strategy
+                    if strategy not in strategy_performance:
+                        strategy_performance[strategy] = {
+                            'trades': 0, 'wins': 0, 'total_pnl': 0.0
+                        }
+                    
+                    strategy_performance[strategy]['trades'] += 1
+                    if trade.success:
+                        strategy_performance[strategy]['wins'] += 1
+                    strategy_performance[strategy]['total_pnl'] += trade.net_pnl
+                
+                # Calculate win rates for each strategy
+                for strategy, stats in strategy_performance.items():
+                    stats['win_rate'] = (stats['wins'] / stats['trades']) * 100 if stats['trades'] > 0 else 0
+            
+            else:
+                profit_factor = 0
+                avg_win = 0
+                avg_loss = 0
+                strategy_performance = {}
+            
+            return {
+                'paper_trading_summary': {
+                    'starting_capital': self.starting_capital,
+                    'current_capital': self.current_capital,
+                    'total_return': self.current_capital - self.starting_capital,
+                    'total_return_pct': ((self.current_capital - self.starting_capital) / self.starting_capital) * 100,
+                    'trading_period_days': (datetime.now() - datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)).days + 1
+                },
+                'trade_statistics': {
+                    **self.performance_metrics,
+                    'profit_factor': profit_factor,
+                    'avg_win': avg_win,
+                    'avg_loss': avg_loss,
+                    'expectancy': avg_win * (self.performance_metrics['win_rate'] / 100) + avg_loss * ((100 - self.performance_metrics['win_rate']) / 100)
+                },
+                'strategy_breakdown': strategy_performance,
+                'cost_analysis': {
+                    'total_commission': self.performance_metrics['total_commission'],
+                    'total_slippage': self.performance_metrics['total_slippage'],
+                    'commission_per_trade': self.performance_metrics['total_commission'] / max(1, self.performance_metrics['total_trades']),
+                    'slippage_per_trade': self.performance_metrics['total_slippage'] / max(1, self.performance_metrics['total_trades'])
+                },
+                'risk_metrics': {
+                    'max_drawdown_pct': self.performance_metrics['max_drawdown'],
+                    'sharpe_ratio': self.performance_metrics['sharpe_ratio'],
+                    'largest_win': self.performance_metrics['largest_win'],
+                    'largest_loss': self.performance_metrics['largest_loss'],
+                    'volatility': self._calculate_return_volatility()
+                }
+            }
+            
+        except Exception as e:
+            logging.error(f"Error getting performance report: {e}")
+            return {}
+    
+    def _calculate_return_volatility(self) -> float:
+        """Calculate return volatility"""
+        try:
+            if len(self.completed_trades) < 2:
+                return 0.0
+            
+            returns = [(t.net_pnl / self.starting_capital) for t in self.completed_trades]
+            import numpy as np
+            return float(np.std(returns) * np.sqrt(252))  # Annualized volatility
+            
+        except Exception as e:
+            logging.error(f"Error calculating return volatility: {e}")
+            return 0.0
+    
+    async def reset_paper_trading(self):
+        """Reset paper trading to initial state"""
+        try:
+            self.current_capital = self.starting_capital
+            self.available_cash = self.starting_capital
+            self.buying_power = self.starting_capital * 2.0
+            
+            self.pending_orders.clear()
+            self.filled_orders.clear()
+            self.active_positions.clear()
+            self.completed_trades.clear()
+            
+            self.order_counter = 0
+            self.trade_counter = 0
+            
+            # Reset performance metrics
+            self.performance_metrics = {
+                'total_trades': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'total_pnl': 0.0,
+                'total_commission': 0.0,
+                'total_slippage': 0.0,
+                'max_drawdown': 0.0,
+                'max_portfolio_value': self.starting_capital,
+                'sharpe_ratio': 0.0,
+                'win_rate': 0.0,
+                'avg_trade_duration': 0.0,
+                'largest_win': 0.0,
+                'largest_loss': 0.0
+            }
+            
+            # Save reset state
+            await self._save_state()
+            
+            logging.info("🔄 Paper trading reset to initial state")
+            logging.info(f"💰 Starting Capital: ₹{self.starting_capital:,.2f}")
+            
+        except Exception as e:
+            logging.error(f"Error resetting paper trading: {e}")
+    
+    async def stop_engine(self):
+        """Stop the paper trading engine"""
+        try:
+            self.processing_enabled = False
+            
+            if self.processing_task and not self.processing_task.done():
+                self.processing_task.cancel()
+                try:
+                    await self.processing_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Save final state
+            await self._save_state()
+            
+            logging.info("🛑 Paper Trading Engine stopped")
+            
+        except Exception as e:
+            logging.error(f"Error stopping paper trading engine: {e}")
 
-# Example usage and testing
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test_paper_trading():
-        """Test the enhanced paper trading engine"""
-        
-        # Initialize engine
-        engine = EnhancedPaperTradingEngine(initial_capital=100000)
-        
-        # Test market data update
-        engine.update_market_data('RELIANCE', 2500.0, 100000, 2499.0, 2501.0, 25.0)
-        
-        # Test position entry
-        result = engine.enter_position(
-            symbol='RELIANCE',
-            side='BUY',
-            entry_price=2500.0,
-            stop_loss_pct=2.0,
-            profit_target_pct=4.0,
-            confidence=75.0,
-            position_size_method='RISK_BASED'
-        )
-        
-        print(f"Entry result: {result}")
-        
-        # Test portfolio summary
-        portfolio = engine.get_portfolio_summary()
-        print(f"Portfolio: {portfolio}")
-        
-        # Test price update and exit conditions
-        engine.update_market_data('RELIANCE', 2450.0, 120000)  # Price drop
-        exit_check = engine.check_exit_conditions('RELIANCE')
-        print(f"Exit check: {exit_check}")
-        
-        # Test performance analytics
-        analytics = engine.get_performance_analytics()
-        print(f"Analytics: {analytics}")
-    
-    # Run test
-    asyncio.run(test_paper_trading())
+# Global instance
+paper_trading_engine = RealisticPaperTradingEngine()
+
+def get_paper_trading_engine() -> RealisticPaperTradingEngine:
+    """Get the global paper trading engine instance"""
+    return paper_trading_engine
