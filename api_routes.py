@@ -1,890 +1,932 @@
 #!/usr/bin/env python3
 """
-REST API Routes
-Provides REST API endpoints for external integration
+API Routes for Trading Bot Flask Application
+Handles all REST API endpoints for user risk management, bot control, and data retrieval
 """
 
-from flask import Blueprint, request, jsonify, abort
-from functools import wraps
+import asyncio
 import logging
-import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from functools import wraps
 import json
-from typing import Dict, List, Any, Optional
 
-logger = logging.getLogger(__name__)
+from flask import Blueprint, request, jsonify, session, g
+from flask import current_app as app
 
-# Create Blueprint for API routes
-api_bp = Blueprint('api', __name__, url_prefix='/api/v1')
+# Import system components with corrected imports
+from config_manager import ConfigManager, get_config
+from database_setup import DatabaseManager
+from bot_core import TradingBotCore
 
-# Global references (will be set by main app)
-bot_core = None
-scanner = None
-execution_manager = None
-volatility_analyzer = None
-data_manager = None
-strategy_manager = None
+# Create API blueprint
+api_bp = Blueprint('api', __name__, url_prefix='/api')
 
-def set_components(**components):
-    """Set component references for API routes"""
-    global bot_core, scanner, execution_manager, volatility_analyzer, data_manager, strategy_manager
-    bot_core = components.get('bot_core')
-    scanner = components.get('scanner')
-    execution_manager = components.get('execution_manager')
-    volatility_analyzer = components.get('volatility_analyzer')
-    data_manager = components.get('data_manager')
-    strategy_manager = components.get('strategy_manager')
+# Global variables for bot instance and database
+bot_instance = None
+db_manager = None
+config_manager = None
 
-# Rate limiting decorator
-def rate_limit(max_calls: int = 100, window: int = 60):
-    """Rate limiting decorator"""
-    call_times = []
+def init_api_components():
+    """Initialize API components"""
+    global bot_instance, db_manager, config_manager
     
-    def decorator(f):
-        @wraps(f)
-        def wrapper(*args, **kwargs):
-            now = time.time()
-            # Remove old calls outside window
-            call_times[:] = [t for t in call_times if now - t < window]
-            
-            if len(call_times) >= max_calls:
-                return jsonify({
-                    'error': 'Rate limit exceeded',
-                    'message': f'Maximum {max_calls} calls per {window} seconds'
-                }), 429
-            
-            call_times.append(now)
-            return f(*args, **kwargs)
-        return wrapper
-    return decorator
+    try:
+        config_manager = get_config()  # This returns ConfigManager instance
+        db_manager = DatabaseManager(config_manager)
+        
+        # Initialize database connection
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(db_manager.initialize())
+        
+        logging.info("API components initialized successfully")
+        return True
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize API components: {e}")
+        return False
 
-# Authentication decorator (simplified)
 def require_auth(f):
-    """Simple authentication decorator"""
+    """Decorator to require authentication"""
     @wraps(f)
-    def wrapper(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        # In production, validate the token here
-        token = auth_header.split(' ')[1]
-        if token != 'your_api_token':  # Replace with proper validation
-            return jsonify({'error': 'Invalid token'}), 401
-        
-        return f(*args, **kwargs)
-    return wrapper
-
-# Error handler decorator
-def handle_errors(f):
-    """Error handling decorator"""
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            logger.error(f"API error in {f.__name__}: {e}")
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
             return jsonify({
-                'error': 'Internal server error',
-                'message': str(e),
-                'timestamp': datetime.now().isoformat()
-            }), 500
-    return wrapper
+                'success': False,
+                'message': 'Authentication required'
+            }), 401
+        
+        g.user_id = session['user_id']
+        return f(*args, **kwargs)
+    
+    return decorated_function
 
-# Health and Status Endpoints
-@api_bp.route('/health', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
+def handle_async(f):
+    """Decorator to handle async functions in Flask routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(f(*args, **kwargs))
+        except Exception as e:
+            logging.error(f"Async route error: {e}")
+            return jsonify({
+                'success': False,
+                'message': f'Server error: {str(e)}'
+            }), 500
+        finally:
+            loop.close()
+    
+    return decorated_function
+
+def get_or_create_bot_instance(user_id: str):
+    """Get or create bot instance for user"""
+    global bot_instance
+    
+    try:
+        if not bot_instance or bot_instance.user_id != user_id:
+            bot_instance = TradingBotCore(user_id=user_id)
+        
+        return bot_instance
+        
+    except Exception as e:
+        logging.error(f"Error creating bot instance: {e}")
+        return None
+
+# Authentication and User Management
+@api_bp.route('/login', methods=['POST'])
+@handle_async
+async def api_login():
+    """API login endpoint"""
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password:
+            return jsonify({
+                'success': False,
+                'message': 'Username and password required'
+            }), 400
+        
+        # Authenticate user
+        user_id = await db_manager.authenticate_user(username, password)
+        
+        if user_id:
+            session['user_id'] = user_id
+            session['username'] = username
+            
+            # Load user config
+            user_config = await config_manager.load_user_risk_config(user_id)
+            
+            return jsonify({
+                'success': True,
+                'message': 'Login successful',
+                'user_id': user_id,
+                'user_config': user_config
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid credentials'
+            }), 401
+            
+    except Exception as e:
+        logging.error(f"Login error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Login failed'
+        }), 500
+
+@api_bp.route('/logout', methods=['POST'])
+def api_logout():
+    """API logout endpoint"""
+    session.clear()
+    return jsonify({
+        'success': True,
+        'message': 'Logged out successfully'
+    })
+
+@api_bp.route('/register', methods=['POST'])
+@handle_async
+async def api_register():
+    """API registration endpoint"""
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        email = data.get('email')
+        password = data.get('password')
+        
+        if not all([username, email, password]):
+            return jsonify({
+                'success': False,
+                'message': 'All fields are required'
+            }), 400
+        
+        # Create user
+        user_id = await db_manager.create_user(username, email, password)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Registration successful',
+            'user_id': user_id
+        })
+        
+    except Exception as e:
+        logging.error(f"Registration error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Registration failed'
+        }), 500
+
+# Dashboard and Status
+@api_bp.route('/dashboard-data')
+@require_auth
+@handle_async
+async def get_dashboard_data():
+    """Get comprehensive dashboard data"""
+    try:
+        user_id = g.user_id
+        bot = get_or_create_bot_instance(user_id)
+        
+        # Get bot status
+        bot_status = await bot.get_user_status() if bot else {}
+        
+        # Get recent trades
+        recent_trades = await db_manager.get_user_trades(user_id, limit=10)
+        
+        # Get portfolio data
+        portfolio = await db_manager.get_user_portfolio(user_id)
+        portfolio_summary = await db_manager.calculate_user_daily_pnl(user_id)
+        
+        # Get risk alerts
+        alerts = await db_manager.get_user_risk_alerts(user_id, unacknowledged_only=True)
+        
+        # Get performance history for chart
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=30)
+        pnl_history = await db_manager.get_performance_history(user_id, start_date, end_date)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'portfolio_value': portfolio_summary.get('total_pnl', 0) + config_manager.default_risk.capital,
+                'daily_pnl': portfolio_summary.get('daily_pnl', 0),
+                'total_trades': portfolio_summary.get('total_trades', 0),
+                'win_rate': portfolio_summary.get('win_rate', 0),
+                'bot_status': bot_status,
+                'recent_trades': recent_trades,
+                'alerts': alerts[:5],  # Latest 5 alerts
+                'pnl_data': {
+                    'labels': [item['date'] for item in pnl_history],
+                    'values': [item['pnl'] for item in pnl_history]
+                }
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"Dashboard data error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load dashboard data'
+        }), 500
+
+@api_bp.route('/bot-status')
+@require_auth
+@handle_async
+async def get_bot_status():
+    """Get current bot status"""
+    try:
+        user_id = g.user_id
+        bot = get_or_create_bot_instance(user_id)
+        
+        if bot:
+            status = await bot.get_user_status()
+            return jsonify({
+                'success': True,
+                'data': status
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'is_running': False,
+                    'trading_mode': 'paper',
+                    'message': 'Bot not initialized'
+                }
+            })
+            
+    except Exception as e:
+        logging.error(f"Bot status error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to get bot status'
+        }), 500
+
+# User Configuration Management
+@api_bp.route('/user-config')
+@require_auth
+@handle_async
+async def get_user_config():
+    """Get user trading configuration"""
+    try:
+        user_id = g.user_id
+        user_config = await config_manager.load_user_risk_config(user_id)
+        
+        return jsonify({
+            'success': True,
+            'data': user_config
+        })
+        
+    except Exception as e:
+        logging.error(f"Get user config error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load user configuration'
+        }), 500
+
+@api_bp.route('/update-risk-config', methods=['POST'])
+@require_auth
+@handle_async
+async def update_risk_config():
+    """Update user risk configuration"""
+    try:
+        user_id = g.user_id
+        config_data = request.get_json()
+        
+        # Validate configuration
+        validation_result = config_manager.validate_user_config(config_data)
+        
+        if not validation_result.get('overall_valid', False):
+            return jsonify({
+                'success': False,
+                'message': 'Invalid configuration',
+                'validation_errors': validation_result
+            }), 400
+        
+        # Update configuration
+        success = await config_manager.update_user_risk_config(user_id, config_data)
+        
+        if success:
+            # Update bot instance if running
+            bot = get_or_create_bot_instance(user_id)
+            if bot:
+                await bot.load_user_risk_config()
+                await bot.apply_user_risk_settings()
+            
+            return jsonify({
+                'success': True,
+                'message': 'Configuration updated successfully',
+                'derived_params': config_manager.calculate_derived_risk_params(config_data)
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to update configuration'
+            }), 500
+            
+    except Exception as e:
+        logging.error(f"Update risk config error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to update configuration'
+        }), 500
+
+@api_bp.route('/risk-status')
+@require_auth
+@handle_async
+async def get_risk_status():
+    """Get current risk status and metrics"""
+    try:
+        user_id = g.user_id
+        
+        # Get user config
+        user_config = await config_manager.load_user_risk_config(user_id)
+        
+        # Get current portfolio status
+        daily_pnl = await db_manager.calculate_user_daily_pnl(user_id)
+        portfolio = await db_manager.get_user_portfolio(user_id)
+        
+        # Get bot status
+        bot = get_or_create_bot_instance(user_id)
+        bot_status = await bot.get_user_status() if bot else {}
+        
+        # Calculate risk metrics
+        risk_calculations = config_manager.calculate_derived_risk_params(user_config) if user_config else {}
+        
+        # Determine risk status
+        risk_status = 'Safe'
+        if abs(daily_pnl.get('daily_pnl', 0)) > risk_calculations.get('daily_loss_limit_amount', 0):
+            risk_status = 'Critical'
+        elif len(portfolio) >= user_config.get('max_concurrent_trades', 5):
+            risk_status = 'Warning'
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'daily_pnl': daily_pnl.get('daily_pnl', 0),
+                'active_trades': len(portfolio),
+                'risk_status': risk_status,
+                'risk_calculations': risk_calculations,
+                'bot_running': bot_status.get('is_running', False)
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"Risk status error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to get risk status'
+        }), 500
+
+# Portfolio and Trading
+@api_bp.route('/portfolio')
+@require_auth
+@handle_async
+async def get_portfolio():
+    """Get user portfolio"""
+    try:
+        user_id = g.user_id
+        
+        # Get portfolio holdings
+        holdings = await db_manager.get_user_portfolio(user_id)
+        
+        # Calculate summary
+        total_value = sum(holding['current_value'] for holding in holdings)
+        invested_amount = sum(holding['invested_amount'] for holding in holdings)
+        total_pnl = sum(holding['unrealized_pnl'] for holding in holdings)
+        total_return_percent = (total_pnl / invested_amount * 100) if invested_amount > 0 else 0
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'holdings': holdings,
+                'total_value': total_value,
+                'invested_amount': invested_amount,
+                'total_pnl': total_pnl,
+                'total_return_percent': total_return_percent
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"Portfolio error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load portfolio'
+        }), 500
+
+@api_bp.route('/trades')
+@require_auth
+@handle_async
+async def get_trades():
+    """Get user trade history"""
+    try:
+        user_id = g.user_id
+        filter_param = request.args.get('filter', 'today')
+        limit = int(request.args.get('limit', 100))
+        
+        # Calculate date range based on filter
+        end_date = datetime.now()
+        if filter_param == 'today':
+            start_date = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif filter_param == 'week':
+            start_date = end_date - timedelta(days=7)
+        elif filter_param == 'month':
+            start_date = end_date - timedelta(days=30)
+        else:  # all
+            start_date = None
+        
+        # Get trades
+        trades = await db_manager.get_user_trades(user_id, start_date, end_date, limit)
+        
+        # Calculate summary
+        total_trades = len(trades)
+        winning_trades = len([t for t in trades if t.get('realized_pnl', 0) > 0])
+        losing_trades = total_trades - winning_trades
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+        total_pnl = sum(t.get('realized_pnl', 0) for t in trades)
+        avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'trades': trades,
+                'summary': {
+                    'total_trades': total_trades,
+                    'winning_trades': winning_trades,
+                    'losing_trades': losing_trades,
+                    'win_rate': win_rate,
+                    'total_pnl': total_pnl,
+                    'avg_pnl': avg_pnl
+                }
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"Trades error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load trades'
+        }), 500
+
+@api_bp.route('/performance-history')
+@require_auth
+@handle_async
+async def get_performance_history():
+    """Get performance history for charts"""
+    try:
+        user_id = g.user_id
+        days = int(request.args.get('days', 30))
+        
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        # Get daily reports
+        daily_reports = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            daily_pnl = await db_manager.calculate_user_daily_pnl(user_id, current_date.date())
+            daily_reports.append({
+                'date': current_date.strftime('%Y-%m-%d'),
+                'pnl': daily_pnl.get('daily_pnl', 0)
+            })
+            current_date += timedelta(days=1)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'labels': [item['date'] for item in daily_reports],
+                'values': [item['pnl'] for item in daily_reports]
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"Performance history error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load performance history'
+        }), 500
+
+# Bot Control
+@api_bp.route('/bot-control', methods=['POST'])
+@require_auth
+@handle_async
+async def bot_control():
+    """Control bot operations (start/stop/restart)"""
+    try:
+        user_id = g.user_id
+        data = request.get_json()
+        action = data.get('action')
+        
+        if action not in ['start', 'stop', 'restart']:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid action'
+            }), 400
+        
+        bot = get_or_create_bot_instance(user_id)
+        if not bot:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to create bot instance'
+            }), 500
+        
+        if action == 'start':
+            if not bot.is_running:
+                await bot.start()
+                message = 'Bot started successfully'
+            else:
+                message = 'Bot is already running'
+                
+        elif action == 'stop':
+            if bot.is_running:
+                await bot.stop()
+                message = 'Bot stopped successfully'
+            else:
+                message = 'Bot is already stopped'
+                
+        elif action == 'restart':
+            if bot.is_running:
+                await bot.stop()
+            await bot.start()
+            message = 'Bot restarted successfully'
+        
+        # Get updated status
+        status = await bot.get_user_status()
+        
+        return jsonify({
+            'success': True,
+            'message': message,
+            'bot_status': status
+        })
+        
+    except Exception as e:
+        logging.error(f"Bot control error: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Bot control failed: {str(e)}'
+        }), 500
+
+@api_bp.route('/manual-trade', methods=['POST'])
+@require_auth
+@handle_async
+async def manual_trade():
+    """Execute manual trade"""
+    try:
+        user_id = g.user_id
+        data = request.get_json()
+        
+        symbol = data.get('symbol')
+        action = data.get('action')  # BUY or SELL
+        quantity = data.get('quantity')
+        price = data.get('price')  # Optional
+        
+        if not all([symbol, action, quantity]):
+            return jsonify({
+                'success': False,
+                'message': 'Symbol, action, and quantity are required'
+            }), 400
+        
+        bot = get_or_create_bot_instance(user_id)
+        if not bot:
+            return jsonify({
+                'success': False,
+                'message': 'Bot not available'
+            }), 500
+        
+        # Execute manual trade
+        result = await bot.manual_trade(symbol, action, int(quantity), float(price) if price else None)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logging.error(f"Manual trade error: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Manual trade failed: {str(e)}'
+        }), 500
+
+@api_bp.route('/close-position', methods=['POST'])
+@require_auth
+@handle_async
+async def close_position():
+    """Close a specific position"""
+    try:
+        user_id = g.user_id
+        data = request.get_json()
+        symbol = data.get('symbol')
+        
+        if not symbol:
+            return jsonify({
+                'success': False,
+                'message': 'Symbol is required'
+            }), 400
+        
+        bot = get_or_create_bot_instance(user_id)
+        if not bot:
+            return jsonify({
+                'success': False,
+                'message': 'Bot not available'
+            }), 500
+        
+        # Close position
+        result = await bot.close_position(symbol)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logging.error(f"Close position error: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to close position: {str(e)}'
+        }), 500
+
+# Strategies
+@api_bp.route('/strategies')
+@require_auth
+@handle_async
+async def get_strategies():
+    """Get available strategies and their status"""
+    try:
+        user_id = g.user_id
+        bot = get_or_create_bot_instance(user_id)
+        
+        if bot:
+            strategies = await bot.get_active_strategies()
+        else:
+            strategies = {}
+        
+        return jsonify({
+            'success': True,
+            'data': strategies
+        })
+        
+    except Exception as e:
+        logging.error(f"Strategies error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load strategies'
+        }), 500
+
+@api_bp.route('/toggle-strategy', methods=['POST'])
+@require_auth
+@handle_async
+async def toggle_strategy():
+    """Enable/disable a trading strategy"""
+    try:
+        user_id = g.user_id
+        data = request.get_json()
+        strategy_name = data.get('strategy')
+        enabled = data.get('enabled', True)
+        
+        if not strategy_name:
+            return jsonify({
+                'success': False,
+                'message': 'Strategy name is required'
+            }), 400
+        
+        bot = get_or_create_bot_instance(user_id)
+        if not bot:
+            return jsonify({
+                'success': False,
+                'message': 'Bot not available'
+            }), 500
+        
+        # Toggle strategy
+        await bot.toggle_strategy(strategy_name, enabled)
+        
+        return jsonify({
+            'success': True,
+            'message': f'Strategy {strategy_name} {"enabled" if enabled else "disabled"}'
+        })
+        
+    except Exception as e:
+        logging.error(f"Toggle strategy error: {e}")
+        return jsonify({
+            'success': False,
+            'message': f'Failed to toggle strategy: {str(e)}'
+        }), 500
+
+# Alerts and Notifications
+@api_bp.route('/alerts')
+@require_auth
+@handle_async
+async def get_alerts():
+    """Get user risk alerts"""
+    try:
+        user_id = g.user_id
+        unacknowledged_only = request.args.get('unacknowledged_only', 'true').lower() == 'true'
+        
+        alerts = await db_manager.get_user_risk_alerts(user_id, unacknowledged_only)
+        
+        return jsonify({
+            'success': True,
+            'data': alerts
+        })
+        
+    except Exception as e:
+        logging.error(f"Alerts error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load alerts'
+        }), 500
+
+@api_bp.route('/acknowledge-alert/<alert_id>', methods=['POST'])
+@require_auth
+@handle_async
+async def acknowledge_alert(alert_id):
+    """Acknowledge a risk alert"""
+    try:
+        success = await db_manager.acknowledge_risk_alert(alert_id)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'Alert acknowledged'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to acknowledge alert'
+            }), 500
+            
+    except Exception as e:
+        logging.error(f"Acknowledge alert error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to acknowledge alert'
+        }), 500
+
+# System Status and Health
+@api_bp.route('/system-status')
+@require_auth
+@handle_async
+async def get_system_status():
+    """Get comprehensive system status"""
+    try:
+        user_id = g.user_id
+        bot = get_or_create_bot_instance(user_id)
+        
+        # Get bot health
+        bot_health = await bot.get_system_health() if bot else {}
+        
+        # Check database connection
+        try:
+            await db_manager.get_database_stats()
+            database_connected = True
+        except:
+            database_connected = False
+        
+        # Check API configuration
+        user_config = await config_manager.load_user_risk_config(user_id)
+        api_configured = bool(user_config and user_config.get('goodwill_api_key'))
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'bot_running': bot.is_running if bot else False,
+                'database_connected': database_connected,
+                'api_configured': api_configured,
+                'bot_health': bot_health,
+                'timestamp': datetime.now().isoformat()
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"System status error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to get system status'
+        }), 500
+
+@api_bp.route('/health')
 def health_check():
-    """Health check endpoint"""
+    """Simple health check endpoint"""
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
-        'version': '1.0.0',
-        'services': {
-            'bot_core': bool(bot_core),
-            'scanner': bool(scanner),
-            'execution_manager': bool(execution_manager),
-            'volatility_analyzer': bool(volatility_analyzer)
-        }
+        'version': '1.0.0'
     })
 
-@api_bp.route('/status', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def system_status():
-    """Get comprehensive system status"""
-    status = {
-        'timestamp': datetime.now().isoformat(),
-        'bot_status': bot_core.get_bot_status() if bot_core else {'running': False},
-        'scanner_status': scanner.get_scanner_status() if scanner else {'running': False},
-        'execution_status': execution_manager.get_execution_summary() if execution_manager else {'running': False}
-    }
-    
-    if volatility_analyzer:
-        status['volatility_status'] = volatility_analyzer.get_volatility_summary()
-    
-    return jsonify(status)
-
-# Bot Management Endpoints
-@api_bp.route('/bot/start', methods=['POST'])
+# Settings
+@api_bp.route('/save-settings/<category>', methods=['POST'])
 @require_auth
-@rate_limit(max_calls=5, window=60)
-@handle_errors
-def start_bot():
-    """Start trading bot"""
-    if not bot_core:
-        return jsonify({'error': 'Bot core not available'}), 404
-    
-    if bot_core.running:
-        return jsonify({'message': 'Bot is already running'}), 200
-    
-    bot_core.start_bot()
-    return jsonify({
-        'message': 'Bot started successfully',
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/bot/stop', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=5, window=60)
-@handle_errors
-def stop_bot():
-    """Stop trading bot"""
-    if not bot_core:
-        return jsonify({'error': 'Bot core not available'}), 404
-    
-    bot_core.stop_bot()
-    return jsonify({
-        'message': 'Bot stopped successfully',
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/bot/toggle-mode', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=10, window=60)
-@handle_errors
-def toggle_trading_mode():
-    """Toggle between paper and live trading"""
-    if not bot_core:
-        return jsonify({'error': 'Bot core not available'}), 404
-    
-    paper_mode = bot_core.toggle_paper_mode()
-    return jsonify({
-        'paper_mode': paper_mode,
-        'mode': 'paper' if paper_mode else 'live',
-        'timestamp': datetime.now().isoformat()
-    })
-
-# Portfolio Endpoints
-@api_bp.route('/portfolio', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_portfolio():
-    """Get portfolio summary"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    portfolio = bot_core.paper_engine.get_portfolio_summary()
-    return jsonify(portfolio)
-
-@api_bp.route('/portfolio/positions', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_positions():
-    """Get current positions"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    portfolio = bot_core.paper_engine.get_portfolio_summary()
-    return jsonify({
-        'positions': portfolio.get('positions', []),
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/portfolio/trades', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_trade_history():
-    """Get trade history"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    # Get query parameters
-    limit = request.args.get('limit', 50, type=int)
-    offset = request.args.get('offset', 0, type=int)
-    
-    trades = bot_core.paper_engine.get_order_history()
-    
-    # Apply pagination
-    paginated_trades = trades[offset:offset + limit]
-    
-    return jsonify({
-        'trades': paginated_trades,
-        'total': len(trades),
-        'limit': limit,
-        'offset': offset,
-        'timestamp': datetime.now().isoformat()
-    })
-
-# Scanner Endpoints
-@api_bp.route('/scanner/status', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_scanner_status():
-    """Get scanner status"""
-    if not scanner:
-        return jsonify({'error': 'Scanner not available'}), 404
-    
-    return jsonify(scanner.get_scanner_status())
-
-@api_bp.route('/scanner/top-stocks', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_top_stocks():
-    """Get top stocks from scanner"""
-    if not scanner:
-        return jsonify({'error': 'Scanner not available'}), 404
-    
-    count = request.args.get('count', 10, type=int)
-    count = min(max(count, 1), 50)  # Limit between 1 and 50
-    
-    top_stocks = scanner.get_top_stocks(count)
-    
-    return jsonify({
-        'stocks': top_stocks,
-        'count': len(top_stocks),
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/scanner/force-scan', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=5, window=300)  # Only 5 force scans per 5 minutes
-@handle_errors
-def force_scanner_update():
-    """Force immediate scanner update"""
-    if not scanner:
-        return jsonify({'error': 'Scanner not available'}), 404
-    
-    result = scanner.force_scan()
-    return jsonify(result)
-
-@api_bp.route('/scanner/config', methods=['GET', 'PUT'])
-@rate_limit(max_calls=20, window=60)
-@handle_errors
-def scanner_config():
-    """Get or update scanner configuration"""
-    if not scanner:
-        return jsonify({'error': 'Scanner not available'}), 404
-    
-    if request.method == 'GET':
-        return jsonify(scanner.get_scanner_status())
-    
-    elif request.method == 'PUT':
-        if not require_auth:
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        # Update scanner interval if provided
-        if 'scan_interval_minutes' in data:
-            interval = data['scan_interval_minutes']
-            if 5 <= interval <= 120:
-                success = scanner.update_scan_interval(interval)
-                if success:
-                    return jsonify({'message': f'Scan interval updated to {interval} minutes'})
-                else:
-                    return jsonify({'error': 'Failed to update scan interval'}), 500
-            else:
-                return jsonify({'error': 'Scan interval must be between 5 and 120 minutes'}), 400
-        
-        return jsonify({'message': 'Configuration updated'})
-
-# Execution Manager Endpoints
-@api_bp.route('/execution/status', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_execution_status():
-    """Get execution manager status"""
-    if not execution_manager:
-        return jsonify({'error': 'Execution manager not available'}), 404
-    
-    return jsonify(execution_manager.get_execution_summary())
-
-@api_bp.route('/execution/signals', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_recent_signals():
-    """Get recent trading signals"""
-    if not execution_manager:
-        return jsonify({'error': 'Execution manager not available'}), 404
-    
-    # Get query parameters
-    limit = request.args.get('limit', 20, type=int)
-    hours = request.args.get('hours', 24, type=int)
-    
-    # This would need to be implemented in execution_manager
-    # For now, return a placeholder response
-    return jsonify({
-        'signals': [],
-        'limit': limit,
-        'hours': hours,
-        'message': 'Signal history endpoint - to be implemented',
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/execution/strategies', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_strategy_status():
-    """Get strategy status and performance"""
-    if not strategy_manager:
-        return jsonify({'error': 'Strategy manager not available'}), 404
-    
-    return jsonify(strategy_manager.get_strategy_status())
-
-@api_bp.route('/execution/strategies/<strategy_name>/toggle', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=10, window=60)
-@handle_errors
-def toggle_strategy(strategy_name):
-    """Enable/disable a specific strategy"""
-    if not strategy_manager:
-        return jsonify({'error': 'Strategy manager not available'}), 404
-    
-    data = request.get_json() or {}
-    enabled = data.get('enabled', True)
-    
-    if enabled:
-        strategy_manager.enable_strategy(strategy_name)
-    else:
-        strategy_manager.disable_strategy(strategy_name)
-    
-    return jsonify({
-        'strategy': strategy_name,
-        'enabled': enabled,
-        'message': f'Strategy {strategy_name} {"enabled" if enabled else "disabled"}',
-        'timestamp': datetime.now().isoformat()
-    })
-
-# Market Data Endpoints
-@api_bp.route('/market/quote/<symbol>', methods=['GET'])
-@rate_limit(max_calls=100, window=60)
-@handle_errors
-def get_quote(symbol):
-    """Get current quote for symbol"""
-    if not data_manager:
-        return jsonify({'error': 'Data manager not available'}), 404
-    
-    symbol = symbol.upper()
-    latest_data = data_manager.get_latest_data(symbol)
-    
-    if not latest_data:
-        return jsonify({'error': f'No data available for {symbol}'}), 404
-    
-    return jsonify({
-        'symbol': symbol,
-        'data': latest_data,
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/market/quotes', methods=['POST'])
-@rate_limit(max_calls=50, window=60)
-@handle_errors
-def get_multiple_quotes():
-    """Get quotes for multiple symbols"""
-    if not data_manager:
-        return jsonify({'error': 'Data manager not available'}), 404
-    
-    data = request.get_json()
-    if not data or 'symbols' not in data:
-        return jsonify({'error': 'Symbols list required'}), 400
-    
-    symbols = [s.upper() for s in data['symbols'][:20]]  # Limit to 20 symbols
-    quotes = {}
-    
-    for symbol in symbols:
-        latest_data = data_manager.get_latest_data(symbol)
-        if latest_data:
-            quotes[symbol] = latest_data
-    
-    return jsonify({
-        'quotes': quotes,
-        'requested_symbols': symbols,
-        'found_symbols': len(quotes),
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/market/historical/<symbol>', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_historical_data(symbol):
-    """Get historical data for symbol"""
-    if not data_manager:
-        return jsonify({'error': 'Data manager not available'}), 404
-    
-    symbol = symbol.upper()
-    hours = request.args.get('hours', 24, type=int)
-    hours = min(max(hours, 1), 168)  # Limit between 1 hour and 1 week
-    
-    historical_data = data_manager.get_historical_data(symbol, hours)
-    
-    return jsonify({
-        'symbol': symbol,
-        'data': historical_data,
-        'hours': hours,
-        'data_points': len(historical_data),
-        'timestamp': datetime.now().isoformat()
-    })
-
-# Volatility Endpoints
-@api_bp.route('/volatility/summary', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_volatility_summary():
-    """Get volatility analysis summary"""
-    if not volatility_analyzer:
-        return jsonify({'error': 'Volatility analyzer not available'}), 404
-    
-    return jsonify(volatility_analyzer.get_volatility_summary())
-
-@api_bp.route('/volatility/alerts', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_volatility_alerts():
-    """Get recent volatility alerts"""
-    if not volatility_analyzer:
-        return jsonify({'error': 'Volatility analyzer not available'}), 404
-    
-    hours = request.args.get('hours', 24, type=int)
-    resolved = request.args.get('resolved')
-    
-    # Convert string to boolean
-    if resolved is not None:
-        resolved = resolved.lower() in ('true', '1', 'yes')
-    
-    alerts = volatility_analyzer.get_alerts(resolved=resolved, hours=hours)
-    
-    return jsonify({
-        'alerts': alerts,
-        'hours': hours,
-        'resolved_filter': resolved,
-        'count': len(alerts),
-        'timestamp': datetime.now().isoformat()
-    })
-
-# Trading Orders Endpoints
-@api_bp.route('/orders', methods=['GET'])
-@rate_limit(max_calls=60, window=60)
-@handle_errors
-def get_orders():
-    """Get order history"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    # Get query parameters
-    limit = request.args.get('limit', 50, type=int)
-    status = request.args.get('status', 'all')
-    
-    orders = bot_core.paper_engine.get_order_history()
-    
-    # Filter by status if specified
-    if status != 'all':
-        orders = [order for order in orders if order.get('status', '').lower() == status.lower()]
-    
-    # Apply limit
-    orders = orders[:limit]
-    
-    return jsonify({
-        'orders': orders,
-        'limit': limit,
-        'status_filter': status,
-        'count': len(orders),
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/orders', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=20, window=60)
-@handle_errors
-def place_order():
-    """Place a new trading order"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Order data required'}), 400
-    
-    # Validate required fields
-    required_fields = ['symbol', 'side', 'quantity']
-    for field in required_fields:
-        if field not in data:
-            return jsonify({'error': f'Missing required field: {field}'}), 400
-    
+@handle_async
+async def save_settings(category):
+    """Save user settings"""
     try:
-        from paper_trading_engine import OrderType
+        user_id = g.user_id
+        data = request.get_json()
         
-        # Parse order data
-        symbol = data['symbol'].upper()
-        side = data['side'].upper()
-        quantity = int(data['quantity'])
-        order_type = OrderType.MARKET if data.get('order_type', 'MARKET').upper() == 'MARKET' else OrderType.LIMIT
-        price = float(data.get('price', 0)) if order_type == OrderType.LIMIT else None
-        
-        # Validate data
-        if side not in ['BUY', 'SELL']:
-            return jsonify({'error': 'Side must be BUY or SELL'}), 400
-        
-        if quantity <= 0:
-            return jsonify({'error': 'Quantity must be positive'}), 400
-        
-        if order_type == OrderType.LIMIT and (not price or price <= 0):
-            return jsonify({'error': 'Price required for limit orders'}), 400
-        
-        # Place order
-        order_id = bot_core.paper_engine.place_order(
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            order_type=order_type,
-            price=price
-        )
-        
-        if order_id:
-            return jsonify({
-                'order_id': order_id,
-                'message': 'Order placed successfully',
-                'symbol': symbol,
-                'side': side,
-                'quantity': quantity,
-                'order_type': order_type.value,
-                'price': price,
-                'timestamp': datetime.now().isoformat()
-            })
+        if category == 'general':
+            # Update general settings
+            success = await config_manager.update_user_risk_config(user_id, data)
+        elif category == 'notifications':
+            # Update notification settings
+            success = await db_manager.update_user_config(user_id, data)
+        elif category == 'api':
+            # Store API credentials securely
+            success = await db_manager.store_user_api_credentials(
+                user_id, 'goodwill',
+                data.get('goodwill_api_key'),
+                data.get('goodwill_secret_key'),
+                data.get('goodwill_user_id')
+            )
         else:
-            return jsonify({'error': 'Failed to place order'}), 500
-            
-    except ValueError as e:
-        return jsonify({'error': f'Invalid data format: {str(e)}'}), 400
-    except Exception as e:
-        return jsonify({'error': f'Order placement failed: {str(e)}'}), 500
-
-@api_bp.route('/orders/<order_id>/cancel', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=20, window=60)
-@handle_errors
-def cancel_order(order_id):
-    """Cancel an existing order"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    success = bot_core.paper_engine.cancel_order(order_id)
-    
-    if success:
-        return jsonify({
-            'order_id': order_id,
-            'message': 'Order cancelled successfully',
-            'timestamp': datetime.now().isoformat()
-        })
-    else:
-        return jsonify({
-            'error': 'Failed to cancel order',
-            'order_id': order_id,
-            'message': 'Order may not exist or cannot be cancelled'
-        }), 400
-
-# Analytics Endpoints
-@api_bp.route('/analytics/performance', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_performance_analytics():
-    """Get performance analytics"""
-    if not bot_core or not bot_core.paper_engine:
-        return jsonify({'error': 'Paper engine not available'}), 404
-    
-    analytics = bot_core.paper_engine.get_trade_analytics()
-    
-    return jsonify({
-        'analytics': analytics,
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/analytics/strategies', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def get_strategy_analytics():
-    """Get strategy performance analytics"""
-    if not strategy_manager:
-        return jsonify({'error': 'Strategy manager not available'}), 404
-    
-    report = strategy_manager.get_strategy_performance_report()
-    rankings = strategy_manager.get_strategy_rankings()
-    
-    return jsonify({
-        'performance_report': report,
-        'strategy_rankings': rankings,
-        'timestamp': datetime.now().isoformat()
-    })
-
-# Configuration Endpoints
-@api_bp.route('/config/risk', methods=['GET', 'PUT'])
-@rate_limit(max_calls=20, window=60)
-@handle_errors
-def risk_configuration():
-    """Get or update risk management configuration"""
-    # This would integrate with config_manager
-    if request.method == 'GET':
-        return jsonify({
-            'risk_config': {
-                'max_positions': 10,
-                'max_daily_loss': 5000.0,
-                'stop_loss_percentage': 0.5,
-                'take_profit_percentage': 1.0
-            },
-            'timestamp': datetime.now().isoformat()
-        })
-    
-    elif request.method == 'PUT':
-        if not require_auth:
-            return jsonify({'error': 'Authentication required'}), 401
-        
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'Configuration data required'}), 400
-        
-        # Validate and update risk configuration
-        # This would use config_manager to update settings
-        
-        return jsonify({
-            'message': 'Risk configuration updated',
-            'updated_fields': list(data.keys()),
-            'timestamp': datetime.now().isoformat()
-        })
-
-# System Control Endpoints
-@api_bp.route('/system/restart', methods=['POST'])
-@require_auth
-@rate_limit(max_calls=2, window=300)  # Only 2 restarts per 5 minutes
-@handle_errors
-def restart_system():
-    """Restart system components"""
-    data = request.get_json() or {}
-    component = data.get('component', 'all')
-    
-    restart_results = {}
-    
-    if component in ['all', 'scanner'] and scanner:
-        try:
-            scanner.stop_scanning()
-            time.sleep(2)
-            scanner.start_scanning()
-            restart_results['scanner'] = 'restarted'
-        except Exception as e:
-            restart_results['scanner'] = f'failed: {str(e)}'
-    
-    if component in ['all', 'execution'] and execution_manager:
-        try:
-            execution_manager.stop_execution()
-            time.sleep(2)
-            execution_manager.start_execution()
-            restart_results['execution'] = 'restarted'
-        except Exception as e:
-            restart_results['execution'] = f'failed: {str(e)}'
-    
-    return jsonify({
-        'message': f'Restart initiated for: {component}',
-        'results': restart_results,
-        'timestamp': datetime.now().isoformat()
-    })
-
-@api_bp.route('/system/logs', methods=['GET'])
-@require_auth
-@rate_limit(max_calls=10, window=60)
-@handle_errors
-def get_system_logs():
-    """Get recent system logs"""
-    lines = request.args.get('lines', 100, type=int)
-    lines = min(max(lines, 10), 1000)  # Limit between 10 and 1000 lines
-    
-    try:
-        import os
-        log_file = 'logs/production.log'
-        
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                all_lines = f.readlines()
-                recent_lines = all_lines[-lines:]
-            
             return jsonify({
-                'logs': [line.strip() for line in recent_lines],
-                'lines_requested': lines,
-                'lines_returned': len(recent_lines),
-                'timestamp': datetime.now().isoformat()
+                'success': False,
+                'message': 'Invalid settings category'
+            }), 400
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'{category.title()} settings saved successfully'
             })
         else:
             return jsonify({
-                'logs': [],
-                'message': 'Log file not found',
-                'timestamp': datetime.now().isoformat()
-            })
-    
+                'success': False,
+                'message': f'Failed to save {category} settings'
+            }), 500
+            
     except Exception as e:
+        logging.error(f"Save settings error: {e}")
         return jsonify({
-            'error': 'Failed to read logs',
-            'message': str(e),
-            'timestamp': datetime.now().isoformat()
+            'success': False,
+            'message': f'Failed to save {category} settings'
         }), 500
 
-# WebSocket Info Endpoint
-@api_bp.route('/websocket/info', methods=['GET'])
-@rate_limit(max_calls=30, window=60)
-@handle_errors
-def websocket_info():
-    """Get WebSocket connection information"""
-    return jsonify({
-        'websocket_url': 'ws://localhost:9001',
-        'connection_types': [
-            'live_updates',
-            'market_data',
-            'trading_signals',
-            'portfolio_updates',
-            'alerts'
-        ],
-        'message_types': [
-            'welcome',
-            'live_update',
-            'market_data',
-            'trading_signal',
-            'portfolio_update',
-            'alert',
-            'error',
-            'pong'
-        ],
-        'timestamp': datetime.now().isoformat()
-    })
+# Reports and Analytics
+@api_bp.route('/daily-report')
+@require_auth
+@handle_async
+async def get_daily_report():
+    """Get daily trading report"""
+    try:
+        user_id = g.user_id
+        date = request.args.get('date')  # Optional date parameter
+        
+        report = await db_manager.get_user_daily_report(user_id, date)
+        
+        return jsonify({
+            'success': True,
+            'data': report
+        })
+        
+    except Exception as e:
+        logging.error(f"Daily report error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load daily report'
+        }), 500
+
+@api_bp.route('/statistics')
+@require_auth
+@handle_async
+async def get_user_statistics():
+    """Get comprehensive user trading statistics"""
+    try:
+        user_id = g.user_id
+        
+        stats = await db_manager.get_user_statistics(user_id)
+        
+        return jsonify({
+            'success': True,
+            'data': stats
+        })
+        
+    except Exception as e:
+        logging.error(f"Statistics error: {e}")
+        return jsonify({
+            'success': False,
+            'message': 'Failed to load statistics'
+        }), 500
 
 # Error handlers
 @api_bp.errorhandler(404)
-def not_found(error):
+def api_not_found(error):
     return jsonify({
-        'error': 'Endpoint not found',
-        'message': 'The requested endpoint does not exist',
-        'timestamp': datetime.now().isoformat()
+        'success': False,
+        'message': 'API endpoint not found'
     }), 404
 
-@api_bp.errorhandler(405)
-def method_not_allowed(error):
-    return jsonify({
-        'error': 'Method not allowed',
-        'message': 'The requested method is not allowed for this endpoint',
-        'timestamp': datetime.now().isoformat()
-    }), 405
-
 @api_bp.errorhandler(500)
-def internal_error(error):
+def api_internal_error(error):
     return jsonify({
-        'error': 'Internal server error',
-        'message': 'An unexpected error occurred',
-        'timestamp': datetime.now().isoformat()
+        'success': False,
+        'message': 'Internal server error'
     }), 500
 
-# API Documentation endpoint
-@api_bp.route('/docs', methods=['GET'])
-@rate_limit(max_calls=20, window=60)
-@handle_errors
-def api_documentation():
-    """Get API documentation"""
-    docs = {
-        'title': 'Trading Bot REST API',
-        'version': '1.0.0',
-        'description': 'REST API for the Scalping Trading Bot system',
-        'base_url': '/api/v1',
-        'authentication': 'Bearer token required for write operations',
-        'rate_limits': 'Various limits applied per endpoint',
-        'endpoints': {
-            'health': {
-                'GET /health': 'Health check',
-                'GET /status': 'System status'
-            },
-            'bot': {
-                'POST /bot/start': 'Start trading bot',
-                'POST /bot/stop': 'Stop trading bot',
-                'POST /bot/toggle-mode': 'Toggle paper/live mode'
-            },
-            'portfolio': {
-                'GET /portfolio': 'Get portfolio summary',
-                'GET /portfolio/positions': 'Get current positions',
-                'GET /portfolio/trades': 'Get trade history'
-            },
-            'scanner': {
-                'GET /scanner/status': 'Get scanner status',
-                'GET /scanner/top-stocks': 'Get top stocks',
-                'POST /scanner/force-scan': 'Force scan (auth required)'
-            },
-            'execution': {
-                'GET /execution/status': 'Get execution status',
-                'GET /execution/signals': 'Get recent signals',
-                'GET /execution/strategies': 'Get strategy status'
-            },
-            'market': {
-                'GET /market/quote/<symbol>': 'Get quote for symbol',
-                'POST /market/quotes': 'Get quotes for multiple symbols',
-                'GET /market/historical/<symbol>': 'Get historical data'
-            },
-            'orders': {
-                'GET /orders': 'Get order history',
-                'POST /orders': 'Place new order (auth required)',
-                'POST /orders/<id>/cancel': 'Cancel order (auth required)'
-            },
-            'analytics': {
-                'GET /analytics/performance': 'Get performance analytics',
-                'GET /analytics/strategies': 'Get strategy analytics'
-            }
-        },
-        'timestamp': datetime.now().isoformat()
-    }
-    
-    return jsonify(docs)
+# Initialize API when blueprint is registered
+@api_bp.before_app_first_request
+def initialize_api():
+    """Initialize API components when app starts"""
+    success = init_api_components()
+    if not success:
+        logging.error("Failed to initialize API components")
 
-# Usage example and testing
-if __name__ == "__main__":
-    from flask import Flask
-    
-    # Test API routes
-    app = Flask(__name__)
-    app.register_blueprint(api_bp)
-    
-    print("🔗 Testing API Routes...")
-    
-    # Mock components for testing
-    class MockBotCore:
-        running = True
-        paper_mode = True
-        
-        def get_bot_status(self):
-            return {'running': self.running, 'paper_mode': self.paper_mode}
-        
-        def toggle_paper_mode(self):
-            self.paper_mode = not self.paper_mode
-            return self.paper_mode
-    
-    # Set mock components
-    set_components(bot_core=MockBotCore())
-    
-    with app.test_client() as client:
-        # Test health endpoint
-        response = client.get('/api/v1/health')
-        print(f"Health check: {response.status_code}")
-        
-        # Test status endpoint
-        response = client.get('/api/v1/status')
-        print(f"Status check: {response.status_code}")
-        
-        # Test docs endpoint
-        response = client.get('/api/v1/docs')
-        print(f"Documentation: {response.status_code}")
-    
-    print("✅ API routes test completed")
+# Export the blueprint
+__all__ = ['api_bp', 'init_api_components']
