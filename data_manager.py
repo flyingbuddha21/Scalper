@@ -1,464 +1,885 @@
-#!/usr/bin/env python3
 """
-Market Data Manager
-Handles market data collection, caching, and distribution
+Advanced Data Manager for Indian Market Trading Bot
+Handles real-time market data from Goodwill API with OHLC, Tick, and L1 feeds
+Optimized for high-frequency scalping strategies
 """
 
-import asyncio
 import logging
-import time
-import threading
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
 import pandas as pd
 import numpy as np
-import sqlite3
+import asyncio
+import aiohttp
+from typing import Dict, List, Optional, Any, Callable
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from collections import defaultdict, deque
+import threading
+import time
 import json
-from collections import deque
-import queue
 
-logger = logging.getLogger(__name__)
+from config_manager import get_config
+from utils import format_currency, format_percentage
+
+@dataclass
+class TickData:
+    """Individual tick data structure"""
+    symbol: str
+    timestamp: datetime
+    last_price: float
+    volume: int
+    bid_price: float
+    ask_price: float
+    bid_qty: int
+    ask_qty: int
+    total_buy_qty: int
+    total_sell_qty: int
+    change: float
+    change_percent: float
+
+@dataclass
+class OHLCCandle:
+    """OHLC candle data structure"""
+    symbol: str
+    timestamp: datetime
+    timeframe: str  # 1min, 5min, 15min
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    vwap: float
+    trades: int
+
+@dataclass
+class L1OrderBook:
+    """Level 1 order book data"""
+    symbol: str
+    timestamp: datetime
+    bid_price: float
+    bid_qty: int
+    ask_price: float
+    ask_qty: int
+    spread: float
+    spread_percent: float
+    imbalance: float  # (bid_qty - ask_qty) / (bid_qty + ask_qty)
 
 class MarketDataManager:
-    """Manages market data collection and distribution"""
+    """Comprehensive market data management for Indian equities"""
     
-    def __init__(self, api_handler, db_path: str = "data/market_data.db"):
-        self.api = api_handler
-        self.db_path = db_path
-        self.running = False
+    def __init__(self):
+        self.config = get_config()
+        self.session: Optional[aiohttp.ClientSession] = """
+Advanced Data Manager for Indian Market Trading Bot
+Uses Goodwill WebSocket for real-time market data feeds
+Handles OHLC, Tick, and L1 data from Goodwill WebSocket
+"""
+
+import logging
+import pandas as pd
+import numpy as np
+import asyncio
+import aiohttp
+import websockets
+import json
+from typing import Dict, List, Optional, Any, Callable
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from collections import defaultdict, deque
+import threading
+import time
+
+from config_manager import get_config
+from utils import format_currency, format_percentage
+from goodwill_api_handler import get_goodwill_handler
+
+@dataclass
+class TickData:
+    """Individual tick data structure"""
+    symbol: str
+    timestamp: datetime
+    last_price: float
+    volume: int
+    bid_price: float
+    ask_price: float
+    bid_qty: int
+    ask_qty: int
+    total_buy_qty: int
+    total_sell_qty: int
+    change: float
+    change_percent: float
+
+@dataclass
+class OHLCCandle:
+    """OHLC candle data structure"""
+    symbol: str
+    timestamp: datetime
+    timeframe: str  # 1min, 5min, 15min
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    vwap: float
+    trades: int
+
+@dataclass
+class L1OrderBook:
+    """Level 1 order book data"""
+    symbol: str
+    timestamp: datetime
+    bid_price: float
+    bid_qty: int
+    ask_price: float
+    ask_qty: int
+    spread: float
+    spread_percent: float
+    imbalance: float  # (bid_qty - ask_qty) / (bid_qty + ask_qty)
+
+class GoodwillWebSocketManager:
+    """Real-time market data manager using Goodwill WebSocket feed"""
+    
+    def __init__(self):
+        self.config = get_config()
+        self.goodwill_handler = get_goodwill_handler()
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+        # WebSocket connection
+        self.websocket: Optional[websockets.WebSocketServerProtocol] = None
+        self.websocket_url = "wss://giga.gwcindia.in/NorenWSTP/"
+        self.is_connected = False
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
         
         # Data storage
-        self.realtime_data = {}  # symbol -> latest data
-        self.historical_cache = {}  # symbol -> historical data
-        self.subscribers = []  # List of callback functions
+        self.tick_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self.ohlc_buffers: Dict[str, Dict[str, deque]] = defaultdict(lambda: {
+            '1min': deque(maxlen=500),
+            '5min': deque(maxlen=200),
+            '15min': deque(maxlen=100)
+        })
+        self.l1_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
         
-        # Data queues
-        self.data_queue = queue.Queue(maxsize=1000)
-        self.update_queue = queue.Queue(maxsize=500)
+        # Real-time subscribers
+        self.tick_subscribers: List[Callable] = []
+        self.ohlc_subscribers: List[Callable] = []
+        self.l1_subscribers: List[Callable] = []
         
-        # Configuration
-        self.update_interval = 1.0  # 1 second
-        self.cache_duration = timedelta(hours=1)  # Cache for 1 hour
+        # Market status
+        self.market_status = "CLOSED"
+        self.subscribed_symbols: set = set()
         
-        # Statistics
-        self.stats = {
-            'updates_processed': 0,
-            'api_calls_made': 0,
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'errors': 0
+        # Data quality tracking
+        self.data_quality_metrics = {
+            'tick_count': 0,
+            'ohlc_count': 0,
+            'l1_count': 0,
+            'last_update': None,
+            'connection_status': 'DISCONNECTED',
+            'error_count': 0,
+            'websocket_reconnects': 0
         }
         
-        logger.info("📊 Market Data Manager initialized")
+        logging.info("Goodwill WebSocket Data Manager initialized")
     
-    def start_data_collection(self, symbols: List[str]):
-        """Start collecting market data for symbols"""
+    async def initialize(self):
+        """Initialize WebSocket connection and data feeds"""
         try:
-            self.running = True
-            self.symbols = symbols
+            # Create aiohttp session
+            timeout = aiohttp.ClientTimeout(total=self.config.api.timeout)
+            connector = aiohttp.TCPConnector(limit=50, limit_per_host=30)
             
-            # Start data collection thread
-            data_thread = threading.Thread(
-                target=self._data_collection_loop,
-                daemon=True,
-                name="DataCollection"
-            )
-            data_thread.start()
-            
-            # Start data processing thread
-            process_thread = threading.Thread(
-                target=self._data_processing_loop,
-                daemon=True,
-                name="DataProcessing"
-            )
-            process_thread.start()
-            
-            logger.info(f"🚀 Market data collection started for {len(symbols)} symbols")
-            
-        except Exception as e:
-            logger.error(f"❌ Start data collection error: {e}")
-    
-    def stop_data_collection(self):
-        """Stop market data collection"""
-        self.running = False
-        logger.info("⏹️ Market data collection stopped")
-    
-    def _data_collection_loop(self):
-        """Main data collection loop"""
-        while self.running:
-            try:
-                for symbol in self.symbols:
-                    try:
-                        # Get market data from API
-                        market_data = self._fetch_market_data(symbol)
-                        
-                        if market_data:
-                            # Add to processing queue
-                            if not self.data_queue.full():
-                                self.data_queue.put({
-                                    'symbol': symbol,
-                                    'data': market_data,
-                                    'timestamp': datetime.now()
-                                })
-                            
-                            self.stats['api_calls_made'] += 1
-                        
-                    except Exception as e:
-                        logger.debug(f"Data collection error for {symbol}: {e}")
-                        self.stats['errors'] += 1
-                        continue
-                
-                time.sleep(self.update_interval)
-                
-            except Exception as e:
-                logger.error(f"❌ Data collection loop error: {e}")
-                time.sleep(5)
-    
-    def _data_processing_loop(self):
-        """Process collected market data"""
-        while self.running:
-            try:
-                # Get data from queue
-                data_packet = self.data_queue.get(timeout=1)
-                
-                symbol = data_packet['symbol']
-                market_data = data_packet['data']
-                timestamp = data_packet['timestamp']
-                
-                # Update realtime data
-                self.realtime_data[symbol] = {
-                    **market_data,
-                    'last_updated': timestamp
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={
+                    'User-Agent': 'MomentumBot/1.0'
                 }
-                
-                # Save to database
-                self._save_to_database(symbol, market_data, timestamp)
-                
-                # Notify subscribers
-                self._notify_subscribers(symbol, market_data)
-                
-                self.stats['updates_processed'] += 1
-                self.data_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"❌ Data processing error: {e}")
-    
-    def _fetch_market_data(self, symbol: str) -> Optional[Dict]:
-        """Fetch market data for symbol"""
-        try:
-            if self.api and hasattr(self.api, 'get_quotes'):
-                # Real API call
-                response = self.api.get_quotes([symbol])
-                
-                if response and response.get('status') == 'success':
-                    data = response.get('data', {})
-                    if symbol in data:
-                        return self._normalize_market_data(data[symbol])
-                
-            # Fallback to mock data
-            return self._generate_mock_data(symbol)
+            )
+            
+            # Initialize Goodwill API handler
+            if not self.goodwill_handler.is_authenticated:
+                await self.goodwill_handler.initialize()
+            
+            # Connect to WebSocket
+            if self.goodwill_handler.is_authenticated:
+                await self._connect_websocket()
+            else:
+                logging.warning("Goodwill API not authenticated - WebSocket connection will be established after authentication")
+            
+            # Start background tasks
+            asyncio.create_task(self._websocket_monitor())
+            asyncio.create_task(self._data_quality_monitor())
+            
+            logging.info("Goodwill WebSocket Data Manager initialized successfully")
             
         except Exception as e:
-            logger.debug(f"Fetch market data error for {symbol}: {e}")
-            return self._generate_mock_data(symbol)
+            logging.error(f"Failed to initialize Goodwill WebSocket Data Manager: {e}")
+            raise
     
-    def _normalize_market_data(self, raw_data: Dict) -> Dict:
-        """Normalize market data from API"""
+    async def _connect_websocket(self):
+        """Connect to Goodwill WebSocket feed"""
         try:
-            return {
-                'ltp': float(raw_data.get('ltp', 0)),
-                'bid': float(raw_data.get('bid', 0)),
-                'ask': float(raw_data.get('ask', 0)),
-                'bid_qty': int(raw_data.get('bid_qty', 0)),
-                'ask_qty': int(raw_data.get('ask_qty', 0)),
-                'volume': int(raw_data.get('volume', 0)),
-                'open': float(raw_data.get('open', 0)),
-                'high': float(raw_data.get('high', 0)),
-                'low': float(raw_data.get('low', 0)),
-                'prev_close': float(raw_data.get('prev_close', 0)),
-                'change_pct': float(raw_data.get('change_pct', 0))
+            if not self.goodwill_handler.is_authenticated:
+                logging.error("Cannot connect to WebSocket: not authenticated")
+                return False
+            
+            logging.info(f"Connecting to Goodwill WebSocket: {self.websocket_url}")
+            
+            # Connect to WebSocket
+            self.websocket = await websockets.connect(
+                self.websocket_url,
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=10
+            )
+            
+            # Send connection request
+            connection_request = {
+                "t": "c",
+                "uid": self.goodwill_handler.login_session.client_id,
+                "actid": self.goodwill_handler.login_session.client_id,
+                "source": "API",
+                "susertoken": self.goodwill_handler.login_session.user_session_id
             }
             
+            await self.websocket.send(json.dumps(connection_request))
+            
+            # Wait for connection acknowledgment
+            response = await self.websocket.recv()
+            response_data = json.loads(response)
+            
+            if response_data.get('t') == 'ck' and response_data.get('s') == 'OK':
+                self.is_connected = True
+                self.data_quality_metrics['connection_status'] = 'CONNECTED'
+                self.reconnect_attempts = 0
+                
+                logging.info("✅ Connected to Goodwill WebSocket successfully")
+                
+                # Start message processing
+                asyncio.create_task(self._process_websocket_messages())
+                
+                return True
+            else:
+                logging.error(f"WebSocket connection failed: {response_data}")
+                return False
+                
         except Exception as e:
-            logger.debug(f"Normalize data error: {e}")
-            return {}
+            logging.error(f"Error connecting to WebSocket: {e}")
+            self.is_connected = False
+            return False
     
-    def _generate_mock_data(self, symbol: str) -> Dict:
-        """Generate mock market data for testing"""
-        import random
+    async def _process_websocket_messages(self):
+        """Process incoming WebSocket messages"""
+        try:
+            while self.is_connected and self.websocket:
+                try:
+                    message = await asyncio.wait_for(self.websocket.recv(), timeout=60)
+                    await self._handle_websocket_message(message)
+                    
+                except asyncio.TimeoutError:
+                    # Send ping to keep connection alive
+                    if self.websocket:
+                        await self.websocket.ping()
+                    
+                except websockets.exceptions.ConnectionClosed:
+                    logging.warning("WebSocket connection closed")
+                    self.is_connected = False
+                    break
+                    
+                except Exception as e:
+                    logging.error(f"Error processing WebSocket message: {e}")
+                    self.data_quality_metrics['error_count'] += 1
+                    
+        except Exception as e:
+            logging.error(f"Error in WebSocket message processing: {e}")
+            self.is_connected = False
+    
+    async def _handle_websocket_message(self, message: str):
+        """Handle individual WebSocket message"""
+        try:
+            data = json.loads(message)
+            message_type = data.get('t', '')
+            
+            if message_type == 'tf':  # Touchline feed
+                await self._process_touchline_feed(data)
+            elif message_type == 'df':  # Depth feed (L1 data)
+                await self._process_depth_feed(data)
+            elif message_type == 'tk':  # Touchline acknowledgment
+                logging.info(f"Subscribed to touchline for {data.get('ts', 'unknown')}")
+            elif message_type == 'dk':  # Depth acknowledgment
+                logging.info(f"Subscribed to depth for {data.get('ts', 'unknown')}")
+            elif message_type == 'uk':  # Unsubscribe acknowledgment
+                logging.info(f"Unsubscribed from touchline")
+            elif message_type == 'udk':  # Unsubscribe depth acknowledgment
+                logging.info(f"Unsubscribed from depth")
+            else:
+                logging.debug(f"Unknown message type: {message_type}")
+                
+        except Exception as e:
+            logging.error(f"Error handling WebSocket message: {e}")
+    
+    async def _process_touchline_feed(self, data: Dict):
+        """Process touchline feed data (real-time prices)"""
+        try:
+            symbol = self._convert_token_to_symbol(data.get('e', ''), data.get('tk', ''))
+            if not symbol:
+                return
+            
+            # Create tick data
+            tick = TickData(
+                symbol=symbol,
+                timestamp=datetime.now(),
+                last_price=float(data.get('lp', 0)),
+                volume=int(data.get('v', 0)),
+                bid_price=float(data.get('bp1', 0
         
-        # Base prices for common symbols
-        base_prices = {
-            'RELIANCE': 2500, 'TCS': 3200, 'INFY': 1450,
-            'HDFCBANK': 1650, 'ICICIBANK': 950, 'NIFTY': 19500,
-            'BANKNIFTY': 44000
+        # Data storage
+        self.tick_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self.ohlc_buffers: Dict[str, Dict[str, deque]] = defaultdict(lambda: {
+            '1min': deque(maxlen=500),
+            '5min': deque(maxlen=200),
+            '15min': deque(maxlen=100)
+        })
+        self.l1_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        
+        # Real-time subscribers
+        self.tick_subscribers: List[Callable] = []
+        self.ohlc_subscribers: List[Callable] = []
+        self.l1_subscribers: List[Callable] = []
+        
+        # Market status
+        self.market_status = "CLOSED"
+        self.subscribed_symbols: set = set()
+        
+        # Data quality tracking
+        self.data_quality_metrics = {
+            'tick_count': 0,
+            'ohlc_count': 0,
+            'l1_count': 0,
+            'last_update': None,
+            'connection_status': 'DISCONNECTED',
+            'error_count': 0
         }
         
-        base_price = base_prices.get(symbol, 1000)
-        
-        # Generate realistic mock data
-        ltp = base_price + random.uniform(-base_price * 0.02, base_price * 0.02)
-        spread = random.uniform(0.05, 0.50)
-        
-        return {
-            'ltp': round(ltp, 2),
-            'bid': round(ltp - spread/2, 2),
-            'ask': round(ltp + spread/2, 2),
-            'bid_qty': random.randint(100, 2000),
-            'ask_qty': random.randint(100, 2000),
-            'volume': random.randint(1000, 50000),
-            'open': round(ltp + random.uniform(-10, 10), 2),
-            'high': round(ltp + random.uniform(0, 15), 2),
-            'low': round(ltp - random.uniform(0, 15), 2),
-            'prev_close': round(ltp + random.uniform(-5, 5), 2),
-            'change_pct': round(random.uniform(-3, 3), 2)
+        # Rate limiting
+        self.rate_limiter = {
+            'requests_per_minute': 0,
+            'last_minute': datetime.now().minute,
+            'max_requests': self.config.api.rate_limit_requests
         }
+        
+        logging.info("Market Data Manager initialized")
     
-    def _save_to_database(self, symbol: str, data: Dict, timestamp: datetime):
-        """Save market data to database"""
+    async def initialize(self):
+        """Initialize connection and data feeds"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            # Create aiohttp session
+            timeout = aiohttp.ClientTimeout(total=self.config.api.timeout)
+            connector = aiohttp.TCPConnector(limit=50, limit_per_host=30)
             
-            cursor.execute("""
-                INSERT INTO realtime_quotes 
-                (symbol, timestamp, ltp, bid, ask, bid_qty, ask_qty, volume,
-                 open_price, high_price, low_price, prev_close, change_pct)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol, timestamp, data.get('ltp', 0), data.get('bid', 0),
-                data.get('ask', 0), data.get('bid_qty', 0), data.get('ask_qty', 0),
-                data.get('volume', 0), data.get('open', 0), data.get('high', 0),
-                data.get('low', 0), data.get('prev_close', 0), data.get('change_pct', 0)
-            ))
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={
+                    'Authorization': f'Bearer {self.config.api.goodwill_api_key}',
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'MomentumBot/1.0'
+                }
+            )
             
-            conn.commit()
-            conn.close()
+            # Check market status
+            await self._update_market_status()
+            
+            # Start background tasks
+            asyncio.create_task(self._market_data_loop())
+            asyncio.create_task(self._data_quality_monitor())
+            
+            self.data_quality_metrics['connection_status'] = 'CONNECTED'
+            logging.info("Market Data Manager initialized successfully")
             
         except Exception as e:
-            logger.debug(f"Save to database error: {e}")
+            logging.error(f"Failed to initialize Market Data Manager: {e}")
+            raise
     
-    def _notify_subscribers(self, symbol: str, data: Dict):
-        """Notify all subscribers of data update"""
-        for callback in self.subscribers:
-            try:
-                callback(symbol, data)
-            except Exception as e:
-                logger.debug(f"Subscriber notification error: {e}")
-    
-    def subscribe(self, callback_function):
-        """Subscribe to market data updates"""
-        self.subscribers.append(callback_function)
-        logger.info("📡 New subscriber added to market data feed")
-    
-    def unsubscribe(self, callback_function):
-        """Unsubscribe from market data updates"""
-        if callback_function in self.subscribers:
-            self.subscribers.remove(callback_function)
-            logger.info("📡 Subscriber removed from market data feed")
-    
-    def get_latest_data(self, symbol: str) -> Optional[Dict]:
-        """Get latest market data for symbol"""
-        return self.realtime_data.get(symbol)
-    
-    def get_historical_data(self, symbol: str, hours: int = 24) -> List[Dict]:
-        """Get historical data for symbol"""
+    async def subscribe_symbol(self, symbol: str) -> bool:
+        """Subscribe to real-time data for a symbol"""
         try:
-            # Check cache first
-            cache_key = f"{symbol}_{hours}h"
-            if cache_key in self.historical_cache:
-                cached_data, cache_time = self.historical_cache[cache_key]
-                if datetime.now() - cache_time < self.cache_duration:
-                    self.stats['cache_hits'] += 1
-                    return cached_data
+            if symbol in self.subscribed_symbols:
+                return True
             
-            # Fetch from database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            # Subscribe to Goodwill API feeds
+            subscription_payload = {
+                'symbols': [symbol],
+                'feed_types': ['tick', 'ohlc_1min', 'ohlc_5min', 'level1'],
+                'subscription_id': f"momentum_bot_{symbol}_{int(time.time())}"
+            }
             
-            cutoff_time = datetime.now() - timedelta(hours=hours)
+            url = f"{self.config.api.goodwill_base_url}/market-data/subscribe"
             
-            cursor.execute("""
-                SELECT timestamp, ltp, bid, ask, volume, open_price, high_price, low_price
-                FROM realtime_quotes 
-                WHERE symbol = ? AND timestamp > ?
-                ORDER BY timestamp ASC
-            """, (symbol, cutoff_time))
+            async with self.session.post(url, json=subscription_payload) as response:
+                if response.status == 200:
+                    self.subscribed_symbols.add(symbol)
+                    logging.info(f"Successfully subscribed to {symbol}")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logging.error(f"Failed to subscribe to {symbol}: {error_text}")
+                    return False
+                    
+        except Exception as e:
+            logging.error(f"Error subscribing to {symbol}: {e}")
+            return False
+    
+    async def unsubscribe_symbol(self, symbol: str) -> bool:
+        """Unsubscribe from real-time data for a symbol"""
+        try:
+            if symbol not in self.subscribed_symbols:
+                return True
             
-            rows = cursor.fetchall()
-            conn.close()
+            url = f"{self.config.api.goodwill_base_url}/market-data/unsubscribe"
+            payload = {'symbols': [symbol]}
             
-            historical_data = []
-            for row in rows:
-                historical_data.append({
-                    'timestamp': row[0],
-                    'ltp': row[1],
-                    'bid': row[2],
-                    'ask': row[3],
-                    'volume': row[4],
-                    'open': row[5],
-                    'high': row[6],
-                    'low': row[7]
-                })
+            async with self.session.post(url, json=payload) as response:
+                if response.status == 200:
+                    self.subscribed_symbols.discard(symbol)
+                    
+                    # Clear buffers
+                    if symbol in self.tick_buffers:
+                        del self.tick_buffers[symbol]
+                    if symbol in self.ohlc_buffers:
+                        del self.ohlc_buffers[symbol]
+                    if symbol in self.l1_buffers:
+                        del self.l1_buffers[symbol]
+                    
+                    logging.info(f"Successfully unsubscribed from {symbol}")
+                    return True
+                else:
+                    logging.error(f"Failed to unsubscribe from {symbol}")
+                    return False
+                    
+        except Exception as e:
+            logging.error(f"Error unsubscribing from {symbol}: {e}")
+            return False
+    
+    async def get_historical_data(self, symbol: str, timeframe: str = '1min', 
+                                 days: int = 5) -> pd.DataFrame:
+        """Get historical OHLC data for indicators calculation"""
+        try:
+            if not await self._check_rate_limit():
+                await asyncio.sleep(1)
+                return pd.DataFrame()
             
-            # Cache the result
-            self.historical_cache[cache_key] = (historical_data, datetime.now())
-            self.stats['cache_misses'] += 1
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days)
             
-            return historical_data
+            url = f"{self.config.api.goodwill_base_url}/market-data/historical"
+            params = {
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'start_date': start_date.strftime('%Y-%m-%d'),
+                'end_date': end_date.strftime('%Y-%m-%d'),
+                'limit': 1000
+            }
+            
+            async with self.session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    if 'candles' in data and data['candles']:
+                        df = pd.DataFrame(data['candles'])
+                        
+                        # Ensure proper column types
+                        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+                        for col in numeric_cols:
+                            if col in df.columns:
+                                df[col] = pd.to_numeric(df[col], errors='coerce')
+                        
+                        # Convert timestamp
+                        if 'timestamp' in df.columns:
+                            df['timestamp'] = pd.to_datetime(df['timestamp'])
+                            df = df.sort_values('timestamp').reset_index(drop=True)
+                        
+                        logging.info(f"Retrieved {len(df)} historical candles for {symbol}")
+                        return df
+                    else:
+                        logging.warning(f"No historical data available for {symbol}")
+                        return pd.DataFrame()
+                else:
+                    error_text = await response.text()
+                    logging.error(f"Failed to get historical data for {symbol}: {error_text}")
+                    return pd.DataFrame()
+                    
+        except Exception as e:
+            logging.error(f"Error getting historical data for {symbol}: {e}")
+            return pd.DataFrame()
+    
+    def get_latest_tick(self, symbol: str) -> Optional[TickData]:
+        """Get the latest tick data for a symbol"""
+        try:
+            if symbol not in self.tick_buffers or not self.tick_buffers[symbol]:
+                return None
+            
+            return self.tick_buffers[symbol][-1]
             
         except Exception as e:
-            logger.error(f"❌ Get historical data error: {e}")
-            return []
+            logging.error(f"Error getting latest tick for {symbol}: {e}")
+            return None
     
-    def get_ohlc_data(self, symbol: str, timeframe: str = '1min', periods: int = 100) -> pd.DataFrame:
-        """Get OHLC data as DataFrame"""
+    def get_latest_ohlc(self, symbol: str, timeframe: str = '1min') -> Optional[OHLCCandle]:
+        """Get the latest OHLC candle for a symbol"""
         try:
-            historical_data = self.get_historical_data(symbol, hours=24)
+            if (symbol not in self.ohlc_buffers or 
+                timeframe not in self.ohlc_buffers[symbol] or
+                not self.ohlc_buffers[symbol][timeframe]):
+                return None
             
-            if not historical_data:
+            return self.ohlc_buffers[symbol][timeframe][-1]
+            
+        except Exception as e:
+            logging.error(f"Error getting latest OHLC for {symbol}: {e}")
+            return None
+    
+    def get_latest_l1(self, symbol: str) -> Optional[L1OrderBook]:
+        """Get the latest L1 order book data for a symbol"""
+        try:
+            if symbol not in self.l1_buffers or not self.l1_buffers[symbol]:
+                return None
+            
+            return self.l1_buffers[symbol][-1]
+            
+        except Exception as e:
+            logging.error(f"Error getting latest L1 for {symbol}: {e}")
+            return None
+    
+    def get_ohlc_dataframe(self, symbol: str, timeframe: str = '1min', 
+                          periods: int = 200) -> pd.DataFrame:
+        """Get OHLC data as pandas DataFrame for strategy analysis"""
+        try:
+            if (symbol not in self.ohlc_buffers or 
+                timeframe not in self.ohlc_buffers[symbol]):
+                return pd.DataFrame()
+            
+            candles = list(self.ohlc_buffers[symbol][timeframe])[-periods:]
+            
+            if not candles:
                 return pd.DataFrame()
             
             # Convert to DataFrame
-            df = pd.DataFrame(historical_data)
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            df.set_index('timestamp', inplace=True)
+            data = []
+            for candle in candles:
+                data.append({
+                    'timestamp': candle.timestamp,
+                    'open': candle.open,
+                    'high': candle.high,
+                    'low': candle.low,
+                    'close': candle.close,
+                    'volume': candle.volume,
+                    'vwap': candle.vwap
+                })
             
-            # Resample to timeframe
-            ohlc = df['ltp'].resample(timeframe).ohlc()
-            volume = df['volume'].resample(timeframe).sum()
+            df = pd.DataFrame(data)
+            df = df.sort_values('timestamp').reset_index(drop=True)
             
-            # Combine OHLC and volume
-            ohlc_data = pd.concat([ohlc, volume], axis=1)
-            ohlc_data.columns = ['open', 'high', 'low', 'close', 'volume']
-            
-            # Remove NaN rows and get last N periods
-            ohlc_data = ohlc_data.dropna().tail(periods)
-            
-            return ohlc_data.reset_index()
+            return df
             
         except Exception as e:
-            logger.error(f"❌ Get OHLC data error: {e}")
+            logging.error(f"Error getting OHLC DataFrame for {symbol}: {e}")
             return pd.DataFrame()
     
-    def get_market_summary(self) -> Dict:
-        """Get market data summary"""
+    def get_market_data_snapshot(self, symbol: str) -> Dict[str, Any]:
+        """Get comprehensive market data snapshot for strategy analysis"""
         try:
-            summary = {
-                'timestamp': datetime.now().isoformat(),
-                'symbols_tracked': len(self.symbols) if hasattr(self, 'symbols') else 0,
-                'realtime_data_count': len(self.realtime_data),
-                'subscribers_count': len(self.subscribers),
-                'running': self.running,
-                'statistics': self.stats.copy(),
-                'queue_sizes': {
-                    'data_queue': self.data_queue.qsize(),
-                    'update_queue': self.update_queue.qsize()
-                }
+            latest_tick = self.get_latest_tick(symbol)
+            latest_ohlc = self.get_latest_ohlc(symbol, '1min')
+            latest_l1 = self.get_latest_l1(symbol)
+            ohlc_df = self.get_ohlc_dataframe(symbol, '1min', 100)
+            
+            snapshot = {
+                'symbol': symbol,
+                'timestamp': datetime.now(),
+                'tick_data': asdict(latest_tick) if latest_tick else {},
+                'ohlc_data': {
+                    'latest_candle': asdict(latest_ohlc) if latest_ohlc else {},
+                    'candles': ohlc_df.to_dict('records') if not ohlc_df.empty else []
+                },
+                'l1_data': asdict(latest_l1) if latest_l1 else {},
+                'current_price': latest_tick.last_price if latest_tick else 0,
+                'current_volume': latest_tick.volume if latest_tick else 0,
+                'market_status': self.market_status,
+                'data_quality': self._get_symbol_data_quality(symbol)
             }
             
-            # Add symbol-wise latest data
-            summary['latest_prices'] = {}
-            for symbol, data in self.realtime_data.items():
-                summary['latest_prices'][symbol] = {
-                    'ltp': data.get('ltp', 0),
-                    'change_pct': data.get('change_pct', 0),
-                    'volume': data.get('volume', 0),
-                    'last_updated': data.get('last_updated', datetime.now()).isoformat()
-                }
-            
-            return summary
+            return snapshot
             
         except Exception as e:
-            logger.error(f"❌ Market summary error: {e}")
-            return {'error': str(e)}
+            logging.error(f"Error getting market data snapshot for {symbol}: {e}")
+            return {}
     
-    def cleanup_old_data(self, days: int = 7):
-        """Clean up old market data"""
+    async def _market_data_loop(self):
+        """Main market data processing loop"""
+        while True:
+            try:
+                if self.market_status != "OPEN":
+                    await asyncio.sleep(5)
+                    continue
+                
+                # Fetch real-time updates for all subscribed symbols
+                for symbol in list(self.subscribed_symbols):
+                    await self._fetch_real_time_data(symbol)
+                
+                await asyncio.sleep(0.1)  # High frequency updates for scalping
+                
+            except Exception as e:
+                logging.error(f"Error in market data loop: {e}")
+                await asyncio.sleep(1)
+    
+    async def _fetch_real_time_data(self, symbol: str):
+        """Fetch real-time data for a specific symbol"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
+            if not await self._check_rate_limit():
+                return
             
-            cutoff_date = datetime.now() - timedelta(days=days)
+            url = f"{self.config.api.goodwill_base_url}/market-data/realtime/{symbol}"
             
-            cursor.execute("""
-                DELETE FROM realtime_quotes 
-                WHERE timestamp < ?
-            """, (cutoff_date,))
-            
-            deleted_count = cursor.rowcount
-            conn.commit()
-            conn.close()
-            
-            logger.info(f"🧹 Cleaned up {deleted_count} old market data records")
-            return deleted_count
-            
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Process different data types
+                    if 'tick' in data:
+                        await self._process_tick_data(symbol, data['tick'])
+                    
+                    if 'ohlc' in data:
+                        await self._process_ohlc_data(symbol, data['ohlc'])
+                    
+                    if 'level1' in data:
+                        await self._process_l1_data(symbol, data['level1'])
+                    
+                    self.data_quality_metrics['last_update'] = datetime.now()
+                    
+                else:
+                    self.data_quality_metrics['error_count'] += 1
+                    if response.status == 429:  # Rate limited
+                        await asyncio.sleep(1)
+                    
         except Exception as e:
-            logger.error(f"❌ Cleanup old data error: {e}")
-            return 0
+            logging.error(f"Error fetching real-time data for {symbol}: {e}")
+            self.data_quality_metrics['error_count'] += 1
     
-    def get_statistics(self) -> Dict:
-        """Get data manager statistics"""
-        return {
-            'statistics': self.stats.copy(),
-            'uptime_seconds': time.time() - getattr(self, '_start_time', time.time()),
-            'symbols_count': len(self.symbols) if hasattr(self, 'symbols') else 0,
-            'cache_size': len(self.historical_cache),
-            'realtime_data_size': len(self.realtime_data),
-            'subscribers_count': len(self.subscribers)
-        }
-
-
-# Usage example and testing
-if __name__ == "__main__":
-    import time
+    async def _process_tick_data(self, symbol: str, tick_data: Dict):
+        """Process incoming tick data"""
+        try:
+            tick = TickData(
+                symbol=symbol,
+                timestamp=datetime.fromisoformat(tick_data.get('timestamp', datetime.now().isoformat())),
+                last_price=float(tick_data.get('last_price', 0)),
+                volume=int(tick_data.get('volume', 0)),
+                bid_price=float(tick_data.get('bid_price', 0)),
+                ask_price=float(tick_data.get('ask_price', 0)),
+                bid_qty=int(tick_data.get('bid_qty', 0)),
+                ask_qty=int(tick_data.get('ask_qty', 0)),
+                total_buy_qty=int(tick_data.get('total_buy_qty', 0)),
+                total_sell_qty=int(tick_data.get('total_sell_qty', 0)),
+                change=float(tick_data.get('change', 0)),
+                change_percent=float(tick_data.get('change_percent', 0))
+            )
+            
+            self.tick_buffers[symbol].append(tick)
+            self.data_quality_metrics['tick_count'] += 1
+            
+            # Notify subscribers
+            for callback in self.tick_subscribers:
+                try:
+                    await callback(symbol, tick)
+                except Exception as e:
+                    logging.error(f"Error in tick subscriber callback: {e}")
+                    
+        except Exception as e:
+            logging.error(f"Error processing tick data for {symbol}: {e}")
     
-    # Test market data manager
-    print("📊 Testing Market Data Manager...")
+    async def _process_ohlc_data(self, symbol: str, ohlc_data: Dict):
+        """Process incoming OHLC candle data"""
+        try:
+            for timeframe, candle_data in ohlc_data.items():
+                if timeframe not in ['1min', '5min', '15min']:
+                    continue
+                
+                candle = OHLCCandle(
+                    symbol=symbol,
+                    timestamp=datetime.fromisoformat(candle_data.get('timestamp', datetime.now().isoformat())),
+                    timeframe=timeframe,
+                    open=float(candle_data.get('open', 0)),
+                    high=float(candle_data.get('high', 0)),
+                    low=float(candle_data.get('low', 0)),
+                    close=float(candle_data.get('close', 0)),
+                    volume=int(candle_data.get('volume', 0)),
+                    vwap=float(candle_data.get('vwap', 0)),
+                    trades=int(candle_data.get('trades', 0))
+                )
+                
+                self.ohlc_buffers[symbol][timeframe].append(candle)
+                self.data_quality_metrics['ohlc_count'] += 1
+                
+                # Notify subscribers
+                for callback in self.ohlc_subscribers:
+                    try:
+                        await callback(symbol, candle)
+                    except Exception as e:
+                        logging.error(f"Error in OHLC subscriber callback: {e}")
+                        
+        except Exception as e:
+            logging.error(f"Error processing OHLC data for {symbol}: {e}")
     
-    # Mock API for testing
-    class MockAPI:
-        def get_quotes(self, symbols):
+    async def _process_l1_data(self, symbol: str, l1_data: Dict):
+        """Process incoming Level 1 order book data"""
+        try:
+            bid_price = float(l1_data.get('bid_price', 0))
+            ask_price = float(l1_data.get('ask_price', 0))
+            bid_qty = int(l1_data.get('bid_qty', 0))
+            ask_qty = int(l1_data.get('ask_qty', 0))
+            
+            spread = ask_price - bid_price if ask_price > 0 and bid_price > 0 else 0
+            spread_percent = (spread / ask_price * 100) if ask_price > 0 else 0
+            imbalance = ((bid_qty - ask_qty) / (bid_qty + ask_qty)) if (bid_qty + ask_qty) > 0 else 0
+            
+            l1 = L1OrderBook(
+                symbol=symbol,
+                timestamp=datetime.fromisoformat(l1_data.get('timestamp', datetime.now().isoformat())),
+                bid_price=bid_price,
+                bid_qty=bid_qty,
+                ask_price=ask_price,
+                ask_qty=ask_qty,
+                spread=spread,
+                spread_percent=spread_percent,
+                imbalance=imbalance
+            )
+            
+            self.l1_buffers[symbol].append(l1)
+            self.data_quality_metrics['l1_count'] += 1
+            
+            # Notify subscribers
+            for callback in self.l1_subscribers:
+                try:
+                    await callback(symbol, l1)
+                except Exception as e:
+                    logging.error(f"Error in L1 subscriber callback: {e}")
+                    
+        except Exception as e:
+            logging.error(f"Error processing L1 data for {symbol}: {e}")
+    
+    async def _update_market_status(self):
+        """Update current market status"""
+        try:
+            url = f"{self.config.api.goodwill_base_url}/market-data/status"
+            
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    status_data = await response.json()
+                    self.market_status = status_data.get('market_status', 'UNKNOWN')
+                    logging.info(f"Market status: {self.market_status}")
+                else:
+                    logging.warning("Failed to get market status")
+                    
+        except Exception as e:
+            logging.error(f"Error updating market status: {e}")
+    
+    async def _check_rate_limit(self) -> bool:
+        """Check if we're within rate limits"""
+        current_minute = datetime.now().minute
+        
+        if current_minute != self.rate_limiter['last_minute']:
+            self.rate_limiter['requests_per_minute'] = 0
+            self.rate_limiter['last_minute'] = current_minute
+        
+        if self.rate_limiter['requests_per_minute'] >= self.rate_limiter['max_requests']:
+            return False
+        
+        self.rate_limiter['requests_per_minute'] += 1
+        return True
+    
+    async def _data_quality_monitor(self):
+        """Monitor data quality and connection health"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                
+                current_time = datetime.now()
+                last_update = self.data_quality_metrics.get('last_update')
+                
+                if last_update:
+                    time_since_update = (current_time - last_update).total_seconds()
+                    
+                    if time_since_update > 30:  # No updates for 30+ seconds
+                        logging.warning(f"No market data updates for {time_since_update:.0f} seconds")
+                        self.data_quality_metrics['connection_status'] = 'STALE'
+                    else:
+                        self.data_quality_metrics['connection_status'] = 'CONNECTED'
+                
+                # Log quality metrics
+                metrics = self.data_quality_metrics
+                logging.info(f"Data Quality - Ticks: {metrics['tick_count']}, "
+                           f"OHLC: {metrics['ohlc_count']}, L1: {metrics['l1_count']}, "
+                           f"Errors: {metrics['error_count']}, Status: {metrics['connection_status']}")
+                
+            except Exception as e:
+                logging.error(f"Error in data quality monitor: {e}")
+    
+    def _get_symbol_data_quality(self, symbol: str) -> Dict[str, Any]:
+        """Get data quality metrics for a specific symbol"""
+        try:
+            tick_count = len(self.tick_buffers.get(symbol, []))
+            ohlc_count = sum(len(self.ohlc_buffers.get(symbol, {}).get(tf, [])) 
+                           for tf in ['1min', '5min', '15min'])
+            l1_count = len(self.l1_buffers.get(symbol, []))
+            
+            latest_tick = self.get_latest_tick(symbol)
+            data_age = 0
+            if latest_tick:
+                data_age = (datetime.now() - latest_tick.timestamp).total_seconds()
+            
             return {
-                'status': 'success',
-                'data': {
-                    symbols[0]: {
-                        'ltp': 2500.75,
-                        'bid': 2500.50,
-                        'ask': 2501.00,
-                        'volume': 125000
-                    }
-                }
+                'tick_buffer_size': tick_count,
+                'ohlc_buffer_size': ohlc_count,
+                'l1_buffer_size': l1_count,
+                'data_age_seconds': data_age,
+                'is_subscribed': symbol in self.subscribed_symbols
             }
+            
+        except Exception as e:
+            logging.error(f"Error getting data quality for {symbol}: {e}")
+            return {}
     
-    # Initialize manager
-    mock_api = MockAPI()
-    data_manager = MarketDataManager(mock_api)
+    def add_tick_subscriber(self, callback: Callable):
+        """Add callback for tick data updates"""
+        self.tick_subscribers.append(callback)
     
-    # Add subscriber
-    def data_callback(symbol, data):
-        print(f"📈 Data update: {symbol} @ ₹{data.get('ltp', 0)}")
+    def add_ohlc_subscriber(self, callback: Callable):
+        """Add callback for OHLC data updates"""
+        self.ohlc_subscribers.append(callback)
     
-    data_manager.subscribe(data_callback)
+    def add_l1_subscriber(self, callback: Callable):
+        """Add callback for L1 data updates"""
+        self.l1_subscribers.append(callback)
     
-    # Start data collection
-    symbols = ['RELIANCE', 'TCS', 'INFY']
-    data_manager.start_data_collection(symbols)
-    
-    # Let it run for a bit
-    time.sleep(5)
-    
-    # Get summary
-    summary = data_manager.get_market_summary()
-    print(f"📊 Summary: {summary['symbols_tracked']} symbols, {summary['statistics']['updates_processed']} updates")
-    
-    # Get latest data
-    latest = data_manager.get_latest_data('RELIANCE')
-    if latest:
-        print(f"💰 RELIANCE latest: ₹{latest.get('ltp', 0)}")
-    
-    # Stop manager
-    data_manager.stop_data_collection()
-    print("✅ Market data manager test completed")
+    async def cleanup(self):
+        """Cleanup resources"""
+        try:
+            # Unsubscribe from all symbols
+            for symbol in list(self.subscribed_symbols):
+                await self.unsubscribe_symbol(symbol)
+            
+            # Close session
+            if self.session:
+                await self.session.close()
+            
+            logging.info("Market Data Manager cleaned up successfully")
+            
+        except Exception as e:
+            logging.error(f"Error during cleanup: {e}")
+
+# Global instance
+data_manager = MarketDataManager()
+
+def get_data_manager() -> MarketDataManager:
+    """Get the global data manager instance"""
+    return data_manager
