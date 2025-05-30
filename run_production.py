@@ -1,741 +1,598 @@
 #!/usr/bin/env python3
 """
-Production Runner for FlyingBuddha Trading Bot
-Works with the actual 18 files from GitHub repository
+Production System Launcher for Advanced Trading Bot
+Generates all necessary files and starts the complete production system
 """
 
 import os
 import sys
-import json
-import time
+import asyncio
 import logging
 import signal
-import atexit
 import threading
-from datetime import datetime
+import time
 from pathlib import Path
+from datetime import datetime
+from typing import Optional
 
-# Ensure we're in the right directory
-script_dir = Path(__file__).parent.absolute()
-os.chdir(script_dir)
+# Flask application imports
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+from flask import g, current_app
 
-# Set up logging
-def setup_logging():
-    """Setup production logging"""
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_dir / 'production.log'),
-            logging.FileHandler(log_dir / f'production_{datetime.now().strftime("%Y%m%d")}.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    
-    # Reduce noise from third-party libraries
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('requests').setLevel(logging.WARNING)
-    logging.getLogger('werkzeug').setLevel(logging.WARNING)
-    
-    return logging.getLogger(__name__)
+# Import our system components
+try:
+    from files_generator import ProductionFilesGenerator
+    from config_manager import get_config, ConfigManager
+    from database_setup import DatabaseManager
+    from api_routes import api_bp, init_api_components
+    from bot_core import TradingBotCore
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    print("Please ensure all required files are present in the project directory")
+    sys.exit(1)
 
-logger = setup_logging()
-
-class ProductionRunner:
-    """Production runner for FlyingBuddha Trading Bot"""
+class TradingBotProductionSystem:
+    """Main production system that orchestrates everything"""
     
-    def __init__(self):
-        """Initialize production runner"""
-        self.components = {}
+    def __init__(self, project_root: str = "."):
+        self.project_root = Path(project_root)
+        self.app = None
+        self.config_manager = None
+        self.db_manager = None
+        self.bot_instances = {}  # Store bot instances for multiple users
         self.is_running = False
-        self.startup_time = datetime.now()
+        self.shutdown_event = threading.Event()
         
-        # Setup signal handlers
-        self.setup_signal_handlers()
+        # Setup logging early
+        self.setup_logging()
+        self.logger = logging.getLogger(__name__)
         
-        logger.info("🚀 FlyingBuddha Trading Bot - Production Runner Starting")
-        logger.info(f"📁 Working directory: {os.getcwd()}")
-        logger.info(f"🐍 Python version: {sys.version}")
+        print("🚀 Trading Bot Production System Initializing...")
+    
+    def setup_logging(self):
+        """Setup production logging"""
+        log_dir = self.project_root / "logs"
+        log_dir.mkdir(exist_ok=True)
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_dir / 'production.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+    
+    def generate_production_files(self):
+        """Generate all necessary production files"""
+        print("\n📁 Generating production files...")
+        
+        try:
+            generator = ProductionFilesGenerator(self.project_root)
+            generated_files = generator.generate_all_files()
+            
+            print(f"✅ Generated {len(generated_files)} production files")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to generate production files: {e}")
+            return False
+    
+    def check_prerequisites(self):
+        """Check if all prerequisites are met"""
+        print("\n🔍 Checking prerequisites...")
+        
+        issues = []
+        
+        # Check Python version
+        if sys.version_info < (3, 8):
+            issues.append("Python 3.8+ required")
+        
+        # Check required files
+        required_files = [
+            'config_manager.py',
+            'database_setup.py', 
+            'bot_core.py',
+            'api_routes.py'
+        ]
+        
+        for file in required_files:
+            if not (self.project_root / file).exists():
+                issues.append(f"Missing required file: {file}")
+        
+        # Check .env file
+        env_file = self.project_root / '.env'
+        if not env_file.exists():
+            print("⚠️  .env file not found - will use defaults")
+        
+        # Check config directory
+        config_dir = self.project_root / 'config'
+        if not config_dir.exists():
+            print("📁 Creating config directory...")
+            config_dir.mkdir(exist_ok=True)
+        
+        if issues:
+            print("❌ Prerequisites check failed:")
+            for issue in issues:
+                print(f"   - {issue}")
+            return False
+        
+        print("✅ Prerequisites check passed")
+        return True
+    
+    def initialize_configuration(self):
+        """Initialize configuration management"""
+        print("\n⚙️  Initializing configuration...")
+        
+        try:
+            self.config_manager = get_config()
+            
+            # Initialize database connection for config manager
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.config_manager.initialize_database_connection())
+            loop.close()
+            
+            print("✅ Configuration initialized")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Configuration initialization failed: {e}")
+            return False
+    
+    def initialize_database(self):
+        """Initialize database system"""
+        print("\n🗄️  Initializing database system...")
+        
+        try:
+            self.db_manager = DatabaseManager(self.config_manager)
+            
+            # Initialize database in async context
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.db_manager.initialize())
+            loop.close()
+            
+            print("✅ Database system initialized")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Database initialization failed: {e}")
+            print("💡 Make sure PostgreSQL is running and configured correctly")
+            return False
+    
+    def create_flask_app(self):
+        """Create and configure Flask application"""
+        print("\n🌐 Creating Flask application...")
+        
+        try:
+            self.app = Flask(__name__)
+            
+            # Configure Flask
+            flask_config = self.config_manager.flask
+            self.app.config['SECRET_KEY'] = flask_config.secret_key
+            self.app.config['DEBUG'] = flask_config.debug
+            self.app.config['MAX_CONTENT_LENGTH'] = flask_config.max_content_length
+            
+            # Register API blueprint
+            self.app.register_blueprint(api_bp)
+            
+            # Setup Flask routes
+            self.setup_flask_routes()
+            
+            # Setup error handlers
+            self.setup_error_handlers()
+            
+            print("✅ Flask application created")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Flask application creation failed: {e}")
+            return False
+    
+    def setup_flask_routes(self):
+        """Setup Flask web routes"""
+        
+        @self.app.route('/')
+        def index():
+            """Main dashboard"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('dashboard.html')
+        
+        @self.app.route('/dashboard')
+        def dashboard():
+            """Dashboard page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('dashboard.html')
+        
+        @self.app.route('/login', methods=['GET', 'POST'])
+        def login():
+            """Login page"""
+            if request.method == 'POST':
+                username = request.form['username']
+                password = request.form['password']
+                
+                # Use API endpoint for authentication
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    user_id = loop.run_until_complete(
+                        self.db_manager.authenticate_user(username, password)
+                    )
+                    loop.close()
+                    
+                    if user_id:
+                        session['user_id'] = user_id
+                        session['username'] = username
+                        flash('Login successful!', 'success')
+                        return redirect(url_for('dashboard'))
+                    else:
+                        flash('Invalid credentials', 'error')
+                        
+                except Exception as e:
+                    self.logger.error(f"Login error: {e}")
+                    flash('Login failed', 'error')
+            
+            return render_template('login.html')
+        
+        @self.app.route('/register', methods=['GET', 'POST'])
+        def register():
+            """Registration page"""
+            if request.method == 'POST':
+                username = request.form['username']
+                email = request.form['email']
+                password = request.form['password']
+                
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    user_id = loop.run_until_complete(
+                        self.db_manager.create_user(username, email, password)
+                    )
+                    loop.close()
+                    
+                    flash('Registration successful! Please login.', 'success')
+                    return redirect(url_for('login'))
+                    
+                except Exception as e:
+                    self.logger.error(f"Registration error: {e}")
+                    flash('Registration failed', 'error')
+            
+            return render_template('register.html')
+        
+        @self.app.route('/logout')
+        def logout():
+            """Logout"""
+            user_id = session.get('user_id')
+            if user_id and user_id in self.bot_instances:
+                # Stop user's bot instance
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.bot_instances[user_id].stop())
+                    loop.close()
+                    del self.bot_instances[user_id]
+                except Exception as e:
+                    self.logger.error(f"Error stopping bot on logout: {e}")
+            
+            session.clear()
+            flash('Logged out successfully', 'info')
+            return redirect(url_for('login'))
+        
+        @self.app.route('/portfolio')
+        def portfolio():
+            """Portfolio page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('portfolio.html')
+        
+        @self.app.route('/trades')
+        def trades():
+            """Trades page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('trades.html')
+        
+        @self.app.route('/risk-management')
+        def risk_management():
+            """Risk management page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('risk_management.html')
+        
+        @self.app.route('/strategies')
+        def strategies():
+            """Strategies page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('strategies.html')
+        
+        @self.app.route('/settings')
+        def settings():
+            """Settings page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('settings.html')
+        
+        @self.app.route('/profile')
+        def profile():
+            """User profile page"""
+            if 'user_id' not in session:
+                return redirect(url_for('login'))
+            return render_template('settings.html')  # Reuse settings template
+        
+        @self.app.route('/health')
+        def health():
+            """Health check endpoint"""
+            return jsonify({
+                'status': 'healthy',
+                'timestamp': datetime.now().isoformat(),
+                'system': 'Trading Bot Production',
+                'version': '1.0.0'
+            })
+    
+    def setup_error_handlers(self):
+        """Setup Flask error handlers"""
+        
+        @self.app.errorhandler(404)
+        def not_found(error):
+            if request.path.startswith('/api/'):
+                return jsonify({
+                    'success': False,
+                    'message': 'API endpoint not found'
+                }), 404
+            return render_template('error.html', error_code=404, 
+                                 error_message="Page not found"), 404
+        
+        @self.app.errorhandler(500)
+        def internal_error(error):
+            if request.path.startswith('/api/'):
+                return jsonify({
+                    'success': False,
+                    'message': 'Internal server error'
+                }), 500
+            return render_template('error.html', error_code=500,
+                                 error_message="Internal server error"), 500
+        
+        @self.app.errorhandler(403)
+        def forbidden(error):
+            return jsonify({
+                'success': False,
+                'message': 'Access forbidden'
+            }), 403
+    
+    def get_or_create_bot_instance(self, user_id: str) -> Optional[TradingBotCore]:
+        """Get or create bot instance for user"""
+        try:
+            if user_id not in self.bot_instances:
+                self.bot_instances[user_id] = TradingBotCore(user_id=user_id)
+                self.logger.info(f"Created bot instance for user: {user_id}")
+            
+            return self.bot_instances[user_id]
+            
+        except Exception as e:
+            self.logger.error(f"Error creating bot instance for {user_id}: {e}")
+            return None
     
     def setup_signal_handlers(self):
-        """Setup graceful shutdown handlers"""
-        def signal_handler(signum, frame):
-            logger.info(f"🛑 Received signal {signum}, initiating graceful shutdown")
-            self.graceful_shutdown()
-            sys.exit(0)
+        """Setup signal handlers for graceful shutdown"""
+        def signal_handler(sig, frame):
+            print(f"\n🛑 Received signal {sig}, initiating graceful shutdown...")
+            self.shutdown_event.set()
+            self.shutdown()
         
-        signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
-        atexit.register(self.graceful_shutdown)
+        signal.signal(signal.SIGTERM, signal_handler)
     
-    def check_files(self) -> bool:
-        """Check if all required files exist"""
-        try:
-            logger.info("📁 Checking required files...")
-            
-            # Actual files from your GitHub repository
-            required_files = [
-                'api_routes.py',           # REST API endpoints
-                'bot_core.py',             # Trading bot orchestration
-                'config_manager.py',       # Configuration management
-                'data_manager.py',         # Market data management
-                'database_setup.py',       # Database schemas
-                'dynamic_scanner.py',      # 20-50 stock scanner
-                'execution_manager.py',    # 10 scalping strategies
-                'file_generator.py',       # Auto file creation
-                'flask_webapp.py',         # Web application
-                'goodwill_api_handler.py', # Complete API integration
-                'monitoring.py',           # System monitoring
-                'paper_trading_engine.py', # Paper trading engine
-                'security_manager.py',     # Authentication & security
-                'strategy_manager.py',     # Strategy coordination
-                'utils.py',                # Common utilities
-                'volatility_analyzer.py',  # Real-time volatility analysis
-                'websocket_manager.py'     # Real-time WebSocket
-            ]
-            
-            existing_files = []
-            missing_files = []
-            
-            for file in required_files:
-                if Path(file).exists():
-                    existing_files.append(file)
-                    logger.info(f"✅ Found: {file}")
-                else:
-                    missing_files.append(file)
-                    logger.warning(f"❌ Missing: {file}")
-            
-            if missing_files:
-                logger.warning(f"⚠️ Missing files: {missing_files}")
-                logger.info("💡 Will try to run with available files")
-            
-            if len(existing_files) < 10:  # Need at least core files
-                logger.error("❌ Too many critical files missing!")
-                return False
-            
-            logger.info(f"✅ Found {len(existing_files)}/{len(required_files)} files")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ File check error: {e}")
-            return False
-    
-    def create_directories(self):
-        """Create required directories"""
-        try:
-            directories = [
-                'logs', 'data', 'config', 'backups', 
-                'strategies', 'reports', 'temp', 'static'
-            ]
-            
-            for directory in directories:
-                Path(directory).mkdir(exist_ok=True)
-                logger.debug(f"📁 Directory ensured: {directory}")
-            
-            logger.info("✅ Required directories created")
-            
-        except Exception as e:
-            logger.error(f"❌ Directory creation error: {e}")
-    
-    def initialize_config_manager(self) -> bool:
-        """Initialize configuration manager"""
-        try:
-            logger.info("⚙️ Initializing configuration manager...")
-            
-            from config_manager import ConfigManager
-            self.components['config_manager'] = ConfigManager()
-            
-            logger.info("✅ Configuration manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Config manager initialization error: {e}")
-            return False
-    
-    def initialize_security_manager(self) -> bool:
-        """Initialize security manager"""
-        try:
-            logger.info("🔐 Initializing security manager...")
-            
-            from security_manager import SecurityManager
-            self.components['security_manager'] = SecurityManager()
-            
-            logger.info("✅ Security manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Security manager initialization error: {e}")
-            return False
-    
-    def initialize_database(self) -> bool:
-        """Initialize database"""
-        try:
-            logger.info("💾 Initializing database...")
-            
-            from database_setup import DatabaseManager
-            self.components['database'] = DatabaseManager()
-            
-            # Setup database if needed
-            if hasattr(self.components['database'], 'setup_database'):
-                self.components['database'].setup_database()
-            
-            logger.info("✅ Database initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Database initialization error: {e}")
-            return False
-    
-    def initialize_data_manager(self) -> bool:
-        """Initialize data manager"""
-        try:
-            logger.info("📊 Initializing data manager...")
-            
-            from data_manager import DataManager
-            self.components['data_manager'] = DataManager()
-            
-            logger.info("✅ Data manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Data manager initialization error: {e}")
-            return False
-    
-    def initialize_goodwill_api(self) -> bool:
-        """Initialize Goodwill API handler"""
-        try:
-            logger.info("🔌 Initializing Goodwill API handler...")
-            
-            from goodwill_api_handler import GoodwillAPIHandler
-            self.components['api_handler'] = GoodwillAPIHandler()
-            
-            logger.info("✅ Goodwill API handler initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Goodwill API handler initialization error: {e}")
-            return False
-    
-    def initialize_dynamic_scanner(self) -> bool:
-        """Initialize dynamic scanner"""
-        try:
-            logger.info("🔍 Initializing dynamic scanner...")
-            
-            from dynamic_scanner import DynamicScanner
-            self.components['scanner'] = DynamicScanner()
-            
-            logger.info("✅ Dynamic scanner initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Dynamic scanner initialization error: {e}")
-            return False
-    
-    def initialize_volatility_analyzer(self) -> bool:
-        """Initialize volatility analyzer"""
-        try:
-            logger.info("📈 Initializing volatility analyzer...")
-            
-            from volatility_analyzer import VolatilityAnalyzer
-            self.components['volatility_analyzer'] = VolatilityAnalyzer()
-            
-            logger.info("✅ Volatility analyzer initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Volatility analyzer initialization error: {e}")
-            return False
-    
-    def initialize_strategy_manager(self) -> bool:
-        """Initialize strategy manager"""
-        try:
-            logger.info("⚙️ Initializing strategy manager...")
-            
-            from strategy_manager import StrategyManager
-            self.components['strategy_manager'] = StrategyManager()
-            
-            logger.info("✅ Strategy manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Strategy manager initialization error: {e}")
-            return False
-    
-    def initialize_execution_manager(self) -> bool:
-        """Initialize execution manager"""
-        try:
-            logger.info("⚡ Initializing execution manager...")
-            
-            from execution_manager import ExecutionManager
-            self.components['execution_manager'] = ExecutionManager()
-            
-            logger.info("✅ Execution manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Execution manager initialization error: {e}")
-            return False
-    
-    def initialize_paper_trading(self) -> bool:
-        """Initialize paper trading engine"""
-        try:
-            logger.info("📊 Initializing paper trading engine...")
-            
-            from paper_trading_engine import PaperTradingEngine
-            
-            # Create mock API if no real API available
-            if 'api_handler' in self.components:
-                api = self.components['api_handler']
-            else:
-                class MockAPI:
-                    def get_quote(self, symbol):
-                        import random
-                        base_prices = {'RELIANCE': 2500, 'TCS': 3500, 'INFY': 1500}
-                        base = base_prices.get(symbol, 1000)
-                        return {
-                            'ltp': base + random.uniform(-50, 50),
-                            'high': base + 100,
-                            'low': base - 100,
-                            'volume': random.randint(100000, 1000000)
-                        }
-                api = MockAPI()
-            
-            self.components['paper_engine'] = PaperTradingEngine(api, 100000)
-            self.components['paper_engine'].start_realtime_updates()
-            
-            logger.info("✅ Paper trading engine initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Paper trading initialization error: {e}")
-            return False
-    
-    def initialize_websocket_manager(self) -> bool:
-        """Initialize WebSocket manager"""
-        try:
-            logger.info("🔌 Initializing WebSocket manager...")
-            
-            from websocket_manager import WebSocketManager
-            self.components['websocket_manager'] = WebSocketManager()
-            
-            logger.info("✅ WebSocket manager initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ WebSocket manager initialization error: {e}")
-            return False
-    
-    def initialize_monitoring(self) -> bool:
-        """Initialize monitoring system"""
-        try:
-            logger.info("📊 Initializing monitoring system...")
-            
-            from monitoring import MonitoringSystem
-            self.components['monitoring'] = MonitoringSystem()
-            
-            logger.info("✅ Monitoring system initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Monitoring system initialization error: {e}")
-            return False
-    
-    def initialize_bot_core(self) -> bool:
-        """Initialize bot core"""
-        try:
-            logger.info("🤖 Initializing bot core...")
-            
-            from bot_core import TradingBot
-            self.components['bot_core'] = TradingBot()
-            
-            # Connect all components to bot core
-            for name, component in self.components.items():
-                if name != 'bot_core':
-                    setattr(self.components['bot_core'], name, component)
-            
-            logger.info("✅ Bot core initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Bot core initialization error: {e}")
-            return False
-    
-    def initialize_flask_webapp(self) -> bool:
-        """Initialize Flask web application"""
-        try:
-            logger.info("🌐 Initializing Flask web application...")
-            
-            from flask_webapp import create_app
-            
-            # Create Flask app with all components
-            self.components['webapp'] = create_app(self.components)
-            
-            logger.info("✅ Flask web application initialized")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Flask webapp initialization error: {e}")
-            return False
-    
-    def start_background_services(self):
-        """Start background services"""
-        try:
-            logger.info("🔄 Starting background services...")
-            
-            # Start scanner if available
-            if 'scanner' in self.components:
-                if hasattr(self.components['scanner'], 'start_scanning'):
-                    threading.Thread(
-                        target=self.components['scanner'].start_scanning, 
-                        daemon=True
-                    ).start()
-            
-            # Start volatility analyzer if available
-            if 'volatility_analyzer' in self.components:
-                if hasattr(self.components['volatility_analyzer'], 'start_analysis'):
-                    threading.Thread(
-                        target=self.components['volatility_analyzer'].start_analysis, 
-                        daemon=True
-                    ).start()
-            
-            # Start monitoring if available
-            if 'monitoring' in self.components:
-                if hasattr(self.components['monitoring'], 'start_monitoring'):
-                    threading.Thread(
-                        target=self.components['monitoring'].start_monitoring, 
-                        daemon=True
-                    ).start()
-            
-            # Start bot core if available
-            if 'bot_core' in self.components:
-                if hasattr(self.components['bot_core'], 'start'):
-                    self.components['bot_core'].start()
-            
-            logger.info("✅ Background services started")
-            
-        except Exception as e:
-            logger.error(f"❌ Background services start error: {e}")
-    
-    def start_health_monitor(self):
-        """Start health monitoring"""
-        def health_monitor():
-            logger.info("🏥 Health monitor started")
-            
-            while self.is_running:
-                try:
-                    # Basic health checks every 5 minutes
-                    if int(time.time()) % 300 == 0:
-                        status = {
-                            'uptime_minutes': int((datetime.now() - self.startup_time).total_seconds() / 60),
-                            'components_loaded': len(self.components),
-                            'components': list(self.components.keys())
-                        }
-                        logger.info(f"🏥 Health Status: {status}")
-                    
-                    time.sleep(60)  # Check every minute
-                    
-                except Exception as e:
-                    logger.error(f"❌ Health monitor error: {e}")
-                    time.sleep(60)
-            
-            logger.info("🏥 Health monitor stopped")
+    def start_system(self):
+        """Start the complete production system"""
+        print("\n🎯 Starting Trading Bot Production System...")
         
-        health_thread = threading.Thread(target=health_monitor, daemon=True)
-        health_thread.start()
-    
-    def get_external_ip(self) -> str:
-        """Get external IP address"""
         try:
-            import requests
-            response = requests.get('http://ifconfig.me', timeout=5)
-            return response.text.strip()
-        except:
-            return "localhost"
-    
-    def print_startup_info(self):
-        """Print startup information"""
-        try:
-            external_ip = self.get_external_ip()
-            
-            startup_info = f"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                    🤖 FlyingBuddha Trading Bot - READY                        ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║                                                                              ║
-║  🌐 Dashboard URL: http://{external_ip}:5000                          ║
-║  📊 Health Check: http://{external_ip}:5000/api/health                ║
-║  📈 Bot Status:   http://{external_ip}:5000/api/status                ║
-║                                                                              ║
-║  📁 Working Dir:  {os.getcwd():<50} ║
-║  🕐 Started At:   {self.startup_time.strftime('%Y-%m-%d %H:%M:%S'):<50} ║
-║  📋 Log Files:    logs/production.log                                        ║
-║                                                                              ║
-║  🔧 Components Loaded: {len(self.components):<45} ║
-║     {', '.join(self.components.keys()):<60} ║
-║                                                                              ║
-║  🎯 Features Available:                                                      ║
-║     📊 Dynamic Scanner: 20-50 stocks, auto-refresh every 20 minutes          ║
-║     ⚡ 10 Scalping Strategies: Real-time execution on top 10 stocks          ║
-║     💰 Paper Trading: ₹1,00,000 virtual capital with real market data        ║
-║     🌐 Web Interface: Full dashboard at http://{external_ip}:5000     ║
-║     🔄 Real-time Updates: WebSocket streaming                                ║
-║     📈 Volatility Analysis: Live market analysis                             ║
-║     🛡️ Risk Management: Position & loss limits                               ║
-║     📊 Performance Analytics: Detailed trading reports                       ║
-║                                                                              ║
-║  📱 Quick API Endpoints:                                                     ║
-║     GET  /api/status           - Bot status                                  ║
-║     GET  /api/scanner/results  - Scanner results                             ║
-║     GET  /api/volatility       - Volatility data                            ║
-║     POST /api/strategies/start - Start strategies                            ║
-║     POST /api/strategies/stop  - Stop strategies                             ║
-║     GET  /api/paper/portfolio  - Paper trading portfolio                     ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
-            print(startup_info)
-            logger.info("✅ Startup information displayed")
-            
-        except Exception as e:
-            logger.error(f"❌ Startup info display error: {e}")
-    
-    def save_startup_info(self):
-        """Save startup information to file"""
-        try:
-            startup_data = {
-                'startup_time': self.startup_time.isoformat(),
-                'working_directory': os.getcwd(),
-                'python_version': sys.version,
-                'pid': os.getpid(),
-                'components_loaded': list(self.components.keys()),
-                'external_ip': self.get_external_ip(),
-                'environment': 'production'
-            }
-            
-            with open('data/startup_info.json', 'w') as f:
-                json.dump(startup_data, f, indent=4)
-            
-            logger.info("✅ Startup info saved to data/startup_info.json")
-            
-        except Exception as e:
-            logger.error(f"❌ Startup info save error: {e}")
-    
-    def graceful_shutdown(self):
-        """Graceful shutdown procedure"""
-        try:
-            if not self.is_running:
-                return
-            
-            logger.info("🔄 Initiating graceful shutdown...")
-            self.is_running = False
-            
-            # Shutdown components
-            for name, component in self.components.items():
-                try:
-                    if hasattr(component, 'shutdown'):
-                        logger.info(f"🔄 Shutting down {name}...")
-                        component.shutdown()
-                    elif hasattr(component, 'stop'):
-                        logger.info(f"🔄 Stopping {name}...")
-                        component.stop()
-                except Exception as e:
-                    logger.error(f"❌ Error shutting down {name}: {e}")
-            
-            # Save final state
-            self.save_shutdown_info()
-            
-            logger.info("✅ Graceful shutdown completed")
-            
-        except Exception as e:
-            logger.error(f"❌ Graceful shutdown error: {e}")
-    
-    def save_shutdown_info(self):
-        """Save shutdown information"""
-        try:
-            shutdown_data = {
-                'shutdown_time': datetime.now().isoformat(),
-                'uptime_seconds': (datetime.now() - self.startup_time).total_seconds(),
-                'components_shutdown': list(self.components.keys()),
-                'shutdown_reason': 'graceful'
-            }
-            
-            with open('data/shutdown_info.json', 'w') as f:
-                json.dump(shutdown_data, f, indent=4)
-            
-            logger.info("✅ Shutdown info saved")
-            
-        except Exception as e:
-            logger.error(f"❌ Shutdown info save error: {e}")
-    
-    def run(self) -> bool:
-        """Main run method"""
-        try:
-            logger.info("🚀 Starting FlyingBuddha Trading Bot Production System")
-            
-            # Pre-flight checks
-            if not self.check_files():
+            # Initialize API components
+            success = init_api_components()
+            if not success:
+                print("❌ Failed to initialize API components")
                 return False
             
-            # Setup environment
-            self.create_directories()
-            
-            # Initialize components in order
-            initialization_steps = [
-                ("Configuration Manager", self.initialize_config_manager),
-                ("Security Manager", self.initialize_security_manager),
-                ("Database", self.initialize_database),
-                ("Data Manager", self.initialize_data_manager),
-                ("Goodwill API", self.initialize_goodwill_api),
-                ("Dynamic Scanner", self.initialize_dynamic_scanner),
-                ("Volatility Analyzer", self.initialize_volatility_analyzer),
-                ("Strategy Manager", self.initialize_strategy_manager),
-                ("Execution Manager", self.initialize_execution_manager),
-                ("Paper Trading", self.initialize_paper_trading),
-                ("WebSocket Manager", self.initialize_websocket_manager),
-                ("Monitoring", self.initialize_monitoring),
-                ("Bot Core", self.initialize_bot_core),
-                ("Flask Web App", self.initialize_flask_webapp)
-            ]
-            
-            # Execute initialization steps
-            for step_name, step_function in initialization_steps:
-                try:
-                    if not step_function():
-                        logger.warning(f"⚠️ {step_name} initialization failed, continuing...")
-                except Exception as e:
-                    logger.warning(f"⚠️ {step_name} initialization error: {e}, continuing...")
-            
-            # Check if we have minimum required components
-            if len(self.components) < 3:
-                logger.error("❌ Too few components initialized!")
-                return False
-            
-            # Mark as running
             self.is_running = True
             
-            # Start background services
-            self.start_background_services()
+            # Get Flask configuration
+            flask_config = self.config_manager.flask
             
-            # Save startup info
-            self.save_startup_info()
+            # Start Flask application
+            print(f"🌐 Starting Flask server on {flask_config.host}:{flask_config.port}")
+            print(f"🔗 Access the application at: http://{flask_config.host}:{flask_config.port}")
             
-            # Start health monitor
-            self.start_health_monitor()
-            
-            # Display startup info
-            self.print_startup_info()
-            
-            # Run Flask app (this blocks)
-            if 'webapp' in self.components:
-                logger.info("🎯 Starting Flask web application...")
-                self.components['webapp'].run(
-                    host='0.0.0.0',
-                    port=5000,
-                    debug=False,
-                    use_reloader=False,
-                    threaded=True
-                )
-            else:
-                logger.error("❌ Flask webapp not available, entering maintenance mode...")
-                # Keep running for background services
-                while self.is_running:
-                    time.sleep(60)
+            # Start the Flask app
+            self.app.run(
+                host=flask_config.host,
+                port=flask_config.port,
+                debug=flask_config.debug,
+                threaded=True,
+                use_reloader=False  # Disable reloader in production
+            )
             
             return True
+            
+        except Exception as e:
+            print(f"❌ Failed to start system: {e}")
+            return False
+    
+    def shutdown(self):
+        """Gracefully shutdown the system"""
+        if not self.is_running:
+            return
+        
+        print("\n🛑 Shutting down Trading Bot Production System...")
+        
+        try:
+            # Stop all bot instances
+            if self.bot_instances:
+                print("🤖 Stopping bot instances...")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                for user_id, bot in self.bot_instances.items():
+                    try:
+                        loop.run_until_complete(bot.stop())
+                        print(f"   ✅ Stopped bot for user: {user_id}")
+                    except Exception as e:
+                        print(f"   ❌ Error stopping bot for {user_id}: {e}")
+                
+                loop.close()
+            
+            # Close database connections
+            if self.db_manager:
+                print("🗄️  Closing database connections...")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.db_manager.close())
+                loop.close()
+            
+            # Close config manager connections
+            if self.config_manager:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self.config_manager.close())
+                loop.close()
+            
+            self.is_running = False
+            print("✅ System shutdown complete")
+            
+        except Exception as e:
+            print(f"❌ Error during shutdown: {e}")
+    
+    def run(self):
+        """Main run method"""
+        print("="*60)
+        print("🚀 TRADING BOT PRODUCTION SYSTEM")
+        print("="*60)
+        
+        try:
+            # Step 1: Check prerequisites
+            if not self.check_prerequisites():
+                return False
+            
+            # Step 2: Generate production files
+            if not self.generate_production_files():
+                return False
+            
+            # Step 3: Initialize configuration
+            if not self.initialize_configuration():
+                return False
+            
+            # Step 4: Initialize database
+            if not self.initialize_database():
+                return False
+            
+            # Step 5: Create Flask app
+            if not self.create_flask_app():
+                return False
+            
+            # Step 6: Setup signal handlers
+            self.setup_signal_handlers()
+            
+            # Step 7: Start the system
+            print("\n🎉 All systems initialized successfully!")
+            print("📋 System Summary:")
+            print(f"   📁 Project root: {self.project_root}")
+            print(f"   🐍 Python version: {sys.version}")
+            print(f"   🗄️  Database: PostgreSQL + SQLite")
+            print(f"   🌐 Web interface: Flask")
+            print(f"   🤖 Bot engine: Multi-user support")
+            print(f"   📊 Risk management: User-configurable")
+            
+            return self.start_system()
             
         except KeyboardInterrupt:
-            logger.info("🛑 Keyboard interrupt received")
+            print("\n👋 Shutdown requested by user")
+            self.shutdown()
             return True
-        except Exception as e:
-            logger.error(f"❌ Production runner error: {e}")
-            import traceback
-            logger.error(f"📋 Traceback: {traceback.format_exc()}")
-            return False
-        finally:
-            self.graceful_shutdown()
-
-def install_dependencies():
-    """Install required dependencies"""
-    try:
-        logger.info("📦 Installing dependencies...")
-        
-        dependencies = [
-            'flask>=2.0.0',
-            'flask-cors>=3.0.0',
-            'flask-socketio>=5.0.0',
-            'requests>=2.25.0',
-            'websocket-client>=1.0.0',
-            'pandas>=1.3.0',
-            'numpy>=1.21.0',
-            'ta-lib',
-            'yfinance>=0.1.70',
-            'schedule>=1.1.0',
-            'pytz>=2021.1',
-            'python-dotenv>=0.19.0'
-        ]
-        
-        import subprocess
-        for dep in dependencies:
-            logger.info(f"📦 Installing {dep}...")
-            result = subprocess.run([
-                sys.executable, '-m', 'pip', 'install', dep
-            ], capture_output=True, text=True)
             
-            if result.returncode != 0:
-                logger.warning(f"⚠️ Failed to install {dep}: {result.stderr}")
-        
-        logger.info("✅ Dependencies installation completed")
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Dependency installation error: {e}")
-        return False
+        except Exception as e:
+            print(f"\n💥 System error: {e}")
+            self.logger.error(f"System error: {e}")
+            self.shutdown()
+            return False
+
+def print_usage():
+    """Print usage information"""
+    print("""
+Trading Bot Production System
+
+Usage:
+    python run_production.py [OPTIONS]
+
+Options:
+    --help, -h          Show this help message
+    --project-root DIR  Set project root directory (default: current directory)
+    --config FILE       Specify config file (default: config/config.json)
+    --generate-only     Only generate files, don't start system
+    --check-only        Only check prerequisites
+    
+Examples:
+    python run_production.py
+    python run_production.py --project-root /path/to/project
+    python run_production.py --generate-only
+    python run_production.py --check-only
+    
+Environment Variables:
+    Set these in your .env file:
+    - DATABASE_URL: PostgreSQL connection string
+    - FLASK_SECRET_KEY: Flask secret key
+    - GOODWILL_API_KEY: Goodwill API key
+    - TRADING_MODE: 'paper' or 'live'
+    
+For more information, see README.md
+""")
 
 def main():
     """Main entry point"""
+    # Parse command line arguments
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Trading Bot Production System')
+    parser.add_argument('--project-root', default='.', 
+                       help='Project root directory (default: current directory)')
+    parser.add_argument('--config', default='config/config.json',
+                       help='Config file path (default: config/config.json)')
+    parser.add_argument('--generate-only', action='store_true',
+                       help='Only generate files, don\'t start system')
+    parser.add_argument('--check-only', action='store_true',
+                       help='Only check prerequisites')
+    parser.add_argument('--version', action='version', version='Trading Bot 1.0.0')
+    
+    args = parser.parse_args()
+    
+    # Create production system
+    system = TradingBotProductionSystem(args.project_root)
+    
     try:
-        # Handle command line arguments
-        if len(sys.argv) > 1:
-            command = sys.argv[1].lower()
-            
-            if command == 'install-deps':
-                return install_dependencies()
-            elif command == 'help':
-                print("""
-FlyingBuddha Trading Bot - Production Runner
-
-Usage:
-  python run_production.py                 # Run the trading bot
-  python run_production.py install-deps    # Install dependencies
-  python run_production.py help            # Show this help
-
-Environment Variables:
-  TRADING_BOT_ENV=production               # Set environment
-  TRADING_BOT_PORT=5000                   # Set port (default: 5000)
-  TRADING_BOT_DEBUG=false                 # Enable debug mode
-
-The bot will automatically:
-- Initialize all 18 components
-- Start dynamic scanner (20-50 stocks)
-- Run 10 scalping strategies
-- Enable paper trading with ₹1,00,000
-- Launch web dashboard on port 5000
-- Monitor system health
-- Handle market hours automation
-""")
-                return True
+        if args.check_only:
+            # Only check prerequisites
+            success = system.check_prerequisites()
+            sys.exit(0 if success else 1)
         
-        # Run the production system
-        runner = ProductionRunner()
-        return runner.run()
+        elif args.generate_only:
+            # Only generate files
+            success = system.generate_production_files()
+            sys.exit(0 if success else 1)
+        
+        else:
+            # Run the complete system
+            success = system.run()
+            sys.exit(0 if success else 1)
+            
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
+        sys.exit(0)
         
     except Exception as e:
-        logger.error(f"❌ Main error: {e}")
-        return False
+        print(f"\n💥 Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    main()
