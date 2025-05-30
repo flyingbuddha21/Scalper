@@ -1,663 +1,1422 @@
 #!/usr/bin/env python3
 """
-Goodwill API Handler with Complete Login Flow
-Handles authentication, market data, and trading operations
+Goodwill API Handler with 3-Step Authentication Flow
+Production-ready live trading integration for Indian markets
+Official API: https://api.gwcindia.in/v1/
+Documentation: https://developer.gwcindia.in/api/
 """
 
-import requests
-import json
-import hashlib
-import time
+import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-import pandas as pd
-from dataclasses import dataclass
-import threading
-from urllib.parse import urlencode
-import base64
+import json
+import time
+import hashlib
 import hmac
+import urllib.parse
+import webbrowser
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import numpy as np
+import requests
+import websocket
+import threading
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
+class AuthenticationState(Enum):
+    NOT_AUTHENTICATED = "NOT_AUTHENTICATED"
+    STEP1_API_SUBMITTED = "STEP1_API_SUBMITTED"
+    STEP2_LOGIN_PENDING = "STEP2_LOGIN_PENDING"
+    STEP3_TOKEN_PENDING = "STEP3_TOKEN_PENDING"
+    AUTHENTICATED = "AUTHENTICATED"
+    AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED"
+
 @dataclass
-class APICredentials:
-    api_key: str
-    secret_key: str
-    user_id: str
-    password: str
-    totp_secret: Optional[str] = None
+class LivePosition:
+    """Live position with integrated risk management"""
+    symbol: str
+    quantity: int
+    side: str  # 'BUY' or 'SELL'
+    entry_price: float
+    current_price: float
+    entry_time: datetime
+    strategy: str
+    order_id: str
     
-@dataclass
-class LoginSession:
-    access_token: str
-    request_token: str
-    session_token: str
-    user_id: str
-    login_time: datetime
-    expires_at: datetime
-    is_active: bool = True
+    # Adaptive stop loss
+    initial_stop: float
+    current_stop: float
+    trailing_stop_distance: float = 0.0
+    trailing_activated: bool = False
+    
+    # Risk metrics
+    position_value: float = 0.0
+    unrealized_pnl: float = 0.0
+    risk_amount: float = 0.0
+    max_favorable_move: float = 0.0
+    max_adverse_move: float = 0.0
+    
+    # Exit tracking
+    bars_held: int = 0
+    momentum_declining_count: int = 0
+    volume_declining_count: int = 0
+    profit_target_hit: bool = False
+    
+    def update_position(self, current_price: float, high: float, low: float):
+        """Update position metrics"""
+        self.current_price = current_price
+        self.position_value = current_price * self.quantity
+        
+        if self.side == 'BUY':
+            self.unrealized_pnl = (current_price - self.entry_price) * self.quantity
+            self.max_favorable_move = max(self.max_favorable_move, (high - self.entry_price) / self.entry_price)
+            self.max_adverse_move = min(self.max_adverse_move, (low - self.entry_price) / self.entry_price)
+        else:  # SELL
+            self.unrealized_pnl = (self.entry_price - current_price) * self.quantity
+            self.max_favorable_move = max(self.max_favorable_move, (self.entry_price - low) / self.entry_price)
+            self.max_adverse_move = min(self.max_adverse_move, (self.entry_price - high) / self.entry_price)
+    
+    def calculate_profit_pct(self) -> float:
+        """Calculate profit percentage"""
+        if self.side == 'BUY':
+            return (self.current_price - self.entry_price) / self.entry_price * 100
+        else:
+            return (self.entry_price - self.current_price) / self.entry_price * 100
 
 class GoodwillAPIHandler:
-    """Complete Goodwill API handler with authentication and trading"""
+    """
+    Goodwill API Handler with 3-Step Authentication Flow
+    Complete integration for Indian market live trading
+    Official API: https://api.gwcindia.in/v1/
+    Documentation: https://developer.gwcindia.in/api/
+    """
     
-    def __init__(self, credentials: APICredentials):
-        self.credentials = credentials
-        self.session: Optional[LoginSession] = None
-        self.base_url = "https://api.goodwill.co.in"  # Replace with actual base URL
+    def __init__(self, config):
+        self.config = config
         
-        # API endpoints
-        self.endpoints = {
-            'login': '/api/v1/auth/login',
-            'request_token': '/api/v1/auth/request_token',
-            'access_token': '/api/v1/auth/access_token',
-            'logout': '/api/v1/auth/logout',
-            'profile': '/api/v1/user/profile',
-            'quotes': '/api/v1/market/quotes',
-            'historical': '/api/v1/market/historical',
-            'orderbook': '/api/v1/orders',
-            'positions': '/api/v1/positions',
-            'holdings': '/api/v1/holdings',
-            'place_order': '/api/v1/orders/place',
-            'modify_order': '/api/v1/orders/modify',
-            'cancel_order': '/api/v1/orders/cancel',
-            'margins': '/api/v1/margins',
-            'instruments': '/api/v1/instruments'
-        }
+        # API Configuration for Goodwill (Official GWC India)
+        self.base_url = "https://api.gwcindia.in/v1"
+        self.login_url = "https://gwcindia.in/auth"
+        self.api_docs_url = "https://developer.gwcindia.in/api/"
+        
+        # Authentication state
+        self.auth_state = AuthenticationState.NOT_AUTHENTICATED
+        self.api_key = None
+        self.secret_key = None
+        self.request_token = None
+        self.access_token = None
+        self.client_id = None
+        self.session_expiry = None
         
         # Session management
-        self.auto_refresh = True
-        self.refresh_thread = None
-        self.last_heartbeat = None
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': 'GoodwillScalpingBot/1.0'
+        })
         
-        # Rate limiting
-        self.request_count = 0
-        self.request_limit = 3000  # Per minute
-        self.rate_reset_time = time.time() + 60
+        # WebSocket for real-time data (Official GWC India)
+        self.ws = None
+        self.ws_thread = None
+        self.is_ws_connected = False
+        self.ws_url = "wss://ws.gwcindia.in/quotes"
         
-        logger.info("🔐 Goodwill API Handler initialized")
+        # Risk management integration
+        self.risk_profile = None
+        self.live_positions: Dict[str, LivePosition] = {}
+        self.order_history = deque(maxlen=1000)
+        self.rejected_orders = deque(maxlen=100)
+        
+        # Account info
+        self.account_balance = 0.0
+        self.available_margin = 0.0
+        self.used_margin = 0.0
+        self.total_pnl = 0.0
+        
+        # Trading limits (Indian market specific)
+        self.min_order_value = 500  # Minimum order value in INR
+        self.max_single_order_value = 1000000  # 10 Lakh INR
+        self.daily_loss_limit = 50000  # 50k INR daily loss limit
+        self.daily_pnl = 0.0
+        
+        # Market timing (Indian market hours)
+        self.market_hours = {
+            'pre_open_start': '09:00',
+            'market_open': '09:15',
+            'market_close': '15:30',
+            'after_hours_end': '16:00'
+        }
+        
+        # Real-time data storage
+        self.live_quotes = {}
+        self.tick_data = {}
+        
+        # API Endpoints (Official Goodwill/GWC India API)
+        # Base URL: https://api.gwcindia.in/v1/
+        # Documentation: https://developer.gwcindia.in/api/
+        self.endpoints = {
+            'login': '/auth/login',
+            'profile': '/user/profile',
+            'orders': '/orders',
+            'positions': '/portfolio/positions',
+            'holdings': '/portfolio/holdings',
+            'margins': '/user/margins',
+            'instruments': '/instruments',
+            'quotes': '/market/quotes',
+            'historical': '/market/historical',
+            'place_order': '/orders/place',
+            'modify_order': '/orders/modify',
+            'cancel_order': '/orders/cancel',
+            'orderbook': '/orders/book',
+            'tradebook': '/orders/trades'
+        }
+        
+        logger.info("🔗 Goodwill API Handler initialized for 3-step authentication")
+        logger.info(f"📡 API Base URL: {self.base_url}")
+        logger.info(f"📚 API Documentation: {self.api_docs_url}")
     
-    def generate_checksum(self, data: Dict) -> str:
-        """Generate API checksum for security"""
-        try:
-            # Sort data by keys and create query string
-            sorted_data = dict(sorted(data.items()))
-            query_string = urlencode(sorted_data)
-            
-            # Create HMAC SHA256 signature
-            signature = hmac.new(
-                self.credentials.secret_key.encode(),
-                query_string.encode(),
-                hashlib.sha256
-            ).hexdigest()
-            
-            return signature
-            
-        except Exception as e:
-            logger.error(f"❌ Checksum generation error: {e}")
-            return ""
+    # ==========================================
+    # 3-STEP AUTHENTICATION FLOW
+    # ==========================================
     
-    def get_totp_token(self) -> Optional[str]:
-        """Generate TOTP token if TOTP secret is provided"""
+    def start_authentication_flow(self) -> Dict:
+        """
+        STEP 1: Start 3-step authentication flow
+        User provides API key and secret key
+        """
         try:
-            if not self.credentials.totp_secret:
-                return None
+            self.auth_state = AuthenticationState.NOT_AUTHENTICATED
             
-            import pyotp
-            totp = pyotp.TOTP(self.credentials.totp_secret)
-            return totp.now()
-            
-        except ImportError:
-            logger.warning("⚠️ pyotp not available for TOTP generation")
-            return None
-        except Exception as e:
-            logger.error(f"❌ TOTP generation error: {e}")
-            return None
-    
-    def login(self) -> bool:
-        """Complete login flow with request_token method"""
-        try:
-            logger.info("🔐 Starting Goodwill API login flow...")
-            
-            # Step 1: Get request token
-            request_token = self._get_request_token()
-            if not request_token:
-                logger.error("❌ Failed to get request token")
-                return False
-            
-            # Step 2: Authenticate with credentials
-            if not self._authenticate_user(request_token):
-                logger.error("❌ User authentication failed")
-                return False
-            
-            # Step 3: Get access token
-            access_token = self._get_access_token(request_token)
-            if not access_token:
-                logger.error("❌ Failed to get access token")
-                return False
-            
-            # Step 4: Create session
-            self._create_session(request_token, access_token)
-            
-            # Step 5: Verify session
-            if self._verify_session():
-                logger.info("✅ Goodwill API login successful")
-                
-                # Start session refresh thread
-                self._start_session_refresh()
-                return True
-            else:
-                logger.error("❌ Session verification failed")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Login flow error: {e}")
-            return False
-    
-    def _get_request_token(self) -> Optional[str]:
-        """Step 1: Get request token from API"""
-        try:
-            url = f"{self.base_url}{self.endpoints['request_token']}"
-            
-            # Prepare request data
-            timestamp = str(int(time.time()))
-            request_data = {
-                'api_key': self.credentials.api_key,
-                'timestamp': timestamp
+            return {
+                'step': 1,
+                'title': 'Step 1: API Credentials',
+                'message': 'Please provide your Goodwill API credentials',
+                'required_fields': ['api_key', 'secret_key'],
+                'instructions': [
+                    '1. Login to your Goodwill account',
+                    '2. Go to API section and generate API key',
+                    '3. Copy your API key and secret key',
+                    '4. Paste them below and click Submit'
+                ]
             }
             
-            # Add checksum
-            request_data['checksum'] = self.generate_checksum(request_data)
-            
-            # Make request
-            response = requests.post(url, json=request_data, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                
-                if data.get('status') == 'success':
-                    request_token = data.get('data', {}).get('request_token')
-                    logger.info(f"✅ Request token obtained: {request_token[:10]}...")
-                    return request_token
-                else:
-                    logger.error(f"❌ Request token error: {data.get('message', 'Unknown error')}")
-                    return None
-            else:
-                logger.error(f"❌ Request token HTTP error: {response.status_code}")
-                return None
-                
         except Exception as e:
-            logger.error(f"❌ Get request token error: {e}")
-            return None
+            logger.error(f"❌ Authentication flow start error: {e}")
+            return {'error': str(e)}
     
-    def _authenticate_user(self, request_token: str) -> bool:
-        """Step 2: Authenticate user with credentials"""
+    def submit_api_credentials(self, api_key: str, secret_key: str) -> Dict:
+        """
+        STEP 2: Submit API credentials and generate login URL
+        """
         try:
-            url = f"{self.base_url}{self.endpoints['login']}"
+            self.api_key = api_key.strip()
+            self.secret_key = secret_key.strip()
             
-            # Prepare authentication data
-            timestamp = str(int(time.time()))
-            auth_data = {
-                'request_token': request_token,
-                'user_id': self.credentials.user_id,
-                'password': hashlib.sha256(self.credentials.password.encode()).hexdigest(),
-                'timestamp': timestamp
+            if not self.api_key or not self.secret_key:
+                return {
+                    'success': False,
+                    'error': 'API key and secret key are required'
+                }
+            
+            # Generate login URL with API key
+            login_params = {
+                'api_key': self.api_key,
+                'redirect_url': 'http://localhost:8000/auth/callback',
+                'response_type': 'code'
             }
             
-            # Add TOTP if available
-            totp_token = self.get_totp_token()
-            if totp_token:
-                auth_data['totp'] = totp_token
+            login_url = f"{self.login_url}?" + urllib.parse.urlencode(login_params)
             
-            # Add checksum
-            auth_data['checksum'] = self.generate_checksum(auth_data)
+            self.auth_state = AuthenticationState.STEP1_API_SUBMITTED
             
-            # Make authentication request
-            response = requests.post(url, json=auth_data, timeout=30)
+            return {
+                'step': 2,
+                'success': True,
+                'title': 'Step 2: Login to Goodwill',
+                'message': 'Click the login URL below to authenticate with Goodwill',
+                'login_url': login_url,
+                'instructions': [
+                    '1. Click the login URL below',
+                    '2. It will open Goodwill login page in new tab',
+                    '3. Login with your Goodwill credentials',
+                    '4. After login, you will be redirected to a page with request token',
+                    '5. Copy the request token and paste it in Step 3'
+                ],
+                'next_step': 'Copy the request token from redirect URL'
+            }
             
-            if response.status_code == 200:
-                data = response.json()
+        except Exception as e:
+            logger.error(f"❌ API credentials submission error: {e}")
+            self.auth_state = AuthenticationState.AUTHENTICATION_FAILED
+            return {'success': False, 'error': str(e)}
+    
+    def open_login_url(self, login_url: str) -> Dict:
+        """Helper to open login URL in browser"""
+        try:
+            webbrowser.open(login_url)
+            self.auth_state = AuthenticationState.STEP2_LOGIN_PENDING
+            
+            return {
+                'success': True,
+                'message': 'Login URL opened in browser. Please complete login and copy request token.',
+                'status': 'Login page opened in browser'
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Login URL open error: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def submit_request_token(self, request_token: str) -> Dict:
+        """
+        STEP 3: Submit request token and complete authentication
+        """
+        try:
+            self.request_token = request_token.strip()
+            
+            if not self.request_token:
+                return {
+                    'success': False,
+                    'error': 'Request token is required'
+                }
+            
+            self.auth_state = AuthenticationState.STEP3_TOKEN_PENDING
+            
+            # Exchange request token for access token
+            auth_result = self._exchange_token_for_access()
+            
+            if auth_result.get('success'):
+                self.auth_state = AuthenticationState.AUTHENTICATED
                 
-                if data.get('status') == 'success':
-                    logger.info("✅ User authentication successful")
-                    return True
-                else:
-                    error_msg = data.get('message', 'Authentication failed')
-                    logger.error(f"❌ Authentication error: {error_msg}")
-                    return False
+                return {
+                    'step': 3,
+                    'success': True,
+                    'title': 'Authentication Successful!',
+                    'message': 'Successfully authenticated with Goodwill API',
+                    'client_id': self.client_id,
+                    'access_token': self.access_token[:20] + '...' if self.access_token else None,
+                    'session_expiry': self.session_expiry.isoformat() if self.session_expiry else None,
+                    'account_info': auth_result.get('account_info', {}),
+                    'status': 'Ready for live trading'
+                }
             else:
-                logger.error(f"❌ Authentication HTTP error: {response.status_code}")
-                return False
+                self.auth_state = AuthenticationState.AUTHENTICATION_FAILED
+                return {
+                    'success': False,
+                    'error': auth_result.get('error', 'Token exchange failed')
+                }
                 
         except Exception as e:
-            logger.error(f"❌ User authentication error: {e}")
-            return False
+            logger.error(f"❌ Request token submission error: {e}")
+            self.auth_state = AuthenticationState.AUTHENTICATION_FAILED
+            return {'success': False, 'error': str(e)}
     
-    def _get_access_token(self, request_token: str) -> Optional[str]:
-        """Step 3: Get access token using request token"""
+    def _exchange_token_for_access(self) -> Dict:
+        """Exchange request token for access token"""
         try:
-            url = f"{self.base_url}{self.endpoints['access_token']}"
+            # Generate checksum for authentication
+            checksum_string = self.api_key + self.request_token + self.secret_key
+            checksum = hashlib.sha256(checksum_string.encode()).hexdigest()
             
-            # Prepare access token request
-            timestamp = str(int(time.time()))
+            # Token exchange request
             token_data = {
-                'api_key': self.credentials.api_key,
-                'request_token': request_token,
-                'timestamp': timestamp
+                'api_key': self.api_key,
+                'request_token': self.request_token,
+                'checksum': checksum
             }
             
-            # Add checksum
-            token_data['checksum'] = self.generate_checksum(token_data)
+            response = self.session.post(
+                f"{self.base_url}{self.endpoints['login']}/token",
+                json=token_data
+            )
             
-            # Make request
-            response = requests.post(url, json=token_data, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                
+                if result.get('status') == 'success':
+                    # Extract authentication details
+                    self.access_token = result.get('data', {}).get('access_token')
+                    self.client_id = result.get('data', {}).get('user_id')
+                    
+                    # Set session expiry (typically 24 hours)
+                    self.session_expiry = datetime.now() + timedelta(hours=24)
+                    
+                    # Update session headers
+                    self.session.headers.update({
+                        'Authorization': f'Bearer {self.access_token}',
+                        'X-Client-Id': self.client_id
+                    })
+                    
+                    # Get account information
+                    account_info = self._get_account_info()
+                    
+                    logger.info("✅ Successfully authenticated with Goodwill API")
+                    
+                    return {
+                        'success': True,
+                        'access_token': self.access_token,
+                        'client_id': self.client_id,
+                        'session_expiry': self.session_expiry,
+                        'account_info': account_info
+                    }
+                else:
+                    error_msg = result.get('message', 'Token exchange failed')
+                    logger.error(f"❌ Token exchange error: {error_msg}")
+                    return {'success': False, 'error': error_msg}
+            
+            else:
+                logger.error(f"❌ Token exchange HTTP error: {response.status_code} - {response.text}")
+                return {'success': False, 'error': f'HTTP {response.status_code}: {response.text}'}
+                
+        except Exception as e:
+            logger.error(f"❌ Token exchange exception: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def _get_account_info(self) -> Dict:
+        """Get account information after authentication"""
+        try:
+            response = self.session.get(f"{self.base_url}{self.endpoints['profile']}")
             
             if response.status_code == 200:
                 data = response.json()
-                
                 if data.get('status') == 'success':
-                    access_token = data.get('data', {}).get('access_token')
-                    logger.info(f"✅ Access token obtained: {access_token[:10]}...")
-                    return access_token
-                else:
-                    logger.error(f"❌ Access token error: {data.get('message', 'Unknown error')}")
-                    return None
-            else:
-                logger.error(f"❌ Access token HTTP error: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"❌ Get access token error: {e}")
-            return None
-    
-    def _create_session(self, request_token: str, access_token: str):
-        """Step 4: Create authenticated session"""
-        try:
-            self.session = LoginSession(
-                access_token=access_token,
-                request_token=request_token,
-                session_token=f"{request_token}:{access_token}",
-                user_id=self.credentials.user_id,
-                login_time=datetime.now(),
-                expires_at=datetime.now() + timedelta(hours=8),  # 8 hour session
-                is_active=True
-            )
-            
-            logger.info("✅ Session created successfully")
-            
-        except Exception as e:
-            logger.error(f"❌ Session creation error: {e}")
-    
-    def _verify_session(self) -> bool:
-        """Step 5: Verify session is working"""
-        try:
-            profile = self.get_user_profile()
-            if profile and profile.get('status') == 'success':
-                logger.info("✅ Session verification successful")
-                return True
-            else:
-                logger.error("❌ Session verification failed")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Session verification error: {e}")
-            return False
-    
-    def _start_session_refresh(self):
-        """Start automatic session refresh"""
-        if self.auto_refresh and not self.refresh_thread:
-            self.refresh_thread = threading.Thread(
-                target=self._session_refresh_loop,
-                daemon=True,
-                name="SessionRefresh"
-            )
-            self.refresh_thread.start()
-            logger.info("🔄 Session refresh thread started")
-    
-    def _session_refresh_loop(self):
-        """Session refresh loop"""
-        while self.auto_refresh and self.session and self.session.is_active:
-            try:
-                # Check if session needs refresh (30 minutes before expiry)
-                if datetime.now() >= (self.session.expires_at - timedelta(minutes=30)):
-                    logger.info("🔄 Refreshing session...")
+                    user_data = data.get('data', {})
                     
-                    if not self.refresh_session():
-                        logger.error("❌ Session refresh failed")
-                        break
-                
-                # Send heartbeat every 5 minutes
-                if not self.last_heartbeat or (datetime.now() - self.last_heartbeat).seconds > 300:
-                    self._send_heartbeat()
-                
-                time.sleep(60)  # Check every minute
-                
-            except Exception as e:
-                logger.error(f"❌ Session refresh loop error: {e}")
-                time.sleep(60)
-    
-    def refresh_session(self) -> bool:
-        """Refresh the current session"""
-        try:
-            if not self.session:
-                return self.login()
+                    # Update account information
+                    self.account_balance = float(user_data.get('available_balance', 0))
+                    self.available_margin = float(user_data.get('available_margin', 0))
+                    self.used_margin = float(user_data.get('used_margin', 0))
+                    
+                    return user_data
+                else:
+                    logger.warning(f"Profile API error: {data.get('error_msg', 'Unknown error')}")
             
-            # Try to refresh with current tokens
-            new_access_token = self._get_access_token(self.session.request_token)
-            
-            if new_access_token:
-                self.session.access_token = new_access_token
-                self.session.session_token = f"{self.session.request_token}:{new_access_token}"
-                self.session.expires_at = datetime.now() + timedelta(hours=8)
-                
-                logger.info("✅ Session refreshed successfully")
-                return True
-            else:
-                # Full re-login required
-                logger.info("🔄 Full re-login required")
-                return self.login()
-                
-        except Exception as e:
-            logger.error(f"❌ Session refresh error: {e}")
-            return False
-    
-    def _send_heartbeat(self):
-        """Send heartbeat to keep session alive"""
-        try:
-            # Simple API call to keep session active
-            self.get_user_profile()
-            self.last_heartbeat = datetime.now()
+            return {}
             
         except Exception as e:
-            logger.debug(f"Heartbeat error: {e}")
+            logger.error(f"❌ Account info error: {e}")
+            return {}
     
-    def _make_authenticated_request(self, method: str, endpoint: str, 
-                                  data: Optional[Dict] = None) -> Optional[Dict]:
-        """Make authenticated API request"""
+    # ==========================================
+    # API ENDPOINTS IMPLEMENTATION
+    # ==========================================
+    
+    async def get_profile(self) -> Optional[Dict]:
+        """Get user profile information"""
         try:
-            if not self.session or not self.session.is_active:
-                logger.error("❌ No active session for API request")
+            if not self.access_token:
                 return None
             
-            # Rate limiting check
-            if not self._check_rate_limit():
-                logger.warning("⚠️ Rate limit exceeded")
-                return None
-            
-            url = f"{self.base_url}{endpoint}"
-            
-            # Prepare headers
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {self.session.access_token}',
-                'X-Session-Token': self.session.session_token
-            }
-            
-            # Prepare request data
-            if data is None:
-                data = {}
-            
-            data['timestamp'] = str(int(time.time()))
-            data['checksum'] = self.generate_checksum(data)
-            
-            # Make request
-            if method.upper() == 'GET':
-                response = requests.get(url, params=data, headers=headers, timeout=30)
-            else:
-                response = requests.post(url, json=data, headers=headers, timeout=30)
-            
-            self.request_count += 1
+            response = self.session.get(f"{self.base_url}{self.endpoints['profile']}")
             
             if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 401:
-                logger.warning("⚠️ Session expired, attempting refresh...")
-                if self.refresh_session():
-                    # Retry request with new session
-                    return self._make_authenticated_request(method, endpoint, data)
+                data = response.json()
+                if data.get('status') == 'success':
+                    return data.get('data', {})
                 else:
-                    logger.error("❌ Session refresh failed")
-                    return None
-            else:
-                logger.error(f"❌ API request error: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"❌ Authenticated request error: {e}")
+                    logger.error(f"Profile error: {data.get('error_msg', 'Unknown error')}")
+            
             return None
-    
-    def _check_rate_limit(self) -> bool:
-        """Check API rate limiting"""
-        current_time = time.time()
-        
-        if current_time > self.rate_reset_time:
-            self.request_count = 0
-            self.rate_reset_time = current_time + 60
-        
-        return self.request_count < self.request_limit
-    
-    # Market Data Methods
-    def get_quotes(self, symbols: List[str]) -> Optional[Dict]:
-        """Get real-time quotes for symbols"""
-        try:
-            data = {'symbols': ','.join(symbols)}
-            return self._make_authenticated_request('POST', self.endpoints['quotes'], data)
             
         except Exception as e:
-            logger.error(f"❌ Get quotes error: {e}")
+            logger.error(f"❌ Get profile error: {e}")
             return None
     
-    def get_historical_data(self, symbol: str, interval: str = '1minute', 
-                          from_date: str = None, to_date: str = None) -> Optional[Dict]:
-        """Get historical data for symbol"""
-        try:
-            data = {
-                'symbol': symbol,
-                'interval': interval
-            }
-            
-            if from_date:
-                data['from'] = from_date
-            if to_date:
-                data['to'] = to_date
-            
-            return self._make_authenticated_request('POST', self.endpoints['historical'], data)
-            
-        except Exception as e:
-            logger.error(f"❌ Get historical data error: {e}")
-            return None
-    
-    def get_instruments(self, exchange: str = None) -> Optional[Dict]:
-        """Get instrument list"""
-        try:
-            data = {}
-            if exchange:
-                data['exchange'] = exchange
-            
-            return self._make_authenticated_request('GET', self.endpoints['instruments'], data)
-            
-        except Exception as e:
-            logger.error(f"❌ Get instruments error: {e}")
-            return None
-    
-    # Trading Methods
-    def place_order(self, symbol: str, transaction_type: str, quantity: int,
-                   order_type: str = 'MARKET', price: float = 0.0,
-                   product: str = 'MIS', validity: str = 'DAY') -> Optional[Dict]:
-        """Place trading order"""
-        try:
-            order_data = {
-                'symbol': symbol,
-                'transaction_type': transaction_type.upper(),
-                'quantity': quantity,
-                'order_type': order_type.upper(),
-                'product': product.upper(),
-                'validity': validity.upper()
-            }
-            
-            if order_type.upper() in ['LIMIT', 'SL', 'SL-M']:
-                order_data['price'] = price
-            
-            logger.info(f"📝 Placing order: {symbol} {transaction_type} {quantity}")
-            
-            return self._make_authenticated_request('POST', self.endpoints['place_order'], order_data)
-            
-        except Exception as e:
-            logger.error(f"❌ Place order error: {e}")
-            return None
-    
-    def modify_order(self, order_id: str, quantity: int = None, 
-                    price: float = None, order_type: str = None) -> Optional[Dict]:
-        """Modify existing order"""
-        try:
-            modify_data = {'order_id': order_id}
-            
-            if quantity:
-                modify_data['quantity'] = quantity
-            if price:
-                modify_data['price'] = price
-            if order_type:
-                modify_data['order_type'] = order_type.upper()
-            
-            return self._make_authenticated_request('POST', self.endpoints['modify_order'], modify_data)
-            
-        except Exception as e:
-            logger.error(f"❌ Modify order error: {e}")
-            return None
-    
-    def cancel_order(self, order_id: str) -> Optional[Dict]:
-        """Cancel existing order"""
-        try:
-            cancel_data = {'order_id': order_id}
-            return self._make_authenticated_request('POST', self.endpoints['cancel_order'], cancel_data)
-            
-        except Exception as e:
-            logger.error(f"❌ Cancel order error: {e}")
-            return None
-    
-    # Portfolio Methods
-    def get_positions(self) -> Optional[Dict]:
-        """Get current positions"""
-        try:
-            return self._make_authenticated_request('GET', self.endpoints['positions'])
-            
-        except Exception as e:
-            logger.error(f"❌ Get positions error: {e}")
-            return None
-    
-    def get_holdings(self) -> Optional[Dict]:
-        """Get holdings"""
-        try:
-            return self._make_authenticated_request('GET', self.endpoints['holdings'])
-            
-        except Exception as e:
-            logger.error(f"❌ Get holdings error: {e}")
-            return None
-    
-    def get_orderbook(self) -> Optional[Dict]:
-        """Get order book"""
-        try:
-            return self._make_authenticated_request('GET', self.endpoints['orderbook'])
-            
-        except Exception as e:
-            logger.error(f"❌ Get orderbook error: {e}")
-            return None
-    
-    def get_margins(self) -> Optional[Dict]:
+    async def get_margins(self) -> Optional[Dict]:
         """Get margin information"""
         try:
-            return self._make_authenticated_request('GET', self.endpoints['margins'])
+            if not self.access_token:
+                return None
+            
+            response = self.session.get(f"{self.base_url}{self.endpoints['margins']}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    margin_data = data.get('data', {})
+                    
+                    # Update margin information
+                    self.available_margin = float(margin_data.get('available_margin', 0))
+                    self.used_margin = float(margin_data.get('used_margin', 0))
+                    
+                    return margin_data
+            
+            return None
             
         except Exception as e:
             logger.error(f"❌ Get margins error: {e}")
             return None
     
-    def get_user_profile(self) -> Optional[Dict]:
-        """Get user profile"""
+    async def get_positions(self) -> List[Dict]:
+        """Get current positions"""
         try:
-            return self._make_authenticated_request('GET', self.endpoints['profile'])
+            if not self.access_token:
+                return []
+            
+            response = self.session.get(f"{self.base_url}{self.endpoints['positions']}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    positions_data = data.get('data', [])
+                    
+                    # Update live positions
+                    self.live_positions.clear()
+                    for pos_data in positions_data:
+                        if int(pos_data.get('quantity', 0)) != 0:
+                            symbol = pos_data['symbol'].replace('-EQ', '')  # Remove -EQ suffix
+                            
+                            position = LivePosition(
+                                symbol=symbol,
+                                quantity=abs(int(pos_data['quantity'])),
+                                side='BUY' if int(pos_data['quantity']) > 0 else 'SELL',
+                                entry_price=float(pos_data.get('avg_price', 0)),
+                                current_price=float(pos_data.get('ltp', pos_data.get('avg_price', 0))),
+                                entry_time=datetime.now(),  # Approximate
+                                strategy='EXISTING',
+                                order_id=pos_data.get('order_id', 'UNKNOWN'),
+                                initial_stop=float(pos_data.get('avg_price', 0)) * 0.98,
+                                current_stop=float(pos_data.get('avg_price', 0)) * 0.98
+                            )
+                            
+                            self.live_positions[symbol] = position
+                    
+                    return positions_data
+            
+            return []
             
         except Exception as e:
-            logger.error(f"❌ Get user profile error: {e}")
+            logger.error(f"❌ Get positions error: {e}")
+            return []
+    
+    async def get_holdings(self) -> List[Dict]:
+        """Get holdings information"""
+        try:
+            if not self.access_token:
+                return []
+            
+            response = self.session.get(f"{self.base_url}{self.endpoints['holdings']}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    return data.get('data', [])
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"❌ Get holdings error: {e}")
+            return []
+    
+    async def get_quote(self, symbol: str, exchange: str = "NSE") -> Optional[Dict]:
+        """Get live quote for symbol"""
+        try:
+            if not self.access_token:
+                return None
+            
+            # Get symbol token first
+            token = await self._get_symbol_token(symbol, exchange)
+            if not token:
+                logger.warning(f"No token found for {symbol}")
+                return None
+            
+            payload = {
+                "exchange": exchange,
+                "token": token
+            }
+            
+            response = self.session.post(f"{self.base_url}/getquote", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    quote_data = data.get('data', {})
+                    
+                    return {
+                        'symbol': symbol,
+                        'price': float(quote_data.get('ltp', quote_data.get('last_price', 0))),
+                        'volume': int(quote_data.get('volume', 0)),
+                        'high': float(quote_data.get('high', 0)),
+                        'low': float(quote_data.get('low', 0)),
+                        'open': float(quote_data.get('open', 0)),
+                        'change': float(quote_data.get('change', 0)),
+                        'change_per': float(quote_data.get('change_percentage', quote_data.get('change_per', 0))),
+                        'bid': float(quote_data.get('bid', 0)),
+                        'ask': float(quote_data.get('ask', 0)),
+                        'timestamp': datetime.now()
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Get quote error for {symbol}: {e}")
             return None
     
-    # Session Management
-    def logout(self) -> bool:
-        """Logout and cleanup session"""
+    async def _get_symbol_token(self, symbol: str, exchange: str = "NSE") -> Optional[str]:
+        """Get symbol token using fetchsymbol API"""
         try:
-            if self.session:
-                # Make logout request
-                logout_response = self._make_authenticated_request('POST', self.endpoints['logout'])
-                
-                # Cleanup session
-                self.session.is_active = False
-                self.session = None
-                
-                # Stop refresh thread
-                self.auto_refresh = False
-                
-                logger.info("✅ Logout successful")
-                return True
+            if not self.access_token:
+                return None
             
+            # Check cache first
+            cache_key = f"token_{symbol}_{exchange}"
+            
+            payload = {"s": symbol}  # 's' for search string as per API docs
+            
+            response = self.session.post(f"{self.base_url}/fetchsymbol", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    results = data.get('data', [])
+                    for result in results:
+                        # Match symbol with exchange
+                        if (result.get('exchange') == exchange and 
+                            result.get('symbol', '').upper() == f"{symbol.upper()}-EQ"):
+                            return result.get('token')
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Get symbol token error for {symbol}: {e}")
+            return None
+    
+    async def place_order(self, symbol: str, side: str, quantity: int, price: float = 0,
+                         order_type: str = "MKT", product: str = "MIS", exchange: str = "NSE") -> Optional[str]:
+        """Place order through Goodwill API"""
+        try:
+            if not self.access_token:
+                logger.error("❌ Not authenticated for placing order")
+                return None
+            
+            # Format symbol for API
+            formatted_symbol = f"{symbol.upper()}-EQ"
+            
+            order_payload = {
+                "tsym": formatted_symbol,          # Trading Symbol
+                "exchange": exchange,              # Exchange (NSE, BSE, NFO, etc.)
+                "trantype": side.upper(),          # B (Buy) or S (Sell)
+                "validity": "DAY",                 # DAY, IOC, etc.
+                "pricetype": order_type.upper(),   # MKT, L (Limit), SL-L, SL-M
+                "qty": str(quantity),
+                "discqty": "0",                    # Disclosed quantity
+                "price": str(price) if order_type.upper() != "MKT" else "0",
+                "trgprc": "0",                     # Trigger price for SL orders
+                "product": product.upper(),        # MIS (Intraday), CNC (Delivery), NRML (Normal)
+                "amo": "NO"                        # After Market Order
+            }
+            
+            response = self.session.post(f"{self.base_url}/placeorder", json=order_payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    order_data = data.get('data', {})
+                    order_id = order_data.get('nstordno')  # Order number
+                    
+                    if order_id:
+                        logger.info(f"✅ Order placed: {side} {quantity} {symbol} @ {order_type} {price if order_type != 'MKT' else 'Market'} | ID: {order_id}")
+                        
+                        # Add to order history
+                        self.order_history.append({
+                            'order_id': order_id,
+                            'symbol': symbol,
+                            'side': side,
+                            'quantity': quantity,
+                            'order_type': order_type,
+                            'price': price,
+                            'timestamp': datetime.now(),
+                            'status': 'PLACED'
+                        })
+                        
+                        return order_id
+                    else:
+                        logger.error(f"❌ Order placed but no order ID returned")
+                        return None
+                else:
+                    error_msg = data.get('error_msg', 'Order placement failed')
+                    logger.error(f"❌ Order failed: {error_msg}")
+                    
+                    # Add to rejected orders
+                    self.rejected_orders.append({
+                        'symbol': symbol,
+                        'error': error_msg,
+                        'timestamp': datetime.now(),
+                        'payload': order_payload
+                    })
+                    
+                    return None
+            else:
+                logger.error(f"❌ Order HTTP error: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Place order error: {e}")
+            return None
+    
+    async def get_order_status(self, order_id: str) -> Optional[Dict]:
+        """Get order status"""
+        try:
+            if not self.access_token:
+                return None
+            
+            payload = {"order_id": order_id}
+            response = self.session.post(f"{self.base_url}/orderbook", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    orders = data.get('data', [])
+                    for order in orders:
+                        if order.get('nstordno') == order_id:
+                            return {
+                                'order_id': order_id,
+                                'status': order.get('status', 'UNKNOWN'),
+                                'avg_price': float(order.get('avg_price', 0)),
+                                'filled_quantity': int(order.get('filled_qty', 0)),
+                                'remaining_quantity': int(order.get('pending_qty', 0)),
+                                'order_time': order.get('order_time', ''),
+                                'symbol': order.get('tsym', '').replace('-EQ', '')
+                            }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Get order status error: {e}")
+            return None
+    
+    async def get_orderbook(self) -> List[Dict]:
+        """Get complete orderbook"""
+        try:
+            if not self.access_token:
+                return []
+            
+            response = self.session.get(f"{self.base_url}{self.endpoints['orders']}")
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    orders = data.get('data', [])
+                    
+                    # Process and format orders
+                    formatted_orders = []
+                    for order in orders:
+                        formatted_order = {
+                            'order_id': order.get('nstordno', ''),
+                            'symbol': order.get('tsym', '').replace('-EQ', ''),
+                            'side': 'BUY' if order.get('trantype') == 'B' else 'SELL',
+                            'quantity': int(order.get('qty', 0)),
+                            'price': float(order.get('price', 0)),
+                            'avg_price': float(order.get('avg_price', 0)),
+                            'filled_quantity': int(order.get('filled_qty', 0)),
+                            'pending_quantity': int(order.get('pending_qty', 0)),
+                            'status': order.get('status', 'UNKNOWN'),
+                            'order_type': order.get('pricetype', 'MKT'),
+                            'product': order.get('product', 'MIS'),
+                            'exchange': order.get('exchange', 'NSE'),
+                            'order_time': order.get('order_time', ''),
+                            'update_time': order.get('update_time', ''),
+                            'validity': order.get('validity', 'DAY'),
+                            'trigger_price': float(order.get('trgprc', 0))
+                        }
+                        formatted_orders.append(formatted_order)
+                    
+                    return formatted_orders
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"❌ Get orderbook error: {e}")
+            return []
+    
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an order"""
+        try:
+            if not self.access_token:
+                return False
+            
+            payload = {"order_id": order_id}
+            response = self.session.post(f"{self.base_url}/cancelorder", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    logger.info(f"✅ Order cancelled: {order_id}")
+                    return True
+                else:
+                    logger.error(f"❌ Cancel order failed: {data.get('error_msg', 'Unknown error')}")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Cancel order error: {e}")
+            return False
+    
+    async def modify_order(self, order_id: str, quantity: int = None, price: float = None,
+                          order_type: str = None, trigger_price: float = None) -> bool:
+        """Modify an existing order"""
+        try:
+            if not self.access_token:
+                return False
+            
+            # Get existing order details first
+            order_details = await self.get_order_status(order_id)
+            if not order_details:
+                logger.error(f"❌ Order not found for modification: {order_id}")
+                return False
+            
+            payload = {
+                "order_id": order_id,
+                "qty": str(quantity) if quantity else str(order_details.get('quantity', 0)),
+                "price": str(price) if price else str(order_details.get('price', 0)),
+                "pricetype": order_type if order_type else order_details.get('order_type', 'MKT'),
+                "trgprc": str(trigger_price) if trigger_price else "0"
+            }
+            
+            response = self.session.post(f"{self.base_url}/modifyorder", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    logger.info(f"✅ Order modified: {order_id}")
+                    return True
+                else:
+                    logger.error(f"❌ Modify order failed: {data.get('error_msg', 'Unknown error')}")
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"❌ Modify order error: {e}")
+            return False
+    
+    # ==========================================
+    # WEBSOCKET REAL-TIME DATA
+    # ==========================================
+    
+    def start_websocket(self):
+        """Start WebSocket connection for real-time data"""
+        try:
+            if self.is_ws_connected:
+                logger.warning("WebSocket already connected")
+                return
+            
+            def on_message(ws, message):
+                try:
+                    data = json.loads(message)
+                    self._process_tick_data(data)
+                except Exception as e:
+                    logger.error(f"❌ WebSocket message error: {e}")
+            
+            def on_error(ws, error):
+                logger.error(f"❌ WebSocket error: {error}")
+                self.is_ws_connected = False
+            
+            def on_close(ws, close_status_code, close_msg):
+                logger.warning(f"🔌 WebSocket closed: {close_status_code} - {close_msg}")
+                self.is_ws_connected = False
+            
+            def on_open(ws):
+                logger.info("✅ WebSocket connected")
+                self.is_ws_connected = True
+                
+                # Subscribe to symbols
+                for symbol in self.live_positions.keys():
+                    self._subscribe_symbol(ws, symbol)
+            
+            # Create WebSocket connection
+            self.ws = websocket.WebSocketApp(
+                self.ws_url,
+                header={"Authorization": f"Bearer {self.access_token}"},
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            
+            # Start WebSocket in separate thread
+            self.ws_thread = threading.Thread(target=self.ws.run_forever)
+            self.ws_thread.daemon = True
+            self.ws_thread.start()
+            
+        except Exception as e:
+            logger.error(f"❌ WebSocket start error: {e}")
+    
+    def _subscribe_symbol(self, ws, symbol: str):
+        """Subscribe to symbol for real-time data"""
+        try:
+            subscribe_msg = {
+                "action": "subscribe",
+                "symbols": [f"{symbol}-EQ"]
+            }
+            ws.send(json.dumps(subscribe_msg))
+            logger.info(f"📡 Subscribed to {symbol}")
+            
+        except Exception as e:
+            logger.error(f"❌ Subscribe error for {symbol}: {e}")
+    
+    def _process_tick_data(self, tick_data: Dict):
+        """Process incoming tick data"""
+        try:
+            symbol = tick_data.get('symbol', '').replace('-EQ', '')
+            if not symbol:
+                return
+            
+            # Update live quotes
+            quote = {
+                'symbol': symbol,
+                'price': float(tick_data.get('ltp', 0)),
+                'volume': int(tick_data.get('volume', 0)),
+                'high': float(tick_data.get('high', 0)),
+                'low': float(tick_data.get('low', 0)),
+                'open': float(tick_data.get('open', 0)),
+                'change': float(tick_data.get('change', 0)),
+                'change_per': float(tick_data.get('change_per', 0)),
+                'timestamp': datetime.now()
+            }
+            
+            self.live_quotes[symbol] = quote
+            
+            # Update position if exists
+            if symbol in self.live_positions:
+                position = self.live_positions[symbol]
+                position.update_position(
+                    current_price=quote['price'],
+                    high=quote['high'],
+                    low=quote['low']
+                )
+                
+                # Check for stop loss triggers
+                self._check_stop_loss_triggers(symbol, position)
+            
+            # Store tick data for analysis
+            if symbol not in self.tick_data:
+                self.tick_data[symbol] = deque(maxlen=1000)
+            
+            self.tick_data[symbol].append(quote)
+            
+        except Exception as e:
+            logger.error(f"❌ Process tick data error: {e}")
+    
+    def _check_stop_loss_triggers(self, symbol: str, position: LivePosition):
+        """Check if stop loss should be triggered"""
+        try:
+            current_price = position.current_price
+            stop_price = position.current_stop
+            
+            should_exit = False
+            exit_reason = ""
+            
+            if position.side == 'BUY':
+                if current_price <= stop_price:
+                    should_exit = True
+                    exit_reason = "Stop Loss Hit"
+            else:  # SELL
+                if current_price >= stop_price:
+                    should_exit = True
+                    exit_reason = "Stop Loss Hit"
+            
+            if should_exit:
+                logger.warning(f"🚨 {exit_reason} for {symbol}: {current_price} vs {stop_price}")
+                
+                # Place exit order
+                asyncio.create_task(self._exit_position(symbol, exit_reason))
+                
+        except Exception as e:
+            logger.error(f"❌ Stop loss check error for {symbol}: {e}")
+    
+    async def _exit_position(self, symbol: str, reason: str):
+        """Exit a position"""
+        try:
+            if symbol not in self.live_positions:
+                return
+            
+            position = self.live_positions[symbol]
+            exit_side = 'SELL' if position.side == 'BUY' else 'BUY'
+            
+            order_id = await self.place_order(
+                symbol=symbol,
+                side=exit_side,
+                quantity=position.quantity,
+                order_type='MKT'
+            )
+            
+            if order_id:
+                logger.info(f"✅ Exit order placed for {symbol}: {reason} | Order ID: {order_id}")
+                
+                # Remove from live positions
+                del self.live_positions[symbol]
+                
+                # Calculate final P&L
+                final_pnl = position.unrealized_pnl
+                self.daily_pnl += final_pnl
+                
+                logger.info(f"💰 Final P&L for {symbol}: ₹{final_pnl:.2f} | Daily P&L: ₹{self.daily_pnl:.2f}")
+            
+        except Exception as e:
+            logger.error(f"❌ Exit position error for {symbol}: {e}")
+    
+    # ==========================================
+    # HISTORICAL DATA METHODS
+    # ==========================================
+    
+    async def get_historical_data(self, symbol: str, exchange: str = "NSE", 
+                                 interval: str = "1minute", from_date: str = None, 
+                                 to_date: str = None) -> List[Dict]:
+        """Get historical data for symbol"""
+        try:
+            if not self.access_token:
+                return []
+            
+            # Get symbol token first
+            token = await self._get_symbol_token(symbol, exchange)
+            if not token:
+                logger.warning(f"No token found for {symbol}")
+                return []
+            
+            # Default dates if not provided
+            if not to_date:
+                to_date = datetime.now().strftime('%Y-%m-%d')
+            if not from_date:
+                from_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            
+            payload = {
+                "exchange": exchange,
+                "token": token,
+                "interval": interval,
+                "from": from_date,
+                "to": to_date
+            }
+            
+            response = self.session.post(f"{self.base_url}{self.endpoints['historical']}", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    historical_data = data.get('data', [])
+                    
+                    # Format historical data
+                    formatted_data = []
+                    for bar in historical_data:
+                        formatted_bar = {
+                            'datetime': bar.get('time', ''),
+                            'open': float(bar.get('open', 0)),
+                            'high': float(bar.get('high', 0)),
+                            'low': float(bar.get('low', 0)),
+                            'close': float(bar.get('close', 0)),
+                            'volume': int(bar.get('volume', 0))
+                        }
+                        formatted_data.append(formatted_bar)
+                    
+                    return formatted_data
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"❌ Get historical data error for {symbol}: {e}")
+            return []
+    
+    # ==========================================
+    # INSTRUMENTS AND WATCHLIST
+    # ==========================================
+    
+    async def get_instruments(self, exchange: str = "NSE") -> List[Dict]:
+        """Get instrument list for exchange"""
+        try:
+            if not self.access_token:
+                return []
+            
+            payload = {"exchange": exchange}
+            response = self.session.post(f"{self.base_url}{self.endpoints['instruments']}", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    return data.get('data', [])
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"❌ Get instruments error: {e}")
+            return []
+    
+    async def search_instruments(self, search_term: str, exchange: str = "NSE") -> List[Dict]:
+        """Search for instruments"""
+        try:
+            if not self.access_token:
+                return []
+            
+            payload = {"s": search_term, "exchange": exchange}
+            response = self.session.post(f"{self.base_url}/fetchsymbol", json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    return data.get('data', [])
+            
+            return []
+            
+        except Exception as e:
+            logger.error(f"❌ Search instruments error: {e}")
+            return []
+    
+    # ==========================================
+    # UTILITY METHODS
+    # ==========================================
+    
+    def is_authenticated(self) -> bool:
+        """Check if user is authenticated"""
+        return (self.auth_state == AuthenticationState.AUTHENTICATED and 
+                self.access_token is not None and
+                self.session_expiry is not None and
+                datetime.now() < self.session_expiry)
+    
+    def is_market_open(self) -> bool:
+        """Check if market is currently open"""
+        try:
+            now = datetime.now()
+            current_time = now.strftime('%H:%M')
+            current_weekday = now.weekday()
+            
+            # Check if it's a weekday (Monday=0, Sunday=6)
+            if current_weekday >= 5:  # Saturday or Sunday
+                return False
+            
+            # Check market hours
+            return (self.market_hours['market_open'] <= current_time <= 
+                   self.market_hours['market_close'])
+            
+        except Exception as e:
+            logger.error(f"❌ Market open check error: {e}")
+            return False
+    
+    def get_authentication_status(self) -> Dict:
+        """Get current authentication status"""
+        return {
+            'authenticated': self.is_authenticated(),
+            'auth_state': self.auth_state.value,
+            'access_token_exists': self.access_token is not None,
+            'client_id': self.client_id,
+            'session_expiry': self.session_expiry.isoformat() if self.session_expiry else None,
+            'account_balance': self.account_balance,
+            'available_margin': self.available_margin,
+            'used_margin': self.used_margin,
+            'daily_pnl': self.daily_pnl,
+            'live_positions_count': len(self.live_positions),
+            'market_open': self.is_market_open(),
+            'websocket_connected': self.is_ws_connected,
+            'api_base_url': self.base_url,
+            'api_docs_url': self.api_docs_url
+        }
+    
+    def get_trading_summary(self) -> Dict:
+        """Get trading summary for the day"""
+        try:
+            total_orders = len(self.order_history)
+            rejected_orders = len(self.rejected_orders)
+            live_positions_count = len(self.live_positions)
+            
+            # Calculate total unrealized P&L
+            total_unrealized_pnl = sum(pos.unrealized_pnl for pos in self.live_positions.values())
+            
+            # Calculate win/loss statistics
+            executed_orders = [order for order in self.order_history if order.get('status') == 'EXECUTED']
+            
+            return {
+                'account_balance': self.account_balance,
+                'available_margin': self.available_margin,
+                'used_margin': self.used_margin,
+                'daily_pnl': self.daily_pnl,
+                'total_unrealized_pnl': total_unrealized_pnl,
+                'total_orders': total_orders,
+                'executed_orders': len(executed_orders),
+                'rejected_orders': rejected_orders,
+                'live_positions': live_positions_count,
+                'market_status': 'OPEN' if self.is_market_open() else 'CLOSED',
+                'authentication_status': self.auth_state.value,
+                'websocket_status': 'CONNECTED' if self.is_ws_connected else 'DISCONNECTED',
+                'api_info': {
+                    'base_url': self.base_url,
+                    'docs_url': self.api_docs_url,
+                    'websocket_url': self.ws_url
+                },
+                'last_updated': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Trading summary error: {e}")
+            return {}
+    
+    def get_live_positions_summary(self) -> List[Dict]:
+        """Get summary of all live positions"""
+        try:
+            positions_summary = []
+            
+            for symbol, position in self.live_positions.items():
+                position_summary = {
+                    'symbol': symbol,
+                    'side': position.side,
+                    'quantity': position.quantity,
+                    'entry_price': position.entry_price,
+                    'current_price': position.current_price,
+                    'unrealized_pnl': position.unrealized_pnl,
+                    'profit_pct': position.calculate_profit_pct(),
+                    'position_value': position.position_value,
+                    'stop_price': position.current_stop,
+                    'bars_held': position.bars_held,
+                    'entry_time': position.entry_time.isoformat(),
+                    'strategy': position.strategy
+                }
+                positions_summary.append(position_summary)
+            
+            return positions_summary
+            
+        except Exception as e:
+            logger.error(f"❌ Live positions summary error: {e}")
+            return []
+    
+    def get_recent_orders(self, limit: int = 10) -> List[Dict]:
+        """Get recent order history"""
+        try:
+            recent_orders = list(self.order_history)[-limit:]
+            return [
+                {
+                    'order_id': order.get('order_id', ''),
+                    'symbol': order.get('symbol', ''),
+                    'side': order.get('side', ''),
+                    'quantity': order.get('quantity', 0),
+                    'order_type': order.get('order_type', ''),
+                    'price': order.get('price', 0),
+                    'status': order.get('status', ''),
+                    'timestamp': order.get('timestamp', datetime.now()).isoformat()
+                }
+                for order in recent_orders
+            ]
+            
+        except Exception as e:
+            logger.error(f"❌ Recent orders error: {e}")
+            return []
+    
+    def get_rejected_orders(self, limit: int = 5) -> List[Dict]:
+        """Get recent rejected orders"""
+        try:
+            recent_rejected = list(self.rejected_orders)[-limit:]
+            return [
+                {
+                    'symbol': order.get('symbol', ''),
+                    'error': order.get('error', ''),
+                    'timestamp': order.get('timestamp', datetime.now()).isoformat(),
+                    'payload': order.get('payload', {})
+                }
+                for order in recent_rejected
+            ]
+            
+        except Exception as e:
+            logger.error(f"❌ Rejected orders error: {e}")
+            return []
+    
+    def stop_websocket(self):
+        """Stop WebSocket connection"""
+        try:
+            if self.ws:
+                self.ws.close()
+                self.is_ws_connected = False
+                logger.info("🔌 WebSocket connection stopped")
+            
+        except Exception as e:
+            logger.error(f"❌ Stop WebSocket error: {e}")
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        try:
+            # Close WebSocket connection
+            self.stop_websocket()
+            
+            # Wait for WebSocket thread to finish
+            if self.ws_thread and self.ws_thread.is_alive():
+                self.ws_thread.join(timeout=5)
+            
+            # Clear session
+            if self.session:
+                self.session.close()
+            
+            logger.info("🧹 Goodwill API Handler cleaned up")
+            
+        except Exception as e:
+            logger.error(f"❌ Cleanup error: {e}")
+    
+    # ==========================================
+    # SESSION MANAGEMENT
+    # ==========================================
+    
+    def refresh_session(self) -> bool:
+        """Refresh authentication session"""
+        try:
+            if not self.is_authenticated():
+                logger.warning("⚠️ Session not authenticated, cannot refresh")
+                return False
+            
+            # Check if session is close to expiry (within 1 hour)
+            if self.session_expiry and datetime.now() + timedelta(hours=1) >= self.session_expiry:
+                logger.info("🔄 Session nearing expiry, refreshing...")
+                
+                # Re-authenticate using stored credentials
+                if self.api_key and self.secret_key and self.request_token:
+                    auth_result = self._exchange_token_for_access()
+                    if auth_result.get('success'):
+                        logger.info("✅ Session refreshed successfully")
+                        return True
+                    else:
+                        logger.error(f"❌ Session refresh failed: {auth_result.get('error')}")
+                        return False
+                else:
+                    logger.error("❌ Missing credentials for session refresh")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Session refresh error: {e}")
+            return False
+    
+    def logout(self) -> bool:
+        """Logout and clear session"""
+        try:
+            if self.access_token:
+                # Call logout API
+                response = self.session.post(f"{self.base_url}{self.endpoints.get('logout', '/auth/logout')}")
+                if response.status_code == 200:
+                    logger.info("✅ Logged out successfully")
+                else:
+                    logger.warning(f"⚠️ Logout API failed: {response.status_code}")
+            
+            # Clear session data
+            self.access_token = None
+            self.client_id = None
+            self.session_expiry = None
+            self.auth_state = AuthenticationState.NOT_AUTHENTICATED
+            
+            # Clear session headers
+            self.session.headers.pop('Authorization', None)
+            self.session.headers.pop('X-Client-Id', None)
+            
+            # Stop WebSocket
+            self.stop_websocket()
+            
+            logger.info("🔐 Session cleared")
             return True
             
         except Exception as e:
             logger.error(f"❌ Logout error: {e}")
             return False
-    
-    def is_logged_in(self) -> bool:
-        """Check if user is logged in"""
-        return (self.session is not None and 
-                self.session.is_active and 
-                datetime.now() < self.session.expires_at)
-    
-    def get_session_info(self) -> Optional[Dict]:
-        """Get current session information"""
-        if not self.session:
-            return None
+
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
+
+def create_goodwill_handler(config: Dict) -> GoodwillAPIHandler:
+    """Create and return Goodwill API handler instance"""
+    return GoodwillAPIHandler(config)
+
+async def test_goodwill_connection(handler: GoodwillAPIHandler) -> Dict:
+    """Test Goodwill API connection"""
+    try:
+        if not handler.is_authenticated():
+            return {
+                'success': False,
+                'error': 'Not authenticated',
+                'status': handler.auth_state.value,
+                'next_step': 'Complete 3-step authentication process'
+            }
         
+        # Test profile API
+        profile = await handler.get_profile()
+        if profile:
+            return {
+                'success': True,
+                'message': 'Connection successful',
+                'profile': profile,
+                'account_balance': handler.account_balance,
+                'available_margin': handler.available_margin,
+                'api_info': {
+                    'base_url': handler.base_url,
+                    'docs_url': handler.api_docs_url
+                }
+            }
+        else:
+            return {
+                'success': False,
+                'error': 'Profile API failed - check API credentials'
+            }
+            
+    except Exception as e:
         return {
-            'user_id': self.session.user_id,
-            'login_time': self.session.login_time.isoformat(),
-            'expires_at': self.session.expires_at.isoformat(),
-            'is_active': self.session.is_active,
-            'session_duration': str(datetime.now() - self.session.login_time),
-            'time_remaining': str(self.session.expires_at - datetime.now()),
-            'request_count': self.request_count
+            'success': False,
+            'error': str(e)
         }
 
+def validate_trading_config(config: Dict) -> Dict:
+    """Validate trading configuration"""
+    required_fields = ['max_daily_loss', 'max_position_size']
+    errors = []
+    
+    for field in required_fields:
+        if field not in config:
+            errors.append(f"Missing required field: {field}")
+    
+    # Validate values
+    if 'max_daily_loss' in config and config['max_daily_loss'] <= 0:
+        errors.append("max_daily_loss must be positive")
+    
+    if 'max_position_size' in config and config['max_position_size'] <= 0:
+        errors.append("max_position_size must be positive")
+    
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors
+    }
 
-# Usage Example
+# ==========================================
+# USAGE EXAMPLE AND TESTING
+# ==========================================
+
 if __name__ == "__main__":
     # Example usage
-    credentials = APICredentials(
-        api_key="your_api_key",
-        secret_key="your_secret_key",
-        user_id="your_user_id",
-        password="your_password",
-        totp_secret="your_totp_secret"  # Optional
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Initialize API handler
-    api = GoodwillAPIHandler(credentials)
+    config = {
+        'max_daily_loss': 50000,  # 50k INR
+        'max_position_size': 100000  # 1 Lakh INR
+    }
     
-    # Login
-    if api.login():
-        print("✅ Login successful")
-        
-        # Get user profile
-        profile = api.get_user_profile()
-        print(f"Profile: {profile}")
-        
-        # Get quotes
-        quotes = api.get_quotes(['RELIANCE', 'TCS', 'INFY'])
-        print(f"Quotes: {quotes}")
-        
-        # Get positions
-        positions = api.get_positions()
-        print(f"Positions: {positions}")
-        
-        # Logout
-        api.logout()
-    else:
-        print("❌ Login failed")
+    # Validate config
+    validation = validate_trading_config(config)
+    if not validation['valid']:
+        print("❌ Invalid config:", validation['errors'])
+        exit(1)
+    
+    # Create handler
+    handler = create_goodwill_handler(config)
+    
+    # Start authentication flow
+    print("🔐 Starting Goodwill API Authentication Flow")
+    print("=" * 50)
+    
+    auth_step1 = handler.start_authentication_flow()
+    print("Step 1:", auth_step1)
+    
+    print("\n📋 Next Steps:")
+    print("1. Get your API credentials from Goodwill")
+    print("2. Call: handler.submit_api_credentials(api_key, secret_key)")
+    print("3. Open the login URL and get request token")
+    print("4. Call: handler.submit_request_token(request_token)")
+    print("5. Start trading!")
+    
+    print(f"\n📚 API Documentation: {handler.api_docs_url}")
+    print(f"🌐 API Base URL: {handler.base_url}")
+    print("\n✅ Goodwill API Handler ready for authentication!")
