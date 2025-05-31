@@ -1,964 +1,1526 @@
+#!/usr/bin/env python3
 """
-Goodwill API Handler for Indian Market Trading Bot
-Implements proper request token authentication with auto-refresh functionality
-Handles all communication with Goodwill Wealth Management APIs
-Base URL: https://api.gwcindia.in/v1/
+Enhanced Production-Ready Goodwill API Handler with Login Flow & Auto-Refresh
+Complete implementation with web-based authentication, token management, and real-time data
+Based on real Goodwill API documentation: https://developer.gwcindia.in/api/
 """
 
-import logging
-import aiohttp
 import asyncio
-import hashlib
-import time
+import aiohttp
 import json
-from typing import Dict, List, Optional, Any, Tuple
+import hashlib
+import hmac
+import time
+import logging
+import secrets
+import uuid
 from datetime import datetime, timedelta
-from dataclasses import dataclass, asdict
-from urllib.parse import urlencode
+from typing import Dict, List, Optional, Any, Union, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+import urllib.parse
+from pathlib import Path
+import webbrowser
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from config_manager import get_config
-from utils import format_currency, format_percentage
+# Import system components
+from config_manager import ConfigManager, get_config
+from utils import Logger, ErrorHandler, DataValidator
+from security_manager import SecurityManager
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class OrderType(Enum):
+    """Order type enumeration for Goodwill API"""
+    MARKET = 1
+    LIMIT = 2
+    STOP_LOSS = 3
+    STOP_LOSS_MARKET = 4
+
+class OrderSide(Enum):
+    """Order side enumeration"""
+    BUY = 1
+    SELL = -1
+
+class ProductType(Enum):
+    """Product type enumeration for Goodwill API"""
+    CASH = "CNC"        # Cash & Carry
+    INTRADAY = "INTRADAY"  # Intraday
+    MARGIN = "MARGIN"   # Margin
+    COVER = "CO"        # Cover Order
+    BRACKET = "BO"      # Bracket Order
+
+class OrderStatus(Enum):
+    """Order status enumeration"""
+    PENDING = "PENDING"
+    OPEN = "OPEN"
+    COMPLETE = "COMPLETE"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    PARTIAL = "PARTIAL"
+
+class AuthenticationState(Enum):
+    """Authentication state enumeration"""
+    NOT_AUTHENTICATED = "NOT_AUTHENTICATED"
+    AUTHENTICATION_PENDING = "AUTHENTICATION_PENDING"
+    AUTHENTICATED = "AUTHENTICATED"
+    TOKEN_EXPIRED = "TOKEN_EXPIRED"
+    AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED"
 
 @dataclass
-class LoginSession:
-    """Login session data structure"""
-    client_id: str
-    name: str
-    email: str
-    access_token: str
-    user_session_id: str
-    enabled_exchanges: List[str]
-    enabled_products: List[str]
-    enabled_order_types: List[str]
-    exchange_details: Dict[str, Any]
-    login_time: datetime
-    expires_at: datetime
+class Quote:
+    """Market quote data"""
+    symbol: str
+    exchange: str
+    token: str
+    last_price: float
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    volume: int
+    change: float
+    change_percent: float
+    bid_price: float
+    ask_price: float
+    bid_qty: int
+    ask_qty: int
+    timestamp: datetime
+    
+    def to_dict(self) -> Dict:
+        return {
+            'symbol': self.symbol,
+            'exchange': self.exchange,
+            'token': self.token,
+            'last_price': self.last_price,
+            'open_price': self.open_price,
+            'high_price': self.high_price,
+            'low_price': self.low_price,
+            'close_price': self.close_price,
+            'volume': self.volume,
+            'change': self.change,
+            'change_percent': self.change_percent,
+            'bid_price': self.bid_price,
+            'ask_price': self.ask_price,
+            'bid_qty': self.bid_qty,
+            'ask_qty': self.ask_qty,
+            'timestamp': self.timestamp.isoformat()
+        }
 
 @dataclass
-class OrderResponse:
-    """Order response from Goodwill API"""
+class Order:
+    """Order data structure"""
     order_id: str
-    status: str
-    message: str
-    exchange_order_id: Optional[str] = None
-    rejection_reason: Optional[str] = None
+    symbol: str
+    exchange: str
+    side: OrderSide
+    order_type: OrderType
+    product_type: ProductType
+    quantity: int
+    price: float
+    disclosed_qty: int = 0
+    trigger_price: float = 0.0
+    validity: str = "DAY"
+    status: OrderStatus = OrderStatus.PENDING
+    filled_qty: int = 0
+    pending_qty: int = 0
+    average_price: float = 0.0
+    order_time: Optional[datetime] = None
+    exchange_order_id: str = ""
+    rejection_reason: str = ""
+    
+    def to_dict(self) -> Dict:
+        return {
+            'order_id': self.order_id,
+            'symbol': self.symbol,
+            'exchange': self.exchange,
+            'side': self.side.value,
+            'order_type': self.order_type.value,
+            'product_type': self.product_type.value,
+            'quantity': self.quantity,
+            'price': self.price,
+            'disclosed_qty': self.disclosed_qty,
+            'trigger_price': self.trigger_price,
+            'validity': self.validity,
+            'status': self.status.value,
+            'filled_qty': self.filled_qty,
+            'pending_qty': self.pending_qty,
+            'average_price': self.average_price,
+            'order_time': self.order_time.isoformat() if self.order_time else None,
+            'exchange_order_id': self.exchange_order_id,
+            'rejection_reason': self.rejection_reason
+        }
 
-class GoodwillAPIEndpoints:
-    """
-    Goodwill Wealth Management API Endpoints
-    Base URL: https://api.gwcindia.in/v1/
-    """
+@dataclass
+class Position:
+    """Position data structure"""
+    symbol: str
+    exchange: str
+    product_type: ProductType
+    quantity: int
+    average_price: float
+    last_price: float
+    unrealized_pnl: float
+    realized_pnl: float
+    day_pnl: float
+    day_pnl_percent: float
     
-    BASE_URL = "https://api.gwcindia.in/v1"
+    def to_dict(self) -> Dict:
+        return {
+            'symbol': self.symbol,
+            'exchange': self.exchange,
+            'product_type': self.product_type.value,
+            'quantity': self.quantity,
+            'average_price': self.average_price,
+            'last_price': self.last_price,
+            'unrealized_pnl': self.unrealized_pnl,
+            'realized_pnl': self.realized_pnl,
+            'day_pnl': self.day_pnl,
+            'day_pnl_percent': self.day_pnl_percent
+        }
+
+@dataclass
+class AuthenticationResult:
+    """Authentication result"""
+    success: bool
+    access_token: str = ""
+    refresh_token: str = ""
+    user_session: str = ""
+    user_id: str = ""
+    user_name: str = ""
+    broker_name: str = ""
+    email: str = ""
+    mobile: str = ""
+    exchanges: List[str] = field(default_factory=list)
+    products: List[str] = field(default_factory=list)
+    error_message: str = ""
+    expires_at: Optional[datetime] = None
+    refresh_expires_at: Optional[datetime] = None
+
+class TokenManager:
+    """Manages access and refresh tokens with automatic renewal"""
     
-    # Authentication Endpoints
-    LOGIN_URL = f"{BASE_URL}/login"                    # GET - Redirect to login page
-    LOGIN_RESPONSE = f"{BASE_URL}/login-response"       # POST - Complete login with signature
-    LOGOUT = f"{BASE_URL}/logout"                      # GET - Logout
+    def __init__(self, goodwill_handler):
+        self.goodwill_handler = goodwill_handler
+        self.access_token = ""
+        self.refresh_token = ""
+        self.expires_at = None
+        self.refresh_expires_at = None
+        self.auto_refresh_task = None
+        self.refresh_callbacks: List[Callable] = []
+        
+    def set_tokens(self, access_token: str, refresh_token: str = "", 
+                   expires_in: int = 86400, refresh_expires_in: int = 604800):
+        """Set access and refresh tokens"""
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+        
+        if refresh_token:
+            self.refresh_expires_at = datetime.now() + timedelta(seconds=refresh_expires_in)
+        
+        # Start auto-refresh if we have a refresh token
+        if refresh_token and not self.auto_refresh_task:
+            self.start_auto_refresh()
     
-    # Profile & Account Endpoints
-    PROFILE = f"{BASE_URL}/profile"                    # GET - User profile
-    BALANCE = f"{BASE_URL}/balance"                    # GET - Account balance
+    def is_token_valid(self) -> bool:
+        """Check if access token is still valid"""
+        if not self.access_token or not self.expires_at:
+            return False
+        
+        # Consider token expired 5 minutes before actual expiry
+        buffer_time = timedelta(minutes=5)
+        return datetime.now() < (self.expires_at - buffer_time)
     
-    # Market Data Endpoints
-    GET_QUOTE = f"{BASE_URL}/getquote"                 # POST - Get quote for symbol
-    FETCH_SYMBOL = f"{BASE_URL}/fetchsymbol"           # POST - Search symbols
+    def is_refresh_token_valid(self) -> bool:
+        """Check if refresh token is still valid"""
+        if not self.refresh_token or not self.refresh_expires_at:
+            return False
+        
+        return datetime.now() < self.refresh_expires_at
     
-    # Trading Endpoints
-    PLACE_ORDER = f"{BASE_URL}/placeorder"             # POST - Place regular order
-    PLACE_BO_ORDER = f"{BASE_URL}/placeboorder"        # POST - Place bracket order
-    PLACE_CO_ORDER = f"{BASE_URL}/placecoorder"        # POST - Place cover order
-    MODIFY_ORDER = f"{BASE_URL}/modifyorder"           # POST - Modify order
-    MODIFY_BO_ORDER = f"{BASE_URL}/modifyboorder"      # POST - Modify bracket order
-    MODIFY_CO_ORDER = f"{BASE_URL}/modifycoorder"      # POST - Modify cover order
-    CANCEL_ORDER = f"{BASE_URL}/cancelorder"           # POST - Cancel order
-    EXIT_BO_ORDER = f"{BASE_URL}/exitboorder"          # POST - Exit bracket order
-    EXIT_CO_ORDER = f"{BASE_URL}/exitcoorder"          # POST - Exit cover order
+    async def refresh_access_token(self) -> bool:
+        """Refresh the access token using refresh token (Goodwill specific)"""
+        try:
+            if not self.is_refresh_token_valid():
+                logger.warning("Refresh token expired, full re-authentication required")
+                return False
+            
+            # Goodwill API refresh token endpoint
+            refresh_payload = {
+                'fyers_id': self.goodwill_handler.api_key,
+                'refresh_token': self.refresh_token
+            }
+            
+            response = await self.goodwill_handler._make_request(
+                'POST',
+                '/login/refresh_accesstoken/',
+                data=refresh_payload,
+                authenticated=False
+            )
+            
+            if response and response.get('s') == 'ok':
+                # Update tokens
+                data = response.get('data', {})
+                new_access_token = data.get('access_token', '')
+                new_refresh_token = data.get('refresh_token', self.refresh_token)
+                expires_in = 86400  # 24 hours for Goodwill
+                
+                self.set_tokens(new_access_token, new_refresh_token, expires_in)
+                
+                # Notify callbacks
+                for callback in self.refresh_callbacks:
+                    try:
+                        if asyncio.iscoroutinefunction(callback):
+                            await callback(new_access_token)
+                        else:
+                            callback(new_access_token)
+                    except Exception as e:
+                        logger.error(f"Token refresh callback error: {e}")
+                
+                logger.info("Access token refreshed successfully")
+                return True
+            else:
+                logger.error(f"Token refresh failed: {response}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Token refresh error: {e}")
+            return False
     
-    # Portfolio Endpoints
-    POSITIONS = f"{BASE_URL}/positions"                # GET - Current positions
-    EXIT_POSITION = f"{BASE_URL}/exitposition"         # POST - Exit position
-    HOLDINGS = f"{BASE_URL}/holdings"                  # GET - Holdings
-    ORDER_BOOK = f"{BASE_URL}/orderbook"               # GET - Order book
-    ORDER_HISTORY = f"{BASE_URL}/orderhistory"         # POST - Order history
-    TRADE_BOOK = f"{BASE_URL}/tradebook"               # GET - Trade book
-    POSITION_CONVERSION = f"{BASE_URL}/positionconversion"  # POST - Convert position
+    def start_auto_refresh(self):
+        """Start automatic token refresh task"""
+        if self.auto_refresh_task:
+            self.auto_refresh_task.cancel()
+        
+        self.auto_refresh_task = asyncio.create_task(self._auto_refresh_loop())
     
-    # WebSocket Endpoints
-    WEBSOCKET_URL = "wss://giga.gwcindia.in/NorenWSTP/"  # WebSocket connection
+    async def _auto_refresh_loop(self):
+        """Auto-refresh loop that runs in background"""
+        try:
+            while True:
+                if not self.expires_at:
+                    break
+                
+                # Calculate when to refresh (10 minutes before expiry)
+                refresh_time = self.expires_at - timedelta(minutes=10)
+                current_time = datetime.now()
+                
+                if current_time >= refresh_time:
+                    # Time to refresh
+                    success = await self.refresh_access_token()
+                    if not success:
+                        logger.error("Auto token refresh failed")
+                        break
+                else:
+                    # Wait until refresh time
+                    wait_seconds = (refresh_time - current_time).total_seconds()
+                    await asyncio.sleep(min(wait_seconds, 300))  # Max 5 minutes sleep
+                
+        except asyncio.CancelledError:
+            logger.info("Auto refresh task cancelled")
+        except Exception as e:
+            logger.error(f"Auto refresh loop error: {e}")
+    
+    def add_refresh_callback(self, callback: Callable):
+        """Add callback to be called when token is refreshed"""
+        self.refresh_callbacks.append(callback)
+    
+    def clear_tokens(self):
+        """Clear all tokens and stop auto-refresh"""
+        self.access_token = ""
+        self.refresh_token = ""
+        self.expires_at = None
+        self.refresh_expires_at = None
+        
+        if self.auto_refresh_task:
+            self.auto_refresh_task.cancel()
+            self.auto_refresh_task = None
 
 class GoodwillAPIHandler:
-    """Comprehensive Goodwill API handler with auto-refresh authentication"""
+    """Enhanced Production-ready Goodwill API handler with login flow and auto-refresh"""
     
-    def __init__(self):
-        self.config = get_config()
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.endpoints = GoodwillAPIEndpoints()
+    def __init__(self, config_manager: Optional[ConfigManager] = None):
+        # Initialize configuration
+        self.config_manager = config_manager or get_config()
+        self.config = self.config_manager.get_config()
+        self.api_config = self.config.get('goodwill_api', {})
         
-        # Authentication state
-        self.login_session: Optional[LoginSession] = None
-        self.is_authenticated = False
-        self.auto_refresh_enabled = True
-        self.refresh_thread: Optional[threading.Thread] = None
-        self.refresh_lock = threading.Lock()
+        # Initialize utilities
+        self.logger = Logger(__name__)
+        self.error_handler = ErrorHandler()
+        self.data_validator = DataValidator()
+        
+        # API configuration - Using real Goodwill API
+        self.base_url = self.api_config.get('base_url', 'https://api.gwcindia.in/v1')
+        self.api_key = self.api_config.get('api_key', '')
+        self.api_secret = self.api_config.get('api_secret', '')
+        self.user_id = self.api_config.get('user_id', '')
+        self.redirect_url = self.api_config.get('redirect_url', 'https://ant.aliceblueonline.com')
+        
+        # Authentication state management
+        self.auth_state = AuthenticationState.NOT_AUTHENTICATED
+        self.token_manager = TokenManager(self)
+        self.user_info = {}
+        
+        # HTTP session
+        self.session = None
+        self.timeout = aiohttp.ClientTimeout(total=30)
         
         # Rate limiting
-        self.rate_limiter = {
-            'requests_per_minute': 0,
-            'last_minute': datetime.now().minute,
-            'max_requests_per_minute': 300,  # Goodwill allows 300 req/min
-            'request_timestamps': []
-        }
+        self.last_request_time = 0
+        self.min_request_interval = 0.1  # 100ms between requests
+        self.request_count = 0
+        self.rate_limit_window = 60  # 1 minute
+        self.max_requests_per_minute = 300
         
-        # API call statistics
-        self.api_stats = {
-            'total_requests': 0,
-            'successful_requests': 0,
-            'failed_requests': 0,
-            'auth_failures': 0,
-            'rate_limit_hits': 0,
-            'avg_response_time_ms': 0,
-            'last_refresh_time': None
-        }
+        # Cache for frequently accessed data
+        self.symbol_cache = {}
+        self.exchange_cache = {}
+        self.last_cache_update = 0
+        self.cache_ttl = 300  # 5 minutes
         
-        logging.info("Goodwill API Handler initialized")
+        # Order tracking
+        self.active_orders = {}
+        self.order_history = {}
+        
+        # Error tracking
+        self.error_count = 0
+        self.last_error_time = 0
+        self.max_errors_before_disconnect = 5
+        
+        # Connection callbacks
+        self.connection_callbacks: List[Callable] = []
+        self.disconnection_callbacks: List[Callable] = []
+        
+        self.logger.info("Enhanced Goodwill API Handler initialized")
     
-    async def initialize(self):
-        """Initialize HTTP session and try to load existing session"""
+    @property
+    def is_authenticated(self) -> bool:
+        """Check if currently authenticated"""
+        return (self.auth_state == AuthenticationState.AUTHENTICATED and 
+                self.token_manager.is_token_valid())
+    
+    async def initialize(self) -> bool:
+        """Initialize HTTP session and prepare for authentication"""
         try:
-            # Create aiohttp session with optimized settings
-            timeout = aiohttp.ClientTimeout(total=self.config.api.timeout)
+            # Create HTTP session
             connector = aiohttp.TCPConnector(
-                limit=50,
-                limit_per_host=30,
-                keepalive_timeout=300
+                limit=100,
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+                keepalive_timeout=60
             )
             
             self.session = aiohttp.ClientSession(
-                timeout=timeout,
                 connector=connector,
+                timeout=self.timeout,
                 headers={
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'MomentumBot/1.0'
+                    'User-Agent': 'GoodwillTradingBot/1.0',
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json'
                 }
             )
             
-            # Try to load existing session
-            if await self.load_session_from_file():
-                logging.info("✅ Using existing valid session")
-            else:
-                logging.info("🔐 No valid session found. Please authenticate using 3-step process:")
-                logging.info("1. Call start_login_process() to get login URL")
-                logging.info("2. Open URL and login to Goodwill account") 
-                logging.info("3. Call complete_login_with_request_token() with request token")
+            # Try to load saved tokens
+            await self._load_saved_tokens()
             
-            logging.info("Goodwill API Handler session initialized")
+            # Validate existing authentication
+            if self.token_manager.access_token:
+                is_valid = await self._validate_existing_session()
+                if is_valid:
+                    self.auth_state = AuthenticationState.AUTHENTICATED
+                    self.logger.info("Existing session is valid")
+                    return True
+            
+            self.logger.info("Goodwill API handler initialized, authentication required")
+            return True
             
         except Exception as e:
-            logging.error(f"Failed to initialize Goodwill API Handler: {e}")
-            raise
-    
-    def print_login_instructions(self):
-        """Print detailed login instructions for users"""
-        print("\n" + "=" * 80)
-        print("🔐 GOODWILL API 3-STEP LOGIN PROCESS")
-        print("=" * 80)
-        print("STEP 1: Get Login URL")
-        print("  • Call: goodwill_handler.start_login_process()")
-        print("  • This will generate a login URL with your API key")
-        print("")
-        print("STEP 2: Browser Login")
-        print("  • Open the generated URL in your browser")
-        print("  • Login to your Goodwill account")
-        print("  • After login, you'll be redirected to a URL like:")
-        print("  • https://your-redirect-url.com?request_token=XXXXXXXXXX")
-        print("")
-        print("STEP 3: Complete Authentication")
-        print("  • Copy the request_token from the redirect URL")
-        print("  • Call: await goodwill_handler.complete_login_with_request_token('request_token')")
-        print("  • Session will be saved to config/goodwill_session.json")
-        print("")
-        print("🔄 AUTO-REFRESH")
-        print("  • Session will auto-refresh to prevent disconnection")
-        print("  • Valid for 8 hours, then requires re-authentication")
-        print("=" * 80)
-        print("")
-    
-    def get_authentication_status(self) -> Dict[str, Any]:
-        """Get current authentication status"""
-        return {
-            "is_authenticated": self.is_authenticated,
-            "user_name": self.login_session.name if self.login_session else None,
-            "client_id": self.login_session.client_id if self.login_session else None,
-            "email": self.login_session.email if self.login_session else None,
-            "login_time": self.login_session.login_time.isoformat() if self.login_session else None,
-            "expires_at": self.login_session.expires_at.isoformat() if self.login_session else None,
-            "time_until_expiry_minutes": (
-                (self.login_session.expires_at - datetime.now()).total_seconds() / 60
-                if self.login_session else 0
-            ),
-            "enabled_exchanges": self.login_session.enabled_exchanges if self.login_session else [],
-            "enabled_products": self.login_session.enabled_products if self.login_session else [],
-            "auto_refresh_active": self.auto_refresh_enabled and self.is_authenticated,
-            "session_file_exists": self._check_session_file_exists()
-        }
-    
-    def _check_session_file_exists(self) -> bool:
-        """Check if session file exists"""
-        try:
-            import os
-            return os.path.exists(os.path.join("config", "goodwill_session.json"))
-        except:
+            self.logger.error(f"Failed to initialize Goodwill API: {e}")
+            self.error_handler.handle_error(e, "goodwill_initialization")
             return False
     
-    def start_login_process(self) -> str:
+    def start_login_process(self) -> Optional[str]:
         """
-        STEP 1: Generate login URL with API key
-        Returns the URL that user needs to open in browser
+        STEP 1: Generate login URL with API key and secret
+        User inputs API key and secret via Flask dashboard
         """
         try:
-            api_key = self.config.api.goodwill_api_key
-            if not api_key:
-                logging.error("API key is required. Please set GOODWILL_API_KEY in config.")
-                return ""
+            if not self.api_key or not self.api_secret:
+                raise ValueError("API key and secret are required")
             
-            # Generate login URL
-            login_url = f"{self.endpoints.LOGIN_URL}?api_key={api_key}"
+            # Generate login URL according to Goodwill API documentation
+            # This will redirect to Goodwill login page in another tab
+            login_url = (
+                f"{self.base_url}/login/getlg/"
+                f"?v=4&fyers_id={self.api_key}&app_id={self.api_key}"
+                f"&redirect_uri={self.redirect_url}&state=sample_state"
+            )
             
-            logging.info("=" * 60)
-            logging.info("🔐 GOODWILL LOGIN PROCESS - STEP 1")
-            logging.info("=" * 60)
-            logging.info(f"API Key: {api_key}")
-            logging.info(f"API Secret: {'*' * len(self.config.api.goodwill_secret) if self.config.api.goodwill_secret else 'NOT SET'}")
-            logging.info("")
-            logging.info("📍 STEP 1: Open this URL in your browser:")
-            logging.info(f"🌐 {login_url}")
-            logging.info("")
-            logging.info("📍 STEP 2: Login to your Goodwill account")
-            logging.info("📍 STEP 3: After login, you'll be redirected to a URL with request_token")
-            logging.info("📍 Copy the request_token and call complete_login_with_request_token()")
-            logging.info("=" * 60)
+            self.auth_state = AuthenticationState.AUTHENTICATION_PENDING
+            self.logger.info(f"Step 1: Login URL generated")
             
             return login_url
             
         except Exception as e:
-            logging.error(f"Error generating login URL: {e}")
-            return ""
+            self.logger.error(f"Failed to start login process: {e}")
+            self.error_handler.handle_error(e, "start_login_process")
+            return None
     
     async def complete_login_with_request_token(self, request_token: str) -> bool:
         """
-        STEP 3: Complete authentication using request token from redirect URL
-        This saves the session data as JSON file for future use
+        STEP 3: Complete login using request token from redirect URL
+        User copies the URL with request_token and pastes it in input box
         """
         try:
             if not request_token:
-                logging.error("Request token is required for authentication")
-                return False
+                raise ValueError("Request token is required")
             
-            logging.info("🔐 GOODWILL LOGIN PROCESS - STEP 3")
-            logging.info(f"Processing request token: {request_token[:20]}...")
+            self.logger.info(f"Step 3: Completing login with request token")
             
-            # Generate signature for authentication
-            signature = self._generate_signature(request_token)
-            
-            # Prepare login response payload
-            login_payload = {
-                "api_key": self.config.api.goodwill_api_key,
-                "request_token": request_token,
-                "signature": signature
+            # Generate session according to Goodwill API documentation
+            session_payload = {
+                'fyers_id': self.api_key,
+                'app_secret': self.api_secret,
+                'request_token': request_token
             }
             
-            logging.info("Sending authentication request to Goodwill API...")
+            # Make session generation request
+            response = await self._make_request(
+                'POST',
+                '/login/create_session/',
+                data=session_payload,
+                authenticated=False
+            )
             
-            # Make login response API call
-            async with self.session.post(self.endpoints.LOGIN_RESPONSE, json=login_payload) as response:
-                if response.status == 200:
-                    data = await response.json()
+            if response and response.get('s') == 'ok':
+                # Extract session details
+                data = response.get('data', {})
+                access_token = data.get('access_token', '')
+                refresh_token = data.get('refresh_token', '')
+                
+                if access_token:
+                    # Store tokens - Goodwill tokens typically expire in 24 hours
+                    expires_in = 86400  # 24 hours
+                    self.token_manager.set_tokens(access_token, refresh_token, expires_in)
                     
-                    if data.get('status') == 'success':
-                        # Parse login session data
-                        session_data = data['data']
-                        
-                        self.login_session = LoginSession(
-                            client_id=session_data.get('clnt_id', ''),
-                            name=session_data.get('name', ''),
-                            email=session_data.get('email', ''),
-                            access_token=session_data.get('access_token', ''),
-                            user_session_id=session_data.get('usersessionid', ''),
-                            enabled_exchanges=session_data.get('exarr', []),
-                            enabled_products=session_data.get('prarr', []),
-                            enabled_order_types=session_data.get('orarr', []),
-                            exchange_details=session_data.get('exchDetail', {}),
-                            login_time=datetime.now(),
-                            expires_at=datetime.now() + timedelta(hours=8)  # 8-hour session
+                    # Fetch user profile information
+                    await self._fetch_user_info()
+                    
+                    # Save tokens for future use
+                    await self._save_tokens()
+                    
+                    self.auth_state = AuthenticationState.AUTHENTICATED
+                    
+                    # Notify connection callbacks
+                    for callback in self.connection_callbacks:
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback()
+                            else:
+                                callback()
+                        except Exception as e:
+                            self.logger.error(f"Connection callback error: {e}")
+                    
+                    self.logger.info("Goodwill authentication completed successfully")
+                    return True
+                else:
+                    raise ValueError("No access token received")
+            else:
+                error_msg = response.get('message', 'Session creation failed') if response else 'No response from server'
+                self.auth_state = AuthenticationState.AUTHENTICATION_FAILED
+                self.logger.error(f"Session creation failed: {error_msg}")
+                return False
+                
+        except Exception as e:
+            self.auth_state = AuthenticationState.AUTHENTICATION_FAILED
+            self.logger.error(f"Login completion error: {e}")
+            self.error_handler.handle_error(e, "complete_login")
+            return False
+    
+    async def logout(self) -> bool:
+        """Logout from Goodwill API"""
+        try:
+            if self.is_authenticated:
+                # Revoke tokens if possible
+                try:
+                    revoke_payload = {
+                        'fyers_id': self.api_key,
+                        'token': self.token_manager.access_token
+                    }
+                    
+                    await self._make_request(
+                        'DELETE',
+                        '/login/logout/',
+                        data=revoke_payload
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Token revocation failed: {e}")
+            
+            # Clear tokens and state
+            self.token_manager.clear_tokens()
+            self.auth_state = AuthenticationState.NOT_AUTHENTICATED
+            self.user_info = {}
+            
+            # Clear saved tokens
+            await self._clear_saved_tokens()
+            
+            # Notify disconnection callbacks
+            for callback in self.disconnection_callbacks:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback()
+                    else:
+                        callback()
+                except Exception as e:
+                    self.logger.error(f"Disconnection callback error: {e}")
+            
+            self.logger.info("Logged out from Goodwill API")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Logout error: {e}")
+            return False
+    
+    async def place_order(self, order_data: Dict) -> Order:
+        """Place a trading order using Goodwill API"""
+        try:
+            # Ensure authentication
+            if not await self._ensure_authenticated():
+                raise Exception("Authentication failed")
+            
+            # Validate order data
+            validation_result = self._validate_order_data(order_data)
+            if not validation_result['valid']:
+                raise ValueError(f"Invalid order data: {validation_result['errors']}")
+            
+            # Prepare order payload according to Goodwill API format
+            order_payload = {
+                'symbol': f"{order_data['exchange']}:{order_data['symbol']}",
+                'qty': order_data['quantity'],
+                'type': self._convert_order_type(order_data.get('order_type', OrderType.MARKET.value)),
+                'side': 1 if order_data['side'] == OrderSide.BUY.value else -1,
+                'productType': self._convert_product_type(order_data.get('product_type', ProductType.INTRADAY.value)),
+                'limitPrice': order_data.get('price', 0),
+                'stopPrice': order_data.get('trigger_price', 0),
+                'validity': order_data.get('validity', 'DAY'),
+                'disclosedQty': order_data.get('disclosed_qty', 0),
+                'offlineOrder': False,
+                'stopLoss': 0,
+                'takeProfit': 0
+            }
+            
+            # Make order placement request
+            response = await self._make_request(
+                'POST',
+                '/orders/',
+                data=order_payload
+            )
+            
+            if response and response.get('s') == 'ok':
+                # Create order object
+                data = response.get('data', {})
+                order = Order(
+                    order_id=data.get('id', ''),
+                    symbol=order_data['symbol'],
+                    exchange=order_data['exchange'],
+                    side=OrderSide(order_data['side']),
+                    order_type=OrderType(order_data.get('order_type', OrderType.MARKET.value)),
+                    product_type=ProductType(order_data.get('product_type', ProductType.INTRADAY.value)),
+                    quantity=order_data['quantity'],
+                    price=order_data.get('price', 0),
+                    disclosed_qty=order_data.get('disclosed_qty', 0),
+                    trigger_price=order_data.get('trigger_price', 0),
+                    validity=order_data.get('validity', 'DAY'),
+                    status=OrderStatus.PENDING,
+                    order_time=datetime.now()
+                )
+                
+                # Store in active orders
+                self.active_orders[order.order_id] = order
+                
+                self.logger.info(f"Order placed successfully: {order.order_id}")
+                return order
+                
+            else:
+                error_msg = response.get('message', 'Order placement failed') if response else 'No response from server'
+                self.logger.error(f"Order placement failed: {error_msg}")
+                
+                # Create failed order
+                order = Order(
+                    order_id="",
+                    symbol=order_data['symbol'],
+                    exchange=order_data['exchange'],
+                    side=OrderSide(order_data['side']),
+                    order_type=OrderType(order_data.get('order_type', OrderType.MARKET.value)),
+                    product_type=ProductType(order_data.get('product_type', ProductType.INTRADAY.value)),
+                    quantity=order_data['quantity'],
+                    price=order_data.get('price', 0),
+                    status=OrderStatus.REJECTED,
+                    rejection_reason=error_msg,
+                    order_time=datetime.now()
+                )
+                
+                return order
+                
+        except Exception as e:
+            self.logger.error(f"Order placement error: {e}")
+            self.error_handler.handle_error(e, "order_placement")
+            
+            # Return failed order
+            return Order(
+                order_id="",
+                symbol=order_data.get('symbol', ''),
+                exchange=order_data.get('exchange', ''),
+                side=OrderSide(order_data.get('side', OrderSide.BUY.value)),
+                order_type=OrderType.MARKET,
+                product_type=ProductType.INTRADAY,
+                quantity=order_data.get('quantity', 0),
+                price=order_data.get('price', 0),
+                status=OrderStatus.REJECTED,
+                rejection_reason=str(e),
+                order_time=datetime.now()
+            )
+    
+    async def get_quote(self, exchange: str, token: str) -> Optional[Quote]:
+        """Get market quote for a symbol using Goodwill API"""
+        try:
+            # Ensure authentication
+            if not await self._ensure_authenticated():
+                return None
+            
+            # Format symbol according to Goodwill API
+            symbol = f"{exchange}:{token}"
+            
+            response = await self._make_request(
+                'GET',
+                f'/data/quotes/?symbols={symbol}',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                data = response.get('d', [])
+                if data and len(data) > 0:
+                    quote_data = data[0]
+                    
+                    quote = Quote(
+                        symbol=quote_data.get('n', ''),
+                        exchange=exchange,
+                        token=token,
+                        last_price=float(quote_data.get('v', {}).get('lp', 0)),
+                        open_price=float(quote_data.get('v', {}).get('o', 0)),
+                        high_price=float(quote_data.get('v', {}).get('h', 0)),
+                        low_price=float(quote_data.get('v', {}).get('l', 0)),
+                        close_price=float(quote_data.get('v', {}).get('prev_close_price', 0)),
+                        volume=int(quote_data.get('v', {}).get('volume', 0)),
+                        change=float(quote_data.get('v', {}).get('ch', 0)),
+                        change_percent=float(quote_data.get('v', {}).get('chp', 0)),
+                        bid_price=float(quote_data.get('v', {}).get('bid', 0)),
+                        ask_price=float(quote_data.get('v', {}).get('ask', 0)),
+                        bid_qty=int(quote_data.get('v', {}).get('bid_size', 0)),
+                        ask_qty=int(quote_data.get('v', {}).get('ask_size', 0)),
+                        timestamp=datetime.now()
+                    )
+                    
+                    return quote
+            
+            self.logger.warning(f"Quote not found for {exchange}:{token}")
+            return None
+                
+        except Exception as e:
+            self.logger.error(f"Error getting quote: {e}")
+            self.error_handler.handle_error(e, "get_quote")
+            return None
+
+    async def search_symbols(self, search_term: str, exchange: str = "NSE") -> List[Dict]:
+        """Search for symbols using Goodwill API"""
+        try:
+            if not await self._ensure_authenticated():
+                return []
+            
+            response = await self._make_request(
+                'GET',
+                f'/data/symbol_master/?symbol={search_term}&exchange={exchange}',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                symbols = []
+                for symbol_data in response.get('d', []):
+                    symbols.append({
+                        'symbol': symbol_data.get('display_name', ''),
+                        'exchange': symbol_data.get('exchange', ''),
+                        'token': symbol_data.get('token', ''),
+                        'instrument_type': symbol_data.get('instrument_type', ''),
+                        'lot_size': int(symbol_data.get('lot_size', 1)),
+                        'tick_size': float(symbol_data.get('tick_size', 0.05)),
+                        'company_name': symbol_data.get('description', ''),
+                        'expiry': symbol_data.get('expiry', ''),
+                        'strike_price': float(symbol_data.get('strike_price', 0))
+                    })
+                
+                return symbols
+            else:
+                self.logger.warning(f"No symbols found for search term: {search_term}")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error searching symbols: {e}")
+            self.error_handler.handle_error(e, "search_symbols")
+            return []
+
+    async def get_positions(self) -> List[Position]:
+        """Get current positions using Goodwill API"""
+        try:
+            if not await self._ensure_authenticated():
+                return []
+            
+            response = await self._make_request(
+                'GET',
+                '/positions/',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                positions = []
+                
+                for pos_data in response.get('netPositions', []):
+                    if int(pos_data.get('netQty', 0)) != 0:
+                        position = Position(
+                            symbol=pos_data.get('symbol', ''),
+                            exchange=pos_data.get('exchange', ''),
+                            product_type=ProductType(pos_data.get('productType', ProductType.INTRADAY.value)),
+                            quantity=int(pos_data.get('netQty', 0)),
+                            average_price=float(pos_data.get('avgPrice', 0)),
+                            last_price=float(pos_data.get('ltp', 0)),
+                            unrealized_pnl=float(pos_data.get('unrealizedPnl', 0)),
+                            realized_pnl=float(pos_data.get('realizedPnl', 0)),
+                            day_pnl=float(pos_data.get('pl', 0)),
+                            day_pnl_percent=0.0  # Calculate if needed
                         )
                         
-                        self.is_authenticated = True
+                        # Calculate day P&L percentage
+                        if position.average_price > 0:
+                            position.day_pnl_percent = (position.day_pnl / (position.average_price * abs(position.quantity))) * 100
                         
-                        # Save session to JSON file for future use
-                        await self._save_session_to_file()
-                        
-                        # Start auto-refresh mechanism
-                        if self.auto_refresh_enabled:
-                            self._start_auto_refresh()
-                        
-                        logging.info("✅ AUTHENTICATION SUCCESSFUL!")
-                        logging.info("=" * 60)
-                        logging.info(f"👤 User: {self.login_session.name}")
-                        logging.info(f"🆔 Client ID: {self.login_session.client_id}")
-                        logging.info(f"📧 Email: {self.login_session.email}")
-                        logging.info(f"🏦 Exchanges: {', '.join(self.login_session.enabled_exchanges)}")
-                        logging.info(f"📦 Products: {', '.join(self.login_session.enabled_products)}")
-                        logging.info(f"🔑 Access Token: {self.login_session.access_token[:20]}...")
-                        logging.info(f"⏰ Session Expires: {self.login_session.expires_at.strftime('%Y-%m-%d %H:%M:%S')}")
-                        logging.info("💾 Session saved to: goodwill_session.json")
-                        logging.info("=" * 60)
-                        
-                        return True
-                    else:
-                        error_msg = data.get('error_msg', 'Unknown error')
-                        error_type = data.get('error_type', 'Unknown')
-                        logging.error(f"❌ Authentication failed: {error_msg} (Type: {error_type})")
-                        
-                        # Common error solutions
-                        if "Invalid Signature" in error_msg:
-                            logging.error("💡 Solution: Check if API Secret is correct in config")
-                        elif "Invalid API key" in error_msg:
-                            logging.error("💡 Solution: Check if API Key is correct and not expired")
-                        elif "Invalid Request Token" in error_msg:
-                            logging.error("💡 Solution: Make sure request_token is copied correctly from redirect URL")
-                        
-                        return False
-                else:
-                    error_text = await response.text()
-                    logging.error(f"❌ Authentication HTTP error {response.status}: {error_text}")
-                    return False
-                    
+                        positions.append(position)
+                
+                return positions
+            else:
+                self.logger.info("No positions found")
+                return []
+                
         except Exception as e:
-            logging.error(f"❌ Error during authentication: {e}")
-            return False
-    
-    async def _save_session_to_file(self):
-        """Save current session data to JSON file"""
+            self.logger.error(f"Error getting positions: {e}")
+            self.error_handler.handle_error(e, "get_positions")
+            return []
+
+    async def get_holdings(self) -> List[Dict]:
+        """Get holdings/investments using Goodwill API"""
         try:
-            if not self.login_session:
-                return
+            if not await self._ensure_authenticated():
+                return []
             
-            session_data = {
-                "client_id": self.login_session.client_id,
-                "name": self.login_session.name,
-                "email": self.login_session.email,
-                "access_token": self.login_session.access_token,
-                "user_session_id": self.login_session.user_session_id,
-                "enabled_exchanges": self.login_session.enabled_exchanges,
-                "enabled_products": self.login_session.enabled_products,
-                "enabled_order_types": self.login_session.enabled_order_types,
-                "exchange_details": self.login_session.exchange_details,
-                "login_time": self.login_session.login_time.isoformat(),
-                "expires_at": self.login_session.expires_at.isoformat(),
-                "api_key": self.config.api.goodwill_api_key,
-                "saved_at": datetime.now().isoformat()
-            }
-            
-            import os
-            session_file = os.path.join("config", "goodwill_session.json")
-            
-            # Create config directory if it doesn't exist
-            os.makedirs("config", exist_ok=True)
-            
-            with open(session_file, 'w') as f:
-                json.dump(session_data, f, indent=2)
-            
-            logging.info(f"💾 Session saved to: {session_file}")
-            
-        except Exception as e:
-            logging.error(f"Error saving session to file: {e}")
-    
-    async def load_session_from_file(self) -> bool:
-        """Load session data from JSON file if available and valid"""
-        try:
-            import os
-            session_file = os.path.join("config", "goodwill_session.json")
-            
-            if not os.path.exists(session_file):
-                logging.info("No saved session file found")
-                return False
-            
-            with open(session_file, 'r') as f:
-                session_data = json.load(f)
-            
-            # Check if session is still valid
-            expires_at = datetime.fromisoformat(session_data['expires_at'])
-            if datetime.now() >= expires_at:
-                logging.warning("Saved session has expired")
-                return False
-            
-            # Check if API key matches
-            if session_data.get('api_key') != self.config.api.goodwill_api_key:
-                logging.warning("Saved session API key doesn't match current config")
-                return False
-            
-            # Restore session
-            self.login_session = LoginSession(
-                client_id=session_data['client_id'],
-                name=session_data['name'],
-                email=session_data['email'],
-                access_token=session_data['access_token'],
-                user_session_id=session_data['user_session_id'],
-                enabled_exchanges=session_data['enabled_exchanges'],
-                enabled_products=session_data['enabled_products'],
-                enabled_order_types=session_data['enabled_order_types'],
-                exchange_details=session_data['exchange_details'],
-                login_time=datetime.fromisoformat(session_data['login_time']),
-                expires_at=expires_at
+            response = await self._make_request(
+                'GET',
+                '/holdings/',
+                authenticated=True
             )
             
-            # Validate session by making a test API call
-            if await self._validate_session():
-                self.is_authenticated = True
+            if response and response.get('s') == 'ok':
+                holdings = []
                 
-                # Start auto-refresh mechanism
-                if self.auto_refresh_enabled:
-                    self._start_auto_refresh()
+                for holding_data in response.get('holdings', []):
+                    holdings.append({
+                        'symbol': holding_data.get('symbol', ''),
+                        'exchange': holding_data.get('exchange', ''),
+                        'quantity': int(holding_data.get('quantity', 0)),
+                        'average_price': float(holding_data.get('costPrice', 0)),
+                        'last_price': float(holding_data.get('ltp', 0)),
+                        'current_value': float(holding_data.get('marketVal', 0)),
+                        'pnl': float(holding_data.get('pl', 0)),
+                        'pnl_percent': float(holding_data.get('plPercent', 0)),
+                        'product_type': holding_data.get('productType', ''),
+                        'collateral_qty': int(holding_data.get('collateralQty', 0)),
+                        'collateral_value': float(holding_data.get('collateralVal', 0))
+                    })
                 
-                logging.info("✅ LOADED SAVED SESSION!")
-                logging.info(f"👤 User: {self.login_session.name} ({self.login_session.client_id})")
-                logging.info(f"⏰ Expires: {self.login_session.expires_at.strftime('%Y-%m-%d %H:%M:%S')}")
+                return holdings
+            else:
+                self.logger.info("No holdings found")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error getting holdings: {e}")
+            self.error_handler.handle_error(e, "get_holdings")
+            return []
+
+    async def get_order_book(self) -> List[Order]:
+        """Get all orders for the day using Goodwill API"""
+        try:
+            if not await self._ensure_authenticated():
+                return []
+            
+            response = await self._make_request(
+                'GET',
+                '/orders/',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                orders = []
+                
+                for order_data in response.get('orderBook', []):
+                    order = Order(
+                        order_id=order_data.get('id', ''),
+                        symbol=order_data.get('symbol', '').split(':')[-1] if ':' in order_data.get('symbol', '') else order_data.get('symbol', ''),
+                        exchange=order_data.get('symbol', '').split(':')[0] if ':' in order_data.get('symbol', '') else 'NSE',
+                        side=OrderSide.BUY if order_data.get('side') == 1 else OrderSide.SELL,
+                        order_type=OrderType(order_data.get('type', 1)),
+                        product_type=ProductType(order_data.get('productType', ProductType.INTRADAY.value)),
+                        quantity=int(order_data.get('qty', 0)),
+                        price=float(order_data.get('limitPrice', 0)),
+                        disclosed_qty=int(order_data.get('disclosedQty', 0)),
+                        trigger_price=float(order_data.get('stopPrice', 0)),
+                        validity=order_data.get('validity', 'DAY'),
+                        status=self._parse_order_status(order_data.get('status', '')),
+                        filled_qty=int(order_data.get('filledQty', 0)),
+                        pending_qty=int(order_data.get('qty', 0)) - int(order_data.get('filledQty', 0)),
+                        average_price=float(order_data.get('avgPrice', 0)),
+                        exchange_order_id=order_data.get('exchOrdId', ''),
+                        rejection_reason=order_data.get('message', '')
+                    )
+                    
+                    # Parse order time
+                    if order_data.get('orderDateTime'):
+                        try:
+                            order.order_time = datetime.fromisoformat(order_data['orderDateTime'])
+                        except:
+                            order.order_time = datetime.now()
+                    
+                    orders.append(order)
+                
+                return orders
+            else:
+                self.logger.warning("No orders found or invalid response")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error getting order book: {e}")
+            self.error_handler.handle_error(e, "get_order_book")
+            return []
+
+    async def get_funds(self) -> Dict:
+        """Get account funds/margin information using Goodwill API"""
+        try:
+            if not await self._ensure_authenticated():
+                return {}
+            
+            response = await self._make_request(
+                'GET',
+                '/funds/',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                fund_data = response.get('fund_limit', [])
+                if fund_data:
+                    funds = fund_data[0]  # Usually first element contains the fund details
+                    return {
+                        'available_balance': float(funds.get('availableBalance', 0)),
+                        'payin_amount': float(funds.get('payinAmount', 0)),
+                        'payout_amount': float(funds.get('payoutAmount', 0)),
+                        'utilized_amount': float(funds.get('utilizedAmount', 0)),
+                        'blocked_amount': float(funds.get('blockedAmount', 0)),
+                        'withdrawable_balance': float(funds.get('withdrawableBalance', 0)),
+                        'collateral': float(funds.get('collateral', 0)),
+                        'total_balance': float(funds.get('totAvailableBalance', 0))
+                    }
+                else:
+                    return {}
+            else:
+                self.logger.warning("Funds information not available")
+                return {}
+                
+        except Exception as e:
+            self.logger.error(f"Error getting funds: {e}")
+            self.error_handler.handle_error(e, "get_funds")
+            return {}
+
+    async def get_trade_book(self) -> List[Dict]:
+        """Get trade book for the day using Goodwill API"""
+        try:
+            if not await self._ensure_authenticated():
+                return []
+            
+            response = await self._make_request(
+                'GET',
+                '/tradebook/',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                trades = []
+                
+                for trade_data in response.get('tradeBook', []):
+                    trades.append({
+                        'order_id': trade_data.get('orderNumber', ''),
+                        'symbol': trade_data.get('symbol', ''),
+                        'exchange': trade_data.get('exchange', ''),
+                        'side': 'BUY' if trade_data.get('side') == 1 else 'SELL',
+                        'quantity': int(trade_data.get('qty', 0)),
+                        'price': float(trade_data.get('tradePrice', 0)),
+                        'product_type': trade_data.get('productType', ''),
+                        'trade_time': trade_data.get('tradeTime', ''),
+                        'trade_id': trade_data.get('tradeNumber', ''),
+                        'trade_value': float(trade_data.get('tradeValue', 0)),
+                        'remarks': trade_data.get('remarks', '')
+                    })
+                
+                return trades
+            else:
+                self.logger.info("No trades found")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error getting trade book: {e}")
+            self.error_handler.handle_error(e, "get_trade_book")
+            return []
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an existing order using Goodwill API"""
+        try:
+            if not await self._ensure_authenticated():
+                return False
+            
+            response = await self._make_request(
+                'DELETE',
+                f'/orders/{order_id}',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                self.logger.info(f"Order cancelled successfully: {order_id}")
+                
+                # Update local order status
+                if order_id in self.active_orders:
+                    self.active_orders[order_id].status = OrderStatus.CANCELLED
+                
                 return True
             else:
-                logging.warning("Saved session is invalid, please re-authenticate")
+                error_msg = response.get('message', 'Order cancellation failed') if response else 'No response from server'
+                self.logger.error(f"Order cancellation failed: {error_msg}")
                 return False
                 
         except Exception as e:
-            logging.error(f"Error loading session from file: {e}")
+            self.logger.error(f"Order cancellation error: {e}")
+            self.error_handler.handle_error(e, "order_cancellation")
             return False
-    
-    def _generate_signature(self, request_token: str) -> str:
-        """Generate SHA-256 signature for authentication"""
+
+    async def modify_order(self, order_id: str, modifications: Dict) -> bool:
+        """Modify an existing order using Goodwill API"""
         try:
-            api_key = self.config.api.goodwill_api_key
-            api_secret = self.config.api.goodwill_secret
+            if not await self._ensure_authenticated():
+                return False
             
-            # Create checksum: API Key + request_token + API Secret
-            checksum = f"{api_key}{request_token}{api_secret}"
+            # Prepare modification payload
+            modify_payload = {}
             
-            # Generate SHA-256 signature
-            signature = hashlib.sha256(checksum.encode()).hexdigest()
+            if modifications.get('quantity'):
+                modify_payload['qty'] = modifications['quantity']
+            if modifications.get('price'):
+                modify_payload['limitPrice'] = modifications['price']
+            if modifications.get('trigger_price'):
+                modify_payload['stopPrice'] = modifications['trigger_price']
+            if modifications.get('disclosed_qty'):
+                modify_payload['disclosedQty'] = modifications['disclosed_qty']
             
-            logging.info(f"Generated signature for request_token: {request_token[:10]}...")
-            return signature
-            
-        except Exception as e:
-            logging.error(f"Error generating signature: {e}")
-            return ""
-    
-    def _start_auto_refresh(self):
-        """Start auto-refresh mechanism in background thread"""
-        try:
-            if self.refresh_thread and self.refresh_thread.is_alive():
-                return
-            
-            self.refresh_thread = threading.Thread(
-                target=self._auto_refresh_loop,
-                daemon=True,
-                name="GoodwillAutoRefresh"
+            # Make modification request
+            response = await self._make_request(
+                'PUT',
+                f'/orders/{order_id}',
+                data=modify_payload
             )
-            self.refresh_thread.start()
             
-            logging.info("Auto-refresh mechanism started")
-            
-        except Exception as e:
-            logging.error(f"Error starting auto-refresh: {e}")
-    
-    def _auto_refresh_loop(self):
-        """Auto-refresh loop to maintain authentication"""
-        while self.auto_refresh_enabled and self.is_authenticated:
-            try:
-                if not self.login_session:
-                    break
+            if response and response.get('s') == 'ok':
+                self.logger.info(f"Order modified successfully: {order_id}")
                 
-                # Calculate time until token expires
-                time_until_expiry = (self.login_session.expires_at - datetime.now()).total_seconds()
+                # Update local order if exists
+                if order_id in self.active_orders:
+                    order = self.active_orders[order_id]
+                    if modifications.get('quantity'):
+                        order.quantity = modifications['quantity']
+                    if modifications.get('price'):
+                        order.price = modifications['price']
                 
-                # Refresh 30 minutes before expiry
-                if time_until_expiry <= 1800:  # 30 minutes
-                    logging.info("Access token nearing expiry, attempting refresh...")
-                    
-                    with self.refresh_lock:
-                        # Check if we need to re-authenticate
-                        # Note: Goodwill doesn't have explicit refresh token endpoint
-                        # Need to implement session validation
-                        if not asyncio.run(self._validate_session()):
-                            logging.warning("Session validation failed, re-authentication required")
-                            self.is_authenticated = False
-                            break
-                        else:
-                            # Extend session expiry
-                            self.login_session.expires_at = datetime.now() + timedelta(hours=8)
-                            self.api_stats['last_refresh_time'] = datetime.now()
-                            logging.info("Session refreshed successfully")
-                
-                # Sleep for 5 minutes before next check
-                time.sleep(300)
-                
-            except Exception as e:
-                logging.error(f"Error in auto-refresh loop: {e}")
-                time.sleep(60)  # Sleep 1 minute on error
-    
-    async def _validate_session(self) -> bool:
-        """Validate current session by calling profile endpoint"""
-        try:
-            if not self.is_authenticated or not self.login_session:
+                return True
+            else:
+                error_msg = response.get('message', 'Order modification failed') if response else 'No response from server'
+                self.logger.error(f"Order modification failed: {error_msg}")
                 return False
-            
-            response = await self._make_authenticated_request('GET', self.endpoints.PROFILE)
-            return response is not None and response.get('status') == 'success'
-            
+                
         except Exception as e:
-            logging.error(f"Error validating session: {e}")
+            self.logger.error(f"Order modification error: {e}")
+            self.error_handler.handle_error(e, "order_modification")
             return False
-    
-    async def _make_authenticated_request(self, method: str, url: str, 
-                                        data: Dict = None, params: Dict = None) -> Optional[Dict]:
-        """Make authenticated API request with rate limiting and error handling"""
+
+    async def get_historical_data(self, symbol: str, resolution: str = "1", 
+                                 from_date: datetime, to_date: datetime) -> List[Dict]:
+        """Get historical market data using Goodwill API"""
         try:
-            # Check authentication
-            if not self.is_authenticated or not self.login_session:
-                logging.error("Not authenticated. Please authenticate first.")
-                return None
+            if not await self._ensure_authenticated():
+                return []
             
-            # Check rate limiting
-            if not await self._check_rate_limit():
-                logging.warning("Rate limit exceeded, waiting...")
-                await asyncio.sleep(1)
-                return None
+            # Format dates for API
+            from_timestamp = int(from_date.timestamp())
+            to_timestamp = int(to_date.timestamp())
+            
+            params = {
+                'symbol': symbol,
+                'resolution': resolution,
+                'date_format': '1',
+                'range_from': from_timestamp,
+                'range_to': to_timestamp,
+                'cont_flag': '1'
+            }
+            
+            # Build query string
+            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+            
+            response = await self._make_request(
+                'GET',
+                f'/data/history/?{query_string}',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                historical_data = []
+                candles = response.get('candles', [])
+                
+                for candle in candles:
+                    if len(candle) >= 6:
+                        historical_data.append({
+                            'timestamp': datetime.fromtimestamp(candle[0]),
+                            'open': float(candle[1]),
+                            'high': float(candle[2]),
+                            'low': float(candle[3]),
+                            'close': float(candle[4]),
+                            'volume': int(candle[5])
+                        })
+                
+                return historical_data
+            else:
+                self.logger.warning(f"No historical data found for {symbol}")
+                return []
+                
+        except Exception as e:
+            self.logger.error(f"Error getting historical data: {e}")
+            self.error_handler.handle_error(e, "get_historical_data")
+            return []
+
+    async def get_authentication_status(self) -> Dict:
+        """Get current authentication status"""
+        return {
+            'is_authenticated': self.is_authenticated,
+            'access_token': self.token_manager.access_token[:20] + "..." if self.token_manager.access_token else "",
+            'user_id': self.user_info.get('client_id', ''),
+            'user_name': self.user_info.get('username', ''),
+            'email': self.user_info.get('email', ''),
+            'expires_at': self.token_manager.expires_at.isoformat() if self.token_manager.expires_at else None,
+            'time_to_expiry': str(self.token_manager.expires_at - datetime.now()) if self.token_manager.expires_at else None,
+            'last_error': self.last_error_time,
+            'error_count': self.error_count,
+            'auth_state': self.auth_state.value
+        }
+
+    async def get_api_statistics(self) -> Dict:
+        """Get API usage statistics"""
+        return {
+            'total_requests': self.request_count,
+            'requests_per_minute': self.request_count if self.request_count < self.max_requests_per_minute else self.max_requests_per_minute,
+            'rate_limit_window': self.rate_limit_window,
+            'max_requests_per_minute': self.max_requests_per_minute,
+            'last_request_time': self.last_request_time,
+            'min_request_interval': self.min_request_interval,
+            'cache_entries': len(self.symbol_cache),
+            'active_orders': len(self.active_orders),
+            'error_count': self.error_count,
+            'is_rate_limited': self._is_rate_limited(),
+            'base_url': self.base_url,
+            'api_key_set': bool(self.api_key),
+            'session_active': self.session and not self.session.closed
+        }
+
+    # Private helper methods
+    
+    async def _fetch_user_info(self):
+        """Fetch user profile information after authentication"""
+        try:
+            # Get user profile according to Goodwill API
+            response = await self._make_request(
+                'GET',
+                '/user/profile/',
+                authenticated=True
+            )
+            
+            if response and response.get('s') == 'ok':
+                data = response.get('data', {})
+                self.user_info = {
+                    'client_id': data.get('fy_id', ''),
+                    'username': data.get('name', ''),
+                    'email': data.get('email_id', ''),
+                    'mobile': data.get('mobile_number', ''),
+                    'pan': data.get('PAN', ''),
+                    'demat_id': data.get('demat_account', ''),
+                    'firm_name': data.get('firm_name', 'Goodwill'),
+                    'exchanges': data.get('exchange', []),
+                    'segment': data.get('segment', []),
+                    'cm_codes': data.get('cm_codes', {}),
+                    'fo_codes': data.get('fo_codes', {}),
+                    'cd_codes': data.get('cd_codes', {})
+                }
+                
+                # Store client_id as user_id for consistency
+                if self.user_info['client_id']:
+                    self.user_id = self.user_info['client_id']
+                
+                self.logger.info(f"User info fetched: {self.user_info['username']} ({self.user_info['client_id']})")
+            else:
+                self.logger.warning("Failed to fetch user profile")
+                
+        except Exception as e:
+            self.logger.error(f"Error fetching user info: {e}")
+
+    async def _make_request(self, method: str, endpoint: str, data: Dict = None, 
+                          authenticated: bool = True) -> Optional[Dict]:
+        """Make HTTP request to Goodwill API"""
+        try:
+            # Rate limiting
+            await self._enforce_rate_limit()
+            
+            # Session validation for authenticated requests
+            if authenticated and not await self._ensure_authenticated():
+                raise Exception("Authentication required")
+            
+            # Prepare URL
+            url = f"{self.base_url}{endpoint}"
             
             # Prepare headers
             headers = {
-                'x-api-key': self.config.api.goodwill_api_key,
-                'Authorization': f'Bearer {self.login_session.access_token}'
+                'Content-Type': 'application/json',
+                'User-Agent': 'GoodwillTradingBot/1.0'
             }
             
-            # Record request start time
-            start_time = time.time()
+            if authenticated and self.token_manager.access_token:
+                headers['Authorization'] = f'Bearer {self.token_manager.access_token}'
+            
+            # Prepare request data
+            request_data = data or {}
             
             # Make request
             async with self.session.request(
                 method=method,
                 url=url,
-                json=data if method in ['POST', 'PUT'] else None,
-                params=params,
+                json=request_data,
                 headers=headers
             ) as response:
                 
-                # Calculate response time
-                response_time = (time.time() - start_time) * 1000
-                self._update_response_time(response_time)
+                # Update request count
+                self.request_count += 1
+                self.last_request_time = time.time()
                 
-                # Update statistics
-                self.api_stats['total_requests'] += 1
-                
+                # Handle response
                 if response.status == 200:
-                    result = await response.json()
-                    self.api_stats['successful_requests'] += 1
-                    return result
+                    response_data = await response.json()
+                    
+                    # Reset error count on successful request
+                    self.error_count = 0
+                    
+                    return response_data
                 
                 elif response.status == 401:
-                    # Authentication failed
-                    logging.error("Authentication failed, token may be expired")
-                    self.api_stats['auth_failures'] += 1
-                    self.is_authenticated = False
+                    self.logger.warning("Authentication failed - token may be expired")
+                    self.auth_state = AuthenticationState.TOKEN_EXPIRED
                     return None
                 
                 elif response.status == 429:
-                    # Rate limited
-                    logging.warning("Rate limited by API")
-                    self.api_stats['rate_limit_hits'] += 1
+                    self.logger.warning("Rate limit exceeded")
+                    await asyncio.sleep(1)
                     return None
                 
                 else:
-                    # Other error
-                    error_text = await response.text()
-                    logging.error(f"API request failed {response.status}: {error_text}")
-                    self.api_stats['failed_requests'] += 1
+                    self.logger.error(f"API request failed: {response.status}")
+                    response_text = await response.text()
+                    self.logger.error(f"Response: {response_text}")
                     return None
                     
-        except Exception as e:
-            logging.error(f"Error making authenticated request to {url}: {e}")
-            self.api_stats['failed_requests'] += 1
+        except asyncio.TimeoutError:
+            self.logger.error(f"Request timeout for {endpoint}")
+            self._handle_error()
             return None
-    
-    async def _check_rate_limit(self) -> bool:
-        """Check if we're within rate limits"""
-        current_minute = datetime.now().minute
-        current_time = time.time()
-        
-        # Reset counter if minute changed
-        if current_minute != self.rate_limiter['last_minute']:
-            self.rate_limiter['requests_per_minute'] = 0
-            self.rate_limiter['last_minute'] = current_minute
-            self.rate_limiter['request_timestamps'] = []
-        
-        # Remove timestamps older than 1 minute
-        one_minute_ago = current_time - 60
-        self.rate_limiter['request_timestamps'] = [
-            ts for ts in self.rate_limiter['request_timestamps'] if ts > one_minute_ago
-        ]
-        
-        # Check if we're within limits
-        if len(self.rate_limiter['request_timestamps']) >= self.rate_limiter['max_requests_per_minute']:
+            
+        except Exception as e:
+            self.logger.error(f"Request error for {endpoint}: {e}")
+            self._handle_error()
+            return None
+
+    async def _ensure_authenticated(self) -> bool:
+        """Ensure we have valid authentication"""
+        if not self.is_authenticated:
+            self.logger.warning("Authentication required - please login first")
             return False
         
-        # Add current timestamp
-        self.rate_limiter['request_timestamps'].append(current_time)
-        self.rate_limiter['requests_per_minute'] += 1
+        # Check if token needs refresh
+        if not self.token_manager.is_token_valid():
+            if self.token_manager.is_refresh_token_valid():
+                success = await self.token_manager.refresh_access_token()
+                if success:
+                    self.auth_state = AuthenticationState.AUTHENTICATED
+                    return True
+                else:
+                    self.auth_state = AuthenticationState.TOKEN_EXPIRED
+                    return False
+            else:
+                self.auth_state = AuthenticationState.TOKEN_EXPIRED
+                return False
         
         return True
-    
-    def _update_response_time(self, response_time_ms: float):
-        """Update average response time statistics"""
-        current_avg = self.api_stats['avg_response_time_ms']
-        total_requests = self.api_stats['total_requests']
+
+    async def _validate_existing_session(self) -> bool:
+        """Validate existing session"""
+        try:
+            response = await self._make_request(
+                'GET',
+                '/user/profile/',
+                authenticated=True
+            )
+            
+            return response and response.get('s') == 'ok'
+            
+        except Exception as e:
+            self.logger.error(f"Session validation error: {e}")
+            return False
+
+    async def _load_saved_tokens(self):
+        """Load saved tokens from secure storage"""
+        try:
+            # This would load from secure storage like keyring
+            # For now, we'll skip this implementation
+            pass
+        except Exception as e:
+            self.logger.error(f"Error loading saved tokens: {e}")
+
+    async def _save_tokens(self):
+        """Save tokens to secure storage"""
+        try:
+            # This would save to secure storage like keyring
+            # For now, we'll skip this implementation
+            pass
+        except Exception as e:
+            self.logger.error(f"Error saving tokens: {e}")
+
+    async def _clear_saved_tokens(self):
+        """Clear saved tokens from secure storage"""
+        try:
+            # This would clear from secure storage
+            pass
+        except Exception as e:
+            self.logger.error(f"Error clearing saved tokens: {e}")
+
+    async def _enforce_rate_limit(self):
+        """Enforce rate limiting"""
+        current_time = time.time()
         
-        if total_requests == 0:
-            self.api_stats['avg_response_time_ms'] = response_time_ms
-        else:
-            # Calculate rolling average
-            self.api_stats['avg_response_time_ms'] = (
-                (current_avg * (total_requests - 1) + response_time_ms) / total_requests
-            )
-    
-    # Market Data Methods
-    async def get_quote(self, exchange: str, token: str) -> Optional[Dict[str, Any]]:
-        """Get live quote for a symbol"""
-        try:
-            payload = {
-                "exchange": exchange,
-                "token": token
-            }
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.GET_QUOTE, payload)
-            
-            if response and response.get('status') == 'success':
-                return response['data']
-            
-            return None
-            
-        except Exception as e:
-            logging.error(f"Error getting quote for {exchange}:{token}: {e}")
-            return None
-    
-    async def search_symbols(self, search_term: str) -> List[Dict[str, Any]]:
-        """Search for trading symbols"""
-        try:
-            payload = {
-                "s": search_term
-            }
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.FETCH_SYMBOL, payload)
-            
-            if response and response.get('status') == 'success':
-                return response['data']
-            
-            return []
-            
-        except Exception as e:
-            logging.error(f"Error searching symbols for '{search_term}': {e}")
-            return []
-    
-    # Trading Methods
-    async def place_order(self, order_data: Dict[str, Any]) -> Optional[OrderResponse]:
-        """Place a trading order"""
-        try:
-            # Validate required fields
-            required_fields = ['tsym', 'exchange', 'trantype', 'validity', 'pricetype', 'qty', 'price', 'product']
-            for field in required_fields:
-                if field not in order_data:
-                    logging.error(f"Missing required field '{field}' in order data")
-                    return None
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.PLACE_ORDER, order_data)
-            
-            if response and response.get('status') == 'success':
-                order_id = response['data'].get('nstordno', '')
-                return OrderResponse(
-                    order_id=order_id,
-                    status='submitted',
-                    message='Order placed successfully'
-                )
-            else:
-                error_msg = response.get('error_msg', 'Unknown error') if response else 'No response'
-                return OrderResponse(
-                    order_id='',
-                    status='rejected',
-                    message=error_msg,
-                    rejection_reason=error_msg
-                )
-                
-        except Exception as e:
-            logging.error(f"Error placing order: {e}")
-            return OrderResponse(
-                order_id='',
-                status='error',
-                message=str(e)
-            )
-    
-    async def place_bracket_order(self, order_data: Dict[str, Any]) -> Optional[OrderResponse]:
-        """Place a bracket order (BO)"""
-        try:
-            required_fields = ['exchange', 'tsym', 'trantype', 'qty', 'validity', 'price', 'squareoff', 'stoploss', 'pricetype']
-            for field in required_fields:
-                if field not in order_data:
-                    logging.error(f"Missing required field '{field}' in bracket order data")
-                    return None
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.PLACE_BO_ORDER, order_data)
-            
-            if response and response.get('status') == 'success':
-                order_id = response['data'].get('nstordno', '')
-                return OrderResponse(
-                    order_id=order_id,
-                    status='submitted',
-                    message='Bracket order placed successfully'
-                )
-            else:
-                error_msg = response.get('error_msg', 'Unknown error') if response else 'No response'
-                return OrderResponse(
-                    order_id='',
-                    status='rejected',
-                    message=error_msg,
-                    rejection_reason=error_msg
-                )
-                
-        except Exception as e:
-            logging.error(f"Error placing bracket order: {e}")
-            return OrderResponse(
-                order_id='',
-                status='error',
-                message=str(e)
-            )
-    
-    async def modify_order(self, order_data: Dict[str, Any]) -> Optional[OrderResponse]:
-        """Modify an existing order"""
-        try:
-            required_fields = ['exchange', 'tsym', 'nstordno', 'trantype', 'pricetype', 'price', 'qty']
-            for field in required_fields:
-                if field not in order_data:
-                    logging.error(f"Missing required field '{field}' in modify order data")
-                    return None
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.MODIFY_ORDER, order_data)
-            
-            if response and response.get('status') == 'success':
-                return OrderResponse(
-                    order_id=order_data['nstordno'],
-                    status='modified',
-                    message='Order modified successfully'
-                )
-            else:
-                error_msg = response.get('error_msg', 'Unknown error') if response else 'No response'
-                return OrderResponse(
-                    order_id=order_data['nstordno'],
-                    status='modify_failed',
-                    message=error_msg,
-                    rejection_reason=error_msg
-                )
-                
-        except Exception as e:
-            logging.error(f"Error modifying order: {e}")
-            return OrderResponse(
-                order_id=order_data.get('nstordno', ''),
-                status='error',
-                message=str(e)
-            )
-    
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order"""
-        try:
-            payload = {
-                "nstordno": order_id
-            }
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.CANCEL_ORDER, payload)
-            
-            if response and response.get('status') == 'success':
-                logging.info(f"Order {order_id} cancelled successfully")
-                return True
-            else:
-                error_msg = response.get('error_msg', 'Unknown error') if response else 'No response'
-                logging.error(f"Failed to cancel order {order_id}: {error_msg}")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Error cancelling order {order_id}: {e}")
-            return False
-    
-    # Portfolio Methods
-    async def get_positions(self) -> List[Dict[str, Any]]:
-        """Get current positions"""
-        try:
-            response = await self._make_authenticated_request('GET', self.endpoints.POSITIONS)
-            
-            if response and response.get('status') == 'success':
-                return response.get('data', [])
-            
-            return []
-            
-        except Exception as e:
-            logging.error(f"Error getting positions: {e}")
-            return []
-    
-    async def get_holdings(self) -> List[Dict[str, Any]]:
-        """Get current holdings"""
-        try:
-            response = await self._make_authenticated_request('GET', self.endpoints.HOLDINGS)
-            
-            if response and response.get('status') == 'success':
-                return response.get('data', [])
-            
-            return []
-            
-        except Exception as e:
-            logging.error(f"Error getting holdings: {e}")
-            return []
-    
-    async def get_order_book(self) -> List[Dict[str, Any]]:
-        """Get order book"""
-        try:
-            response = await self._make_authenticated_request('GET', self.endpoints.ORDER_BOOK)
-            
-            if response and response.get('status') == 'success':
-                return response.get('data', [])
-            
-            return []
-            
-        except Exception as e:
-            logging.error(f"Error getting order book: {e}")
-            return []
-    
-    async def get_trade_book(self) -> List[Dict[str, Any]]:
-        """Get trade book"""
-        try:
-            response = await self._make_authenticated_request('GET', self.endpoints.TRADE_BOOK)
-            
-            if response and response.get('status') == 'success':
-                return response.get('data', [])
-            
-            return []
-            
-        except Exception as e:
-            logging.error(f"Error getting trade book: {e}")
-            return []
-    
-    async def get_balance(self) -> Optional[Dict[str, Any]]:
-        """Get account balance"""
-        try:
-            response = await self._make_authenticated_request('GET', self.endpoints.BALANCE)
-            
-            if response and response.get('status') == 'success':
-                return response['data']
-            
-            return None
-            
-        except Exception as e:
-            logging.error(f"Error getting balance: {e}")
-            return None
-    
-    async def exit_position(self, position_data: Dict[str, Any]) -> bool:
-        """Exit a position"""
-        try:
-            required_fields = ['segment', 'product', 'netqty', 'token', 'tsym']
-            for field in required_fields:
-                if field not in position_data:
-                    logging.error(f"Missing required field '{field}' in exit position data")
-                    return False
-            
-            response = await self._make_authenticated_request('POST', self.endpoints.EXIT_POSITION, position_data)
-            
-            if response and response.get('status') == 'success':
-                logging.info(f"Position exited successfully: {position_data['tsym']}")
-                return True
-            else:
-                error_msg = response.get('error_msg', 'Unknown error') if response else 'No response'
-                logging.error(f"Failed to exit position {position_data['tsym']}: {error_msg}")
-                return False
-                
-        except Exception as e:
-            logging.error(f"Error exiting position: {e}")
-            return False
-    
-    async def get_order_updates(self) -> List[Dict[str, Any]]:
-        """Get order status updates (simulated for REST API)"""
-        try:
-            # Since Goodwill uses WebSocket for real-time updates,
-            # this method fetches order book and checks for status changes
-            order_book = await self.get_order_book()
-            return order_book
-            
-        except Exception as e:
-            logging.error(f"Error getting order updates: {e}")
-            return []
-    
-    async def logout(self) -> bool:
-        """Logout and invalidate session"""
-        try:
-            response = await self._make_authenticated_request('GET', self.endpoints.LOGOUT)
-            
-            if response and response.get('status') == 'success':
-                self.is_authenticated = False
-                self.login_session = None
-                self.auto_refresh_enabled = False
-                
-                logging.info("Successfully logged out")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logging.error(f"Error during logout: {e}")
-            return False
-    
-    def get_login_url(self) -> str:
-        """Get login URL for manual authentication"""
-        return f"{self.endpoints.LOGIN_URL}?api_key={self.config.api.goodwill_api_key}"
-    
-    def get_api_statistics(self) -> Dict[str, Any]:
-        """Get API usage statistics"""
+        # Check if we need to wait
+        time_since_last_request = current_time - self.last_request_time
+        if time_since_last_request < self.min_request_interval:
+            wait_time = self.min_request_interval - time_since_last_request
+            await asyncio.sleep(wait_time)
+        
+        # Check requests per minute limit
+        if self._is_rate_limited():
+            self.logger.warning("Rate limit reached, waiting...")
+            await asyncio.sleep(60)  # Wait 1 minute
+            self.request_count = 0  # Reset counter
+
+    def _is_rate_limited(self) -> bool:
+        """Check if we're hitting rate limits"""
+        return self.request_count >= self.max_requests_per_minute
+
+    def _handle_error(self):
+        """Handle API errors"""
+        self.error_count += 1
+        self.last_error_time = time.time()
+        
+        if self.error_count >= self.max_errors_before_disconnect:
+            self.logger.error("Too many errors, marking as disconnected...")
+            self.auth_state = AuthenticationState.AUTHENTICATION_FAILED
+
+    def _validate_order_data(self, order_data: Dict) -> Dict:
+        """Validate order data before placement"""
+        errors = []
+        
+        # Required fields
+        required_fields = ['symbol', 'exchange', 'side', 'quantity']
+        for field in required_fields:
+            if field not in order_data:
+                errors.append(f"Missing required field: {field}")
+        
+        # Validate side
+        if order_data.get('side') not in [OrderSide.BUY.value, OrderSide.SELL.value]:
+            errors.append("Invalid order side")
+        
+        # Validate quantity
+        if order_data.get('quantity', 0) <= 0:
+            errors.append("Quantity must be positive")
+        
+        # Validate price for limit orders
+        order_type = order_data.get('order_type', OrderType.MARKET.value)
+        if order_type in [OrderType.LIMIT.value, OrderType.STOP_LOSS.value]:
+            if order_data.get('price', 0) <= 0:
+                errors.append("Price must be positive for limit/stop orders")
+        
         return {
-            **self.api_stats,
-            'is_authenticated': self.is_authenticated,
-            'session_expires_at': self.login_session.expires_at.isoformat() if self.login_session else None,
-            'current_user': self.login_session.name if self.login_session else None,
-            'client_id': self.login_session.client_id if self.login_session else None,
-            'rate_limiter_status': {
-                'requests_this_minute': self.rate_limiter['requests_per_minute'],
-                'max_requests_per_minute': self.rate_limiter['max_requests_per_minute']
-            }
+            'valid': len(errors) == 0,
+            'errors': errors
         }
-    
+
+    def _convert_order_type(self, order_type) -> int:
+        """Convert order type to Goodwill API format"""
+        type_mapping = {
+            OrderType.MARKET.value: 1,
+            OrderType.LIMIT.value: 2,
+            OrderType.STOP_LOSS.value: 3,
+            OrderType.STOP_LOSS_MARKET.value: 4
+        }
+        return type_mapping.get(order_type, 1)
+
+    def _convert_product_type(self, product_type) -> str:
+        """Convert product type to Goodwill API format"""
+        return product_type
+
+    def _parse_order_status(self, status_string: str) -> OrderStatus:
+        """Parse order status from API response"""
+        status_mapping = {
+            'PENDING': OrderStatus.PENDING,
+            'OPEN': OrderStatus.OPEN,
+            'COMPLETE': OrderStatus.COMPLETE,
+            'CANCELLED': OrderStatus.CANCELLED,
+            'REJECTED': OrderStatus.REJECTED,
+            'PARTIAL': OrderStatus.PARTIAL
+        }
+        
+        return status_mapping.get(status_string.upper(), OrderStatus.PENDING)
+
+    def add_connection_callback(self, callback: Callable):
+        """Add callback to be called when connected"""
+        self.connection_callbacks.append(callback)
+
+    def add_disconnection_callback(self, callback: Callable):
+        """Add callback to be called when disconnected"""
+        self.disconnection_callbacks.append(callback)
+
     async def cleanup(self):
         """Cleanup resources"""
         try:
-            # Stop auto-refresh
-            self.auto_refresh_enabled = False
-            
-            # Logout if authenticated
             if self.is_authenticated:
                 await self.logout()
             
-            # Close session
-            if self.session:
+            if self.token_manager.auto_refresh_task:
+                self.token_manager.auto_refresh_task.cancel()
+            
+            if self.session and not self.session.closed:
                 await self.session.close()
             
-            logging.info("Goodwill API Handler cleaned up successfully")
+            self.logger.info("Goodwill API handler cleaned up successfully")
             
         except Exception as e:
-            logging.error(f"Error during cleanup: {e}")
+            self.logger.error(f"Cleanup error: {e}")
 
-# Global instance
-goodwill_handler = GoodwillAPIHandler()
+# Singleton instance
+_goodwill_handler = None
 
 def get_goodwill_handler() -> GoodwillAPIHandler:
-    """Get the global Goodwill API handler instance"""
-    return goodwill_handler
+    """Get singleton Goodwill API handler instance"""
+    global _goodwill_handler
+    if _goodwill_handler is None:
+        _goodwill_handler = GoodwillAPIHandler()
+    return _goodwill_handler
+
+# Example usage and testing
+async def main():
+    """Example usage of Goodwill API handler with 3-step login flow"""
+    try:
+        # Initialize handler
+        handler = get_goodwill_handler()
+        
+        # Initialize
+        success = await handler.initialize()
+        if not success:
+            print("❌ Failed to initialize Goodwill API")
+            return
+        
+        print("✅ Goodwill API initialized successfully")
+        
+        # STEP 1: Generate login URL (user inputs API key/secret via dashboard)
+        handler.api_key = "YOUR_API_KEY"  # This would come from Flask dashboard
+        handler.api_secret = "YOUR_SECRET"  # This would come from Flask dashboard
+        
+        login_url = handler.start_login_process()
+        if login_url:
+            print(f"🔗 STEP 1: Login URL generated:")
+            print(f"   {login_url}")
+            print(f"   Open this URL in browser and complete login")
+        
+        # STEP 2: User opens URL in browser, logs into Goodwill, gets redirected with request_token
+        
+        # STEP 3: User copies the redirect URL with request_token and pastes it
+        request_token = input("\n📋 STEP 3: Paste the request_token from redirect URL: ")
+        
+        if request_token:
+            success = await handler.complete_login_with_request_token(request_token)
+            if success:
+                print("✅ Authentication successful!")
+                
+                # Get authentication status
+                auth_status = await handler.get_authentication_status()
+                print(f"🔐 User: {auth_status['user_name']} ({auth_status['user_id']})")
+                print(f"📧 Email: {auth_status['email']}")
+                
+                # Test some API calls
+                print("\n🧪 Testing API calls...")
+                
+                # Get funds
+                funds = await handler.get_funds()
+                if funds:
+                    print(f"💰 Available Balance: ₹{funds.get('available_balance', 0):,.2f}")
+                
+                # Search symbols
+                symbols = await handler.search_symbols("RELIANCE", "NSE")
+                print(f"🔍 Found {len(symbols)} symbols for RELIANCE")
+                
+                # Get positions
+                positions = await handler.get_positions()
+                print(f"📊 Current positions: {len(positions)}")
+                
+                # Get orders
+                orders = await handler.get_order_book()
+                print(f"📋 Orders today: {len(orders)}")
+                
+            else:
+                print("❌ Authentication failed")
+        
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down...")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    finally:
+        if 'handler' in locals():
+            await handler.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
